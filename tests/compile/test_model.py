@@ -40,7 +40,10 @@ class TestMamba:
 
     # TODO: @goon - Better test parametrization. Mostly left as independent methods for exploration
     # for now.
-    @pytest.mark.parametrize("mode", ("default", "reduce-overhead", "max-autotune"))
+    @pytest.mark.parametrize(
+        "mode",
+        ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
+    )
     def test_compile(self, mode) -> None:
         cfg = get_small_cfg()
         mamba = MambaLMHeadModel(cfg, device=DEVICE)
