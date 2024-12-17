@@ -20,6 +20,7 @@ class _TestMambaBase(ABC):
 
     seq_len = 16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16
 
     @abstractmethod
     def get_cfg(self) -> MambaConfig: ...
@@ -41,7 +42,7 @@ class _TestMambaBase(ABC):
     )
     def test_compile(self, mode) -> None:
         cfg = self.get_cfg()
-        mamba = MambaLMHeadModel(cfg, device=self.device)
+        mamba = MambaLMHeadModel(cfg, device=self.device, dtype=self.dtype)
         compiled_mamba = torch.compile(mamba, mode=mode)
         inputs = torch.randint(
             cfg.vocab_size, size=(1, self.seq_len), device=self.device
@@ -51,7 +52,7 @@ class _TestMambaBase(ABC):
 
     def test_compile_full_graph(self) -> None:
         cfg = self.get_cfg()
-        mamba = MambaLMHeadModel(cfg, device=self.device)
+        mamba = MambaLMHeadModel(cfg, device=self.device, dtype=self.dtype)
         compiled_mamba = torch.compile(mamba, fullgraph=True)
         inputs = torch.randint(
             cfg.vocab_size, size=(1, self.seq_len), device=self.device
@@ -61,7 +62,7 @@ class _TestMambaBase(ABC):
 
     def test_compile_dynamic(self) -> None:
         cfg = self.get_cfg()
-        mamba = MambaLMHeadModel(cfg, device=self.device)
+        mamba = MambaLMHeadModel(cfg, device=self.device, dtype=self.dtype)
         compiled_mamba = torch.compile(mamba, dynamic=True)
         inputs = torch.randint(
             cfg.vocab_size, size=(1, self.seq_len), device=self.device
@@ -81,7 +82,7 @@ class TestMamba(_TestMambaBase):
         Sanity check. TODO: @goon - remove.
         """
         cfg = self.get_cfg()
-        mamba = MambaLMHeadModel(cfg, device=self.device)
+        mamba = MambaLMHeadModel(cfg, device=self.device, dtype=self.dtype)
         for block in mamba.backbone.layers:
             assert isinstance(block.mixer, Mamba)
         inputs = torch.randint(
@@ -105,7 +106,7 @@ class TestMamba2(_TestMambaBase):
         Sanity check. TODO: @goon - remove.
         """
         cfg = self.get_cfg()
-        mamba = MambaLMHeadModel(cfg, device=self.device)
+        mamba = MambaLMHeadModel(cfg, device=self.device, dtype=self.dtype)
         for block in mamba.backbone.layers:
             assert isinstance(block.mixer, Mamba2)
         inputs = torch.randint(
