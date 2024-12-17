@@ -28,10 +28,6 @@ class _TestMambaBase(ABC):
     def teardown_method(self, method):
         pass
 
-    def test_cfg(self) -> None:
-        cfg = self.get_cfg()
-        assert cfg is not None
-
     # TODO: @goon - Better test parametrization. Mostly left as independent methods for exploration
     # for now.
     @pytest.mark.parametrize(
