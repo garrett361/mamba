@@ -13,6 +13,11 @@ SEQ_LEN = 16
 
 
 class _TestMambaBase(ABC):
+    """
+    TODO: @goon
+    - Test the {Mamba,Mamba2}.step methods by passing in non-trivial InferenceParams
+    """
+
     seq_len = 16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
