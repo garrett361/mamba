@@ -99,3 +99,54 @@ def ssd_minimal_no_chunking(X, A, B, C):
     return Y
 
 
+def ssd_minimal_discrete_clean(X, A, B, C, block_len):
+    """
+    Arguments:
+        X: (batch, length, n_heads, d_head)
+        A: (batch, length, n_heads)
+        B: (batch, length, n_groups, d_state)
+        C: (batch, length, n_groups, d_state)
+    Return:
+        Y: (batch, length, n_heads, d_head)
+    """
+    assert X.dtype == A.dtype == B.dtype == C.dtype
+    assert X.shape[1] % block_len == 0
+
+    # Rearrange into blocks/chunks
+    X, A, B, C = [
+        rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)
+    ]
+
+    A = rearrange(A, "b c l h -> b h c l")
+    A_cumsum = A.cumsum( dim=-1)
+    A_sum = A.sum(dim=-1)
+
+    # 1. Compute the output for each intra-chunk (diagonal blocks)
+    L = torch.exp(segsum(A))
+    Y_diag = torch.einsum("bclgn,bcsgn,bhcls,bcshp->bclhp", C, B, L, X)
+
+    # 2. Right-factor
+    T = (A_sum[..., None] - A_cumsum + A).exp()
+    right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
+
+    # 3. Center-factor
+    A_sum_cs = A_sum.cumsum(dim=-1)
+    A_middle = (A_sum_cs[..., None] - A_sum_cs[..., None, :] - A_sum[..., None]).exp()
+    n_chunks = A_middle.shape[-1]
+    mask = torch.triu(torch.ones(n_chunks, n_chunks, dtype=bool, device=A_middle.device), diagonal=0)
+    middle_factor = A_middle.masked_fill(mask, 0.0)
+
+    # 4. Left-factor
+    U = (A_cumsum - A).exp()
+    left_factor = torch.einsum("bclgn,bhcl->bclghn", C, U)
+
+    Y_off = torch.einsum(
+        "bclghn,bhcs,bsghnp->bclhp",
+        left_factor,
+        middle_factor,
+        right_factor,
+    )
+
+    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    return Y
