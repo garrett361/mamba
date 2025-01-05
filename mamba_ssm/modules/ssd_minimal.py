@@ -78,3 +78,22 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     return Y, final_state
 
 
+def ssd_minimal_no_chunking(X, A, B, C):
+    """
+    Arguments:
+        X: (batch, length, n_heads, d_head)
+        A: (batch, length, n_heads)
+        B: (batch, length, n_groups, d_state)
+        C: (batch, length, n_groups, d_state)
+    Return:
+        Y: (batch, length, n_heads, d_head)
+    """
+    assert X.dtype == A.dtype == B.dtype == C.dtype
+
+    A = rearrange(A, "b l h -> b h l")
+    L = torch.exp(segsum(A))
+    Y = torch.einsum("blhn,bshn,bhls,bshp->blhp", C, B, L, X)
+
+    return Y
+
+
