@@ -78,26 +78,3 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     return Y, final_state
 
 
-# Simple test
-def test_correctness():
-    torch.manual_seed(42)
-
-    ## Dimensions
-    # Denoted (B, T, Q, D, P) in the paper
-    batch, seqlen, chunk_size, dim, headdim = 1, 2048, 64, 2048, 64
-    nheads = dim // headdim  # (H) in the paper
-    ngroups = 1 # (G) in the paper
-    dstate = 64  # (N) in the paper
-    dtype = torch.float32
-    device = "cuda"
-
-    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=device)
-    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4).requires_grad_()
-    A = (-torch.exp(torch.rand(nheads, dtype=torch.float32, device=device))).requires_grad_()
-    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
-    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
-    D = torch.randn(nheads, dtype=dtype, device=device)
-
-    # Comparing fused version and minimal version
-    y = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None)
-    y_min, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, chunk_size)
