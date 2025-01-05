@@ -265,7 +265,7 @@ class TestMambaChunkScanCombined:
     device = "cuda"
     chunk_size = 64
 
-    def _get_xdtABC(self):
+    def _get_xdtABC(self, requires_grad: bool = False):
         x = torch.randn(
             self.batch,
             self.seqlen,
@@ -273,6 +273,7 @@ class TestMambaChunkScanCombined:
             self.headdim,
             dtype=self.dtype,
             device=self.device,
+            requires_grad=requires_grad,
         )
         dt = F.softplus(
             torch.randn(
@@ -283,10 +284,19 @@ class TestMambaChunkScanCombined:
                 device=self.device,
             )
             - 4
-        ).requires_grad_()
-        A = (
-            -torch.exp(torch.rand(self.nheads, dtype=self.dtype, device=self.device))
-        ).requires_grad_()
+        )
+        A = -torch.exp(
+            torch.rand(
+                self.nheads,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        )
+        if requires_grad:
+            # Set dt and A as requires_grad, and not the tensors they're built from, so that they
+            # are leaf tensors which accumulate gradients.
+            dt.requires_grad_()
+            A.requires_grad_()
         B = torch.randn(
             self.batch,
             self.seqlen,
@@ -294,6 +304,7 @@ class TestMambaChunkScanCombined:
             self.dstate,
             dtype=self.dtype,
             device=self.device,
+            requires_grad=requires_grad,
         )
         C = torch.randn(
             self.batch,
@@ -302,6 +313,7 @@ class TestMambaChunkScanCombined:
             self.dstate,
             dtype=self.dtype,
             device=self.device,
+            requires_grad=requires_grad,
         )
         return x, dt, A, B, C
 
@@ -320,6 +332,39 @@ class TestMambaChunkScanCombined:
         # These tolerances seem high, but the test fails for rtol = atol = 1e-3. Surprising?
         rtol = atol = 1e-2
         assert torch.allclose(y, y_min, rtol=rtol, atol=atol)
+
+    def test_bwd(self):
+        """
+        Test the triton mamba_chunk_scan_combined against the pure torch implementation
+        ssd_minimal_discrete with a backwards pass.
+        """
+        torch.manual_seed(42)
+        x, dt, A, B, C = self._get_xdtABC(requires_grad=True)
+
+        x_c = x.detach().clone().requires_grad_()
+        dt_c = dt.detach().clone().requires_grad_()
+        A_c = A.detach().clone().requires_grad_()
+        B_c = B.detach().clone().requires_grad_()
+        C_c = C.detach().clone().requires_grad_()
+
+        # Comparing fused version and minimal version
+        y = mamba_chunk_scan_combined(x, dt, A, B, C, self.chunk_size, D=None)
+        y_c, _ = ssd_minimal_discrete(
+            x_c * dt_c.unsqueeze(-1), A_c * dt_c, B_c, C_c, self.chunk_size
+        )
+
+        y.sum().backward()
+        y_c.sum().backward()
+
+        # Test only passes with large tolerances. rtol=atol=1e-2 fails. The dt and C grads have
+        # largest discrepancies. Surprising?
+        rtol = atol = 1e-1
+        with torch.no_grad():
+            assert torch.allclose(x.grad, x_c.grad, rtol=rtol, atol=atol)
+            assert torch.allclose(dt.grad, dt_c.grad, rtol=rtol, atol=atol)
+            assert torch.allclose(A.grad, A_c.grad, rtol=rtol, atol=atol)
+            assert torch.allclose(B.grad, B_c.grad, rtol=rtol, atol=atol)
+            assert torch.allclose(C.grad, C_c.grad, rtol=rtol, atol=atol)
 
     def test_no_chunk_equiv(self):
         """
