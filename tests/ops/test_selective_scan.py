@@ -1,17 +1,21 @@
 # Copyright (C) 2023, Tri Dao.
 
-import math
-
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
 
-from einops import rearrange
-
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
-from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, mamba_inner_ref
+from mamba_ssm.modules.ssd_minimal import (
+    ssd_minimal_discrete,
+    ssd_minimal_discrete_alt,
+    ssd_minimal_no_chunking,
+)
+from mamba_ssm.ops.selective_scan_interface import (
+    mamba_inner_fn,
+    mamba_inner_ref,
+    selective_scan_fn,
+    selective_scan_ref,
+)
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-from mamba_ssm.modules.ssd_minimal import ssd_minimal_discrete
 
 
 # @pytest.mark.parametrize('wtype', [torch.float32, torch.complex64])
@@ -249,31 +253,104 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
     # assert torch.allclose(delta_bias.grad, delta_bias_ref.grad, rtol=rtolw, atol=atolw)
 
 
-
 # Simple test
 class TestMambaChunkScanCombined:
+    ## Dimensions
+    # Denoted (B, T, Q, D, P) in the paper
+    batch, seqlen, chunk_size, dim, headdim = 1, 512, 64, 4096, 32
+    nheads = dim // headdim  # (H) in the paper
+    ngroups = 1  # (G) in the paper
+    dstate = 16  # (N) in the paper
+    dtype = torch.float32
+    device = "cuda"
+    chunk_size = 64
+
+    def _get_xdtABC(self):
+        x = torch.randn(
+            self.batch,
+            self.seqlen,
+            self.nheads,
+            self.headdim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        dt = F.softplus(
+            torch.randn(
+                self.batch,
+                self.seqlen,
+                self.nheads,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            - 4
+        ).requires_grad_()
+        A = (
+            -torch.exp(torch.rand(self.nheads, dtype=self.dtype, device=self.device))
+        ).requires_grad_()
+        B = torch.randn(
+            self.batch,
+            self.seqlen,
+            self.ngroups,
+            self.dstate,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        C = torch.randn(
+            self.batch,
+            self.seqlen,
+            self.ngroups,
+            self.dstate,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        return x, dt, A, B, C
+
     def test_fwd(self):
+        """
+        Test the triton mamba_chunk_scan_combined against the pure torch implementation
+        ssd_minimal_discrete.
+        """
         torch.manual_seed(42)
-
-        ## Dimensions
-        # Denoted (B, T, Q, D, P) in the paper
-        batch, seqlen, chunk_size, dim, headdim = 1, 2048, 64, 2048, 64
-        nheads = dim // headdim  # (H) in the paper
-        ngroups = 1 # (G) in the paper
-        dstate = 64  # (N) in the paper
-        dtype = torch.float32
-        device = "cuda"
-
+        x, dt, A, B, C = self._get_xdtABC()
+        # Comparing fused version and minimal version
+        y = mamba_chunk_scan_combined(x, dt, A, B, C, self.chunk_size, D=None)
+        y_min, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
         # These tolerances seem high, but the test fails for rtol = atol = 1e-3. Surprising?
         rtol = atol = 1e-2
-
-        x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=device)
-        dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=dtype, device=device) - 4).requires_grad_()
-        A = (-torch.exp(torch.rand(nheads, dtype=dtype, device=device))).requires_grad_()
-        B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
-        C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
-
-        # Comparing fused version and minimal version
-        y = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None)
-        y_min, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, chunk_size)
         assert torch.allclose(y, y_min, rtol=rtol, atol=atol)
+
+    def test_no_chunk_equiv(self):
+        """
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunking, which does
+        not chunk over the sequence dimension.
+        """
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+        # Comparing fused version and minimal version
+        y_no_chunk = ssd_minimal_no_chunking(x * dt.unsqueeze(-1), A * dt, B, C)
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
+
+    def test_alt_chunk(self):
+        """
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
+        different chunking implementation.
+        """
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+        # Comparing fused version and minimal version
+        y_clean = ssd_minimal_discrete_alt(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_clean, y_discrete, atol=atol, rtol=rtol)

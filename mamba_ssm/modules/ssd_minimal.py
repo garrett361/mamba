@@ -8,8 +8,6 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-
 
 def segsum_unstable(x):
     """Naive segment sum calculation."""
@@ -19,6 +17,7 @@ def segsum_unstable(x):
     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
+
 
 def segsum(x):
     """More stable segment sum calculation."""
@@ -30,6 +29,7 @@ def segsum(x):
     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
+
 
 def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     """
