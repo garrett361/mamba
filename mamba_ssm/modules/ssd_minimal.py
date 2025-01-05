@@ -94,7 +94,7 @@ def ssd_minimal_no_chunking(X, A, B, C):
 
     A = rearrange(A, "b l h -> b h l")
     L = torch.exp(segsum(A))
-    Y = torch.einsum("blhn,bshn,bhls,bshp->blhp", C, B, L, X)
+    Y = torch.einsum("blgn,bsgn,bhls,bshp->blhp", C, B, L, X)
 
     return Y
 
