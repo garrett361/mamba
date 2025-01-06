@@ -100,6 +100,10 @@ def ssd_minimal_no_chunking(X, A, B, C):
 
 def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     """
+    An alternative pure pytorch implementation. Short, naive implementations of the various steps
+    are provided in comments, while masked implementations with better numeric stability are used in
+    code.
+
     Arguments:
         X: (batch, length, n_heads, d_head)
         A: (batch, length, n_heads)
@@ -134,24 +138,26 @@ def ssd_minimal_discrete_alt(X, A, B, C, block_len):
 
     # 3. Center-factor. Shape: bhcs, c and s both chunk dims
     # A_sum_cs = A_sum.cumsum(dim=-1)
-    # center_factor_naive = (A_sum_cs[..., None] - A_sum_cs[..., None, :]).exp()
+    # center_factor_naive = (A_sum_cs[..., None] -  A_sum[..., None] - A_sum_cs[..., None, :]).exp()
+    # (The off_diag_mask mask below would need to be applied to center_factor_naive before using)
 
     # Need a somewhat complicated 3D mask
     n_chunks = A.shape[-2]
-    center_mask1 = torch.tril(
+    center_mask_2d_0 = torch.tril(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
     )
-    center_mask2 = torch.triu(
+    center_mask_2d_1 = torch.triu(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
     )
-    center_mask_total = center_mask1[..., None] | center_mask2[..., None, :]
+    center_mask_3d = center_mask_2d_0[..., None] | center_mask_2d_1[..., None, :]
     center_factor = (
-        A_sum[..., None, None].masked_fill(center_mask_total, 0).sum(dim=-3).exp()
+        A_sum[..., None, None].masked_fill(center_mask_3d, 0).sum(dim=-3).exp()
     )
     off_diag_mask = torch.triu(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
     )
     center_factor = center_factor.masked_fill(off_diag_mask, 0.0)
+
 
     # 4. Left-factor
     # U_naive = A_cumsum.exp()
