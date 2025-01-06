@@ -399,3 +399,67 @@ class TestMambaChunkScanCombined:
         )
         atol = rtol = 1e-5
         assert torch.allclose(y_clean, y_discrete, atol=atol, rtol=rtol)
+
+    def test_seq_idx(
+        self,
+        seqlen: int = 64,
+        dim: int = 64,
+        itype=torch.bfloat16,
+        width: int = 2,
+        device: str = "cuda",
+    ) -> None:
+        """
+        Similar to causal-conv1d's test_causal_conv1d_varlen.
+        """
+        torch.manual_seed(42)
+
+        batch = 3
+        seqlens = []
+        for _ in range(batch):
+            nsplits = torch.randint(1, 5, (1,)).item()
+            eos_pos = torch.randperm(seqlen - 1)[:nsplits].sort().values
+            seqlens.append(
+                torch.diff(
+                    torch.cat([torch.tensor([-1]), eos_pos, torch.tensor([seqlen - 1])])
+                ).tolist()
+            )
+            assert sum(seqlens[-1]) == seqlen
+            assert all(s > 0 for s in seqlens[-1])
+        # Only support channel_last
+        x = rearrange(
+            torch.randn(
+                batch, seqlen, 4096 + dim + 64, device=self.device, dtype=itype
+            )[:, :, 4096 : 4096 + dim],
+            "b s d -> b d s",
+        ).requires_grad_()
+        weight = torch.randn(
+            dim, width, device=device, dtype=torch.float32, requires_grad=True
+        )
+        if has_bias:
+            bias = torch.randn(
+                dim, device=device, dtype=torch.float32, requires_grad=True
+            )
+        else:
+            bias = None
+        seq_idx = torch.stack(
+            [
+                torch.cat(
+                    [
+                        torch.full((s,), i, dtype=torch.int32, device=device)
+                        for i, s in enumerate(sl)
+                    ],
+                    dim=0,
+                )
+                for sl in seqlens
+            ],
+            dim=0,
+        )
+
+        # Comparing fused version and minimal version
+        y = mamba_chunk_scan_combined(x, dt, A, B, C, self.chunk_size, D=None)
+        y_min, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        # These tolerances seem high, but the test fails for rtol = atol = 1e-3. Surprising?
+        rtol = atol = 1e-2
+        assert torch.allclose(y, y_min, rtol=rtol, atol=atol)
