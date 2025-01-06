@@ -3,6 +3,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
@@ -317,7 +318,7 @@ class TestMambaChunkScanCombined:
         )
         return x, dt, A, B, C
 
-    def test_fwd(self):
+    def test_fwd(self) -> None:
         """
         Test the triton mamba_chunk_scan_combined against the pure torch implementation
         ssd_minimal_discrete.
@@ -333,7 +334,7 @@ class TestMambaChunkScanCombined:
         rtol = atol = 1e-2
         assert torch.allclose(y, y_min, rtol=rtol, atol=atol)
 
-    def test_bwd(self):
+    def test_bwd(self) -> None:
         """
         Test the triton mamba_chunk_scan_combined against the pure torch implementation
         ssd_minimal_discrete with a backwards pass.
@@ -366,7 +367,7 @@ class TestMambaChunkScanCombined:
             assert torch.allclose(B.grad, B_c.grad, rtol=rtol, atol=atol)
             assert torch.allclose(C.grad, C_c.grad, rtol=rtol, atol=atol)
 
-    def test_no_chunk_equiv(self):
+    def test_no_chunk_equiv(self) -> None:
         """
         Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunking, which does
         not chunk over the sequence dimension.
@@ -382,7 +383,7 @@ class TestMambaChunkScanCombined:
         atol = rtol = 1e-5
         assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
 
-    def test_alt_chunk(self):
+    def test_alt_chunk(self) -> None:
         """
         Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
         different chunking implementation.
