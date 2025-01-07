@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
+    ssd_minimal_discrete_alt_naive,
     ssd_minimal_no_chunking,
 )
 from mamba_ssm.ops.selective_scan_interface import (
@@ -324,7 +325,6 @@ class TestMambaChunkScanCombined:
         """
         torch.manual_seed(42)
         x, dt, A, B, C = self._get_xdtABC()
-        # Comparing fused version and minimal version
         y = mamba_chunk_scan_combined(x, dt, A, B, C, self.chunk_size, D=None)
         y_min, _ = ssd_minimal_discrete(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
@@ -347,7 +347,6 @@ class TestMambaChunkScanCombined:
         B_c = B.detach().clone().requires_grad_()
         C_c = C.detach().clone().requires_grad_()
 
-        # Comparing fused version and minimal version
         y = mamba_chunk_scan_combined(x, dt, A, B, C, self.chunk_size, D=None)
         y_c, _ = ssd_minimal_discrete(
             x_c * dt_c.unsqueeze(-1), A_c * dt_c, B_c, C_c, self.chunk_size
@@ -374,7 +373,6 @@ class TestMambaChunkScanCombined:
         torch.manual_seed(42)
 
         x, dt, A, B, C = self._get_xdtABC()
-        # Comparing fused version and minimal version
         y_no_chunk = ssd_minimal_no_chunking(x * dt.unsqueeze(-1), A * dt, B, C)
         y_discrete, _ = ssd_minimal_discrete(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
@@ -390,15 +388,31 @@ class TestMambaChunkScanCombined:
         torch.manual_seed(42)
 
         x, dt, A, B, C = self._get_xdtABC()
-        # Comparing fused version and minimal version
-        y_clean = ssd_minimal_discrete_alt(
+        y_alt = ssd_minimal_discrete_alt(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
         )
         y_discrete, _ = ssd_minimal_discrete(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
         )
         atol = rtol = 1e-5
-        assert torch.allclose(y_clean, y_discrete, atol=atol, rtol=rtol)
+        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
+
+    def test_alt_chunk_naive(self) -> None:
+        """
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt_naive, which
+        uses a different chunking implementation.
+        """
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+        y_alt = ssd_minimal_discrete_alt_naive(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
 
     def test_seq_idx_fwd(self) -> None:
         """
@@ -479,8 +493,8 @@ class TestMambaChunkScanCombined:
 
         atol = rtol = 1e-2
         start_idxs = split_idxs[:-1]
-        stop_idxs =  split_idxs[1:]
-        A_grads= torch.zeros_like(A)
+        stop_idxs = split_idxs[1:]
+        A_grads = torch.zeros_like(A)
         for start_idx, stop_idx in zip(start_idxs, stop_idxs):
             x_chunk = x[:, start_idx:stop_idx].detach().clone().requires_grad_()
             dt_chunk = dt[:, start_idx:stop_idx].detach().clone().requires_grad_()
@@ -494,13 +508,20 @@ class TestMambaChunkScanCombined:
 
             # Need to extract the grad first, then slice
             x_chunk_expected_grad = x.grad[:, start_idx:stop_idx]
-            assert torch.allclose(x_chunk.grad, x_chunk_expected_grad, rtol=rtol, atol=atol)
+            assert torch.allclose(
+                x_chunk.grad, x_chunk_expected_grad, rtol=rtol, atol=atol
+            )
             dt_chunk_expected_grad = dt.grad[:, start_idx:stop_idx]
-            assert torch.allclose(dt_chunk.grad, dt_chunk_expected_grad, rtol=rtol, atol=atol)
+            assert torch.allclose(
+                dt_chunk.grad, dt_chunk_expected_grad, rtol=rtol, atol=atol
+            )
             B_chunk_expected_grad = B.grad[:, start_idx:stop_idx]
-            assert torch.allclose(B_chunk.grad, B_chunk_expected_grad, rtol=rtol, atol=atol)
+            assert torch.allclose(
+                B_chunk.grad, B_chunk_expected_grad, rtol=rtol, atol=atol
+            )
             C_chunk_expected_grad = C.grad[:, start_idx:stop_idx]
-            assert torch.allclose(C_chunk.grad, C_chunk_expected_grad, rtol=rtol, atol=atol)
+            assert torch.allclose(
+                C_chunk.grad, C_chunk_expected_grad, rtol=rtol, atol=atol
+            )
             A_grads += A_copy.grad
         assert torch.allclose(A_grads, A.grad, rtol=rtol, atol=atol)
-
