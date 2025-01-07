@@ -264,7 +264,6 @@ class TestMambaChunkScanCombined:
     dstate = 8  # (N) in the paper
     dtype = torch.float32
     device = "cuda"
-    chunk_size = 64
 
     def _get_xdtABC(self, requires_grad: bool = False, batch_size: int = 1):
         x = torch.randn(

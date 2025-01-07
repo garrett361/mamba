@@ -122,7 +122,6 @@ def ssd_minimal_discrete_alt_naive(X, A, B, C, block_len):
     A = rearrange(A, "b c l h -> b h c l")
     A_sum = A.sum(dim=-1)
     A_cumsum = A.cumsum( dim=-1)
-    A_sum_cs = A_sum.cumsum(dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     L = torch.exp(segsum(A))
@@ -133,7 +132,7 @@ def ssd_minimal_discrete_alt_naive(X, A, B, C, block_len):
     right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
 
     # 3. Center-factor (A terms)
-    center_factor = (A_sum_cs[..., None] -  A_sum[..., None] - A_sum_cs[..., None, :]).exp()
+    center_factor = (segsum(A_sum) -  A_sum[..., None]).exp()
     n_chunks = A.shape[-2]
     off_diag_mask = torch.triu(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
@@ -185,7 +184,7 @@ def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
 
     # 3. Center-factor. (A terms)
-    # Need a somewhat complicated 3D mask
+    # Can avoid any subtractions by using a somewhat complicated 3D mask
     n_chunks = A.shape[-2]
     chunk_tril_mask = torch.tril(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
