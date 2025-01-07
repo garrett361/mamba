@@ -3,7 +3,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
@@ -258,17 +257,17 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
 class TestMambaChunkScanCombined:
     ## Dimensions
     # Denoted (B, T, Q, D, P) in the paper
-    batch, seqlen, chunk_size, dim, headdim = 1, 512, 64, 4096, 32
+    seqlen, chunk_size, dim, headdim = 256, 32, 128, 32
     nheads = dim // headdim  # (H) in the paper
     ngroups = 1  # (G) in the paper
-    dstate = 16  # (N) in the paper
+    dstate = 8  # (N) in the paper
     dtype = torch.float32
     device = "cuda"
     chunk_size = 64
 
-    def _get_xdtABC(self, requires_grad: bool = False):
+    def _get_xdtABC(self, requires_grad: bool = False, batch_size: int = 1):
         x = torch.randn(
-            self.batch,
+            batch_size,
             self.seqlen,
             self.nheads,
             self.headdim,
@@ -278,7 +277,7 @@ class TestMambaChunkScanCombined:
         )
         dt = F.softplus(
             torch.randn(
-                self.batch,
+                batch_size,
                 self.seqlen,
                 self.nheads,
                 dtype=self.dtype,
@@ -299,7 +298,7 @@ class TestMambaChunkScanCombined:
             dt.requires_grad_()
             A.requires_grad_()
         B = torch.randn(
-            self.batch,
+            batch_size,
             self.seqlen,
             self.ngroups,
             self.dstate,
@@ -308,7 +307,7 @@ class TestMambaChunkScanCombined:
             requires_grad=requires_grad,
         )
         C = torch.randn(
-            self.batch,
+            batch_size,
             self.seqlen,
             self.ngroups,
             self.dstate,
