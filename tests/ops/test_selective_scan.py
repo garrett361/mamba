@@ -1,17 +1,15 @@
 # Copyright (C) 2023, Tri Dao.
 
-from copy import deepcopy
 import pytest
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-from typing import Optional
 
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
     ssd_minimal_discrete_alt_naive,
     ssd_minimal_no_chunking,
+    ssd_minimal_discrete_alt_slow,
 )
 from mamba_ssm.ops.selective_scan_interface import (
     mamba_inner_fn,
@@ -21,9 +19,7 @@ from mamba_ssm.ops.selective_scan_interface import (
 )
 from mamba_ssm.ops.triton.ssd_combined import (
     mamba_chunk_scan_combined,
-    mamba_split_conv1d_scan_combined,
 )
-from mamba_ssm.modules.mamba2 import Mamba2
 
 
 # @pytest.mark.parametrize('wtype', [torch.float32, torch.complex64])
@@ -261,10 +257,9 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
     # assert torch.allclose(delta_bias.grad, delta_bias_ref.grad, rtol=rtolw, atol=atolw)
 
 
-
 def get_seq_idx_and_cu_seqlens(
     max_splits: int, seqlen: int, device: torch.device
-)->tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     nsplits = torch.randint(1, max_splits + 1, (1,)).item()
     eos_pos = torch.randperm(seqlen - 1)[:nsplits].sort().values
     cu_seqlens = (
@@ -414,6 +409,23 @@ class TestMambaChunkScanCombined:
         atol = rtol = 1e-5
         assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
 
+    def test_alt_show_chunk(self) -> None:
+        """
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
+        different chunking implementation.
+        """
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+        y_alt = ssd_minimal_discrete_alt_slow(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
+
     def test_alt_chunk(self) -> None:
         """
         Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
@@ -447,4 +459,3 @@ class TestMambaChunkScanCombined:
         )
         atol = rtol = 1e-5
         assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
-

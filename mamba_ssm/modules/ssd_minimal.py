@@ -98,6 +98,7 @@ def ssd_minimal_no_chunking(X, A, B, C):
 
     return Y
 
+
 def ssd_minimal_discrete_alt_naive(X, A, B, C, block_len):
     """
     An alternative pure pytorch implementation. Uses naive cancellations between sums which are
@@ -121,7 +122,7 @@ def ssd_minimal_discrete_alt_naive(X, A, B, C, block_len):
 
     A = rearrange(A, "b c l h -> b h c l")
     A_sum = A.sum(dim=-1)
-    A_cumsum = A.cumsum( dim=-1)
+    A_cumsum = A.cumsum(dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     L = torch.exp(segsum(A))
@@ -132,7 +133,7 @@ def ssd_minimal_discrete_alt_naive(X, A, B, C, block_len):
     right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
 
     # 3. Center-factor (A terms)
-    center_factor = (segsum(A_sum) -  A_sum[..., None]).exp()
+    center_factor = (segsum(A_sum) - A_sum[..., None]).exp()
     n_chunks = A.shape[-2]
     off_diag_mask = torch.triu(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
@@ -142,11 +143,79 @@ def ssd_minimal_discrete_alt_naive(X, A, B, C, block_len):
     # 4. Left-factor (C terms)
     left_factor = torch.einsum("bclgn,bhcl->bclghn", C, A_cumsum.exp())
 
-    Y_off = torch.einsum( "bclghn,bhcs,bsghnp->bclhp", left_factor, center_factor, right_factor)
+    Y_off = torch.einsum(
+        "bclghn,bhcs,bsghnp->bclhp", left_factor, center_factor, right_factor
+    )
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
     return Y
+
+
+def ssd_minimal_discrete_alt_slow(X, A, B, C, block_len):
+    """
+    An alternative pure pytorch implementation. Uses masks, rather than relying on cancellations of
+    sums, for numeric stability than ssd_minimal_discrete_alt_naive.
+
+    Arguments:
+        X: (batch, length, n_heads, d_head)
+        A: (batch, length, n_heads)
+        B: (batch, length, n_groups, d_state)
+        C: (batch, length, n_groups, d_state)
+    Return:
+        Y: (batch, length, n_heads, d_head)
+    """
+    assert X.dtype == A.dtype == B.dtype == C.dtype
+    assert X.shape[1] % block_len == 0
+
+    # Rearrange into blocks/chunks
+    X, A, B, C = [
+        rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)
+    ]
+
+    A = rearrange(A, "b c l h -> b h c l")
+    A_sum = A.sum(dim=-1)
+
+    # 1. Compute the output for each intra-chunk (diagonal blocks)
+    L = torch.exp(segsum(A))
+    Y_diag = torch.einsum("bclgn,bcsgn,bhcls,bcshp->bclhp", C, B, L, X)
+
+    # 2. Right-factor (B terms)
+    T_mask = torch.triu(
+        torch.ones(block_len, block_len, dtype=bool, device=A.device), diagonal=0
+    )
+    T = A[..., None].masked_fill(T_mask, 0.0).sum(dim=-2).exp()
+    right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
+
+    # 3. Center-factor. (A terms)
+    # Can avoid any subtractions by using a somewhat complicated 3D mask
+    n_chunks = A.shape[-2]
+    chunk_tril_mask = torch.tril(
+        torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
+    )
+    chunk_triu_mask = torch.triu(
+        torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
+    )
+    center_mask_3d = chunk_tril_mask[..., None] | chunk_triu_mask[..., None, :]
+    center_factor = (
+        A_sum[..., None, None].masked_fill(center_mask_3d, 0).sum(dim=-3).exp()
+    )
+    center_factor = center_factor.masked_fill(chunk_triu_mask, 0.0)
+
+    # 4. Left-factor (C terms)
+    left_factor = torch.einsum("bclgn,bhcl->bclghn", C, torch.cumsum(A, dim=-1).exp())
+
+    Y_off = torch.einsum(
+        "bclghn,bhcs,bsghnp->bclhp",
+        left_factor,
+        center_factor,
+        right_factor,
+    )
+
+    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    return Y
+
 
 def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     """
@@ -197,7 +266,6 @@ def ssd_minimal_discrete_alt(X, A, B, C, block_len):
         A_sum[..., None, None].masked_fill(center_mask_3d, 0).sum(dim=-3).exp()
     )
     center_factor = center_factor.masked_fill(chunk_triu_mask, 0.0)
-
 
     # 4. Left-factor (C terms)
     left_factor = torch.einsum("bclgn,bhcl->bclghn", C, torch.cumsum(A, dim=-1).exp())
