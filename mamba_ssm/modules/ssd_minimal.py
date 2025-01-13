@@ -240,42 +240,29 @@ def ssd_minimal_discrete_alt(X, A, B, C, block_len):
 
     A = rearrange(A, "b c l h -> b h c l")
     A_sum = A.sum(dim=-1)
+    A_cumsum = A.cumsum(dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     L = torch.exp(segsum(A))
     Y_diag = torch.einsum("bclgn,bcsgn,bhcls,bcshp->bclhp", C, B, L, X)
 
-    # 2. Right-factor (B terms)
-    T_mask = torch.triu(
-        torch.ones(block_len, block_len, dtype=bool, device=A.device), diagonal=0
-    )
-    T = A[..., None].masked_fill(T_mask, 0.0).sum(dim=-2).exp()
-    right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
+    # 2. Compute the state for each intra-chunk
+    # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    decay_states = (A_sum[..., None] - A_cumsum).exp()
+    states = torch.einsum("bclgn,bhcl,bclhp->bcghpn", B, decay_states, X)
 
     # 3. Center-factor. (A terms)
-    # Can avoid any subtractions by using a somewhat complicated 3D mask
+    decay_chunk = (segsum(A_sum) - A_sum[..., None]).exp()
     n_chunks = A.shape[-2]
-    chunk_tril_mask = torch.tril(
+    off_diag_mask = torch.triu(
         torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
     )
-    chunk_triu_mask = torch.triu(
-        torch.ones(n_chunks, n_chunks, dtype=bool, device=A.device), diagonal=0
-    )
-    center_mask_3d = chunk_tril_mask[..., None] | chunk_triu_mask[..., None, :]
-    center_factor = (
-        A_sum[..., None, None].masked_fill(center_mask_3d, 0).sum(dim=-3).exp()
-    )
-    center_factor = center_factor.masked_fill(chunk_triu_mask, 0.0)
+    decay_chunk = decay_chunk.masked_fill(off_diag_mask, 0.0)
+    new_states = torch.einsum("bhzc,bcghpn->bzghpn", decay_chunk, states)
 
     # 4. Left-factor (C terms)
-    left_factor = torch.einsum("bclgn,bhcl->bclghn", C, torch.cumsum(A, dim=-1).exp())
-
-    Y_off = torch.einsum(
-        "bclghn,bhcs,bsghnp->bclhp",
-        left_factor,
-        center_factor,
-        right_factor,
-    )
+    state_decay_out = torch.exp(A_cumsum)
+    Y_off = torch.einsum("bclgn,bcghpn,bhcl->bclhp", C, new_states, state_decay_out)
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
