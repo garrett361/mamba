@@ -7,6 +7,8 @@ from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
     ssd_minimal_discrete_alt_slow,
+    ssd_minimal_discrete_alt_slow2,
+    ssd_minimal_discrete_alt_slow3,
 )
 from torch.profiler import profile, ProfilerActivity
 
@@ -86,6 +88,8 @@ if __name__ == "__main__":
 
     args = (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
     for impl in (
+        ssd_minimal_discrete_alt_slow3,
+        ssd_minimal_discrete_alt_slow2,
         ssd_minimal_discrete_alt_slow,
         ssd_minimal_discrete_alt,
         ssd_minimal_discrete,

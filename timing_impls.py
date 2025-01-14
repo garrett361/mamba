@@ -7,6 +7,8 @@ from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
     ssd_minimal_discrete_alt_slow,
+    ssd_minimal_discrete_alt_slow2,
+    ssd_minimal_discrete_alt_slow3,
 )
 
 
@@ -126,6 +128,8 @@ if __name__ == "__main__":
     args = (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
     results = {}
     for impl in (
+        ssd_minimal_discrete_alt_slow3,
+        ssd_minimal_discrete_alt_slow2,
         ssd_minimal_discrete_alt_slow,
         ssd_minimal_discrete_alt,
         ssd_minimal_discrete,
@@ -134,7 +138,7 @@ if __name__ == "__main__":
             impl(*args)
         timer = CudaTimer()
         with timer:
-            for iteration in range(10):
+            for iteration in range(25):
                 impl(*args)
         print(f"{impl.__name__}: {timer.get_mean_time_s()=}")
         results[impl.__name__] = timer.get_mean_time_s()
