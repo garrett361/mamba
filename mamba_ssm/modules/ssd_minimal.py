@@ -7,6 +7,7 @@ This is the same as Listing 1 from the paper.
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch.profiler import record_function
 
 
 def segsum_unstable(x):
@@ -307,7 +308,8 @@ def ssd_minimal_discrete_alt_slow(X, A, B, C, block_len):
 
     # 2. Right-factor (B terms)
     T = (A_sum[..., None] - A_cumsum).exp()
-    right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghnp", T, B, X)
+    with record_function("einsum1_alt_slow"):
+        right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghpn", T, B, X)
 
     # 3. Center-factor. (A terms)
     n_chunks = A.shape[-2]
@@ -319,14 +321,19 @@ def ssd_minimal_discrete_alt_slow(X, A, B, C, block_len):
     )
 
     # 4. Left-factor (C terms)
-    left_factor = torch.einsum("bclgn,bhcl->bclghn", C, torch.cumsum(A, dim=-1).exp())
+    # This step ends up being slow
+    with record_function("einsum2_alt_slow"):
+        left_factor = torch.einsum(
+            "bclgn,bhcl->bclghn", C, torch.cumsum(A, dim=-1).exp()
+        )
 
-    Y_off = torch.einsum(
-        "bclghn,bhcs,bsghnp->bclhp",
-        left_factor,
-        center_factor,
-        right_factor,
-    )
+    with record_function("einsum3_alt_slow"):
+        Y_off = torch.einsum(
+            "bclghn,bhcs,bsghpn->bclhp",
+            left_factor,
+            center_factor,
+            right_factor,
+        )
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
@@ -365,7 +372,8 @@ def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
     T = (A_sum[..., None] - A_cumsum).exp()
-    right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghpn", T, B, X)
+    with record_function("einsum1_alt"):
+        right_factor = torch.einsum("bhcl,bclgn,bclhp->bcghpn", T, B, X)
 
     # 3. Center-factor. (A terms)
     n_chunks = A.shape[-2]
@@ -375,12 +383,14 @@ def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     center_factor = (
         (segsum(A_sum) - A_sum[..., None]).exp().masked_fill(chunk_triu_mask, 0.0)
     )
-    center_factor = torch.einsum("bhzc,bcghpn->bzghpn", center_factor, right_factor)
+    with record_function("einsum2_alt"):
+        center_factor = torch.einsum("bhzc,bcghpn->bzghpn", center_factor, right_factor)
 
     # 4. Left-factor (C terms)
-    Y_off = torch.einsum(
-        "bclgn,bcghpn,bhcl->bclhp", C, center_factor, torch.exp(A_cumsum)
-    )
+    with record_function("einsum3_alt"):
+        Y_off = torch.einsum(
+            "bclgn,bcghpn,bhcl->bclhp", C, center_factor, torch.exp(A_cumsum)
+        )
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")

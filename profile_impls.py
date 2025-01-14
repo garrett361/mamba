@@ -88,8 +88,8 @@ if __name__ == "__main__":
 
     args = (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
     for impl in (
-        ssd_minimal_discrete_alt_slow3,
-        ssd_minimal_discrete_alt_slow2,
+        # ssd_minimal_discrete_alt_slow3,
+        # ssd_minimal_discrete_alt_slow2,
         ssd_minimal_discrete_alt_slow,
         ssd_minimal_discrete_alt,
         ssd_minimal_discrete,
@@ -103,6 +103,6 @@ if __name__ == "__main__":
             impl(*args)
         print(
             f"{impl.__name__}: ",
-            prof.key_averages().table(sort_by="cuda_time_total", row_limit=10),
+            prof.key_averages().table(sort_by="cuda_time_total", row_limit=50),
         )
         prof.export_chrome_trace(f"traces/{impl.__name__}_trace.json")
