@@ -321,13 +321,13 @@ def ssd_minimal_discrete_alt_slow(X, A, B, C, block_len):
     )
 
     # 4. Left-factor (C terms)
-    # This step ends up being slow
     with record_function("einsum2_alt_slow"):
         left_factor = torch.einsum(
             "bclgn,bhcl->bclghn", C, torch.cumsum(A, dim=-1).exp()
         )
 
     with record_function("einsum3_alt_slow"):
+        # This step ends up being slow
         Y_off = torch.einsum(
             "bclghn,bhcs,bsghpn->bclhp",
             left_factor,
