@@ -1,5 +1,4 @@
 # Copyright (C) 2023, Tri Dao.
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -7,10 +6,7 @@ import torch.nn.functional as F
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
-    ssd_minimal_discrete_alt_naive,
-    ssd_minimal_no_chunking,
-    ssd_minimal_discrete_alt_slow,
-    ssd_minimal_discrete_alt_slow2,
+    ssd_minimal_no_chunk_quadratic,
 )
 from mamba_ssm.ops.selective_scan_interface import (
     mamba_inner_fn,
@@ -425,7 +421,7 @@ class TestSSDImpls:
     headdim = 32
     nheads = dim // headdim
     ngroups = 1
-    dstate = 8
+    dstate = 1
     dtype = torch.float32
     device = "cuda"
     max_splits = 4
@@ -531,69 +527,18 @@ class TestSSDImpls:
 
     def test_no_chunk_equiv(self) -> None:
         """
-        Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunking, which does
-        not chunk over the sequence dimension.
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunk_quadratic, which
+        does not chunk over the sequence dimension.
         """
         torch.manual_seed(42)
 
         x, dt, A, B, C = self._get_xdtABC()
-        y_no_chunk = ssd_minimal_no_chunking(x * dt.unsqueeze(-1), A * dt, B, C)
+        y_no_chunk = ssd_minimal_no_chunk_quadratic(x * dt.unsqueeze(-1), A * dt, B, C)
         y_discrete, _ = ssd_minimal_discrete(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
         )
         atol = rtol = 1e-5
         assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
-
-    def test_alt_show_chunk3(self) -> None:
-        """
-        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
-        different chunking implementation.
-        """
-        torch.manual_seed(42)
-
-        x, dt, A, B, C = self._get_xdtABC()
-        y_alt = ssd_minimal_discrete_alt_slow2(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        y_discrete, _ = ssd_minimal_discrete(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        atol = rtol = 1e-5
-        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
-
-    def test_alt_show_chunk2(self) -> None:
-        """
-        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
-        different chunking implementation.
-        """
-        torch.manual_seed(42)
-
-        x, dt, A, B, C = self._get_xdtABC()
-        y_alt = ssd_minimal_discrete_alt_slow2(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        y_discrete, _ = ssd_minimal_discrete(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        atol = rtol = 1e-5
-        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
-
-    def test_alt_show_chunk(self) -> None:
-        """
-        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
-        different chunking implementation.
-        """
-        torch.manual_seed(42)
-
-        x, dt, A, B, C = self._get_xdtABC()
-        y_alt = ssd_minimal_discrete_alt_slow(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        y_discrete, _ = ssd_minimal_discrete(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        atol = rtol = 1e-5
-        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
 
     def test_alt_chunk(self) -> None:
         """
@@ -604,23 +549,6 @@ class TestSSDImpls:
 
         x, dt, A, B, C = self._get_xdtABC()
         y_alt = ssd_minimal_discrete_alt(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        y_discrete, _ = ssd_minimal_discrete(
-            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
-        )
-        atol = rtol = 1e-5
-        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
-
-    def test_alt_chunk_naive(self) -> None:
-        """
-        Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt_naive, which
-        uses a different chunking implementation.
-        """
-        torch.manual_seed(42)
-
-        x, dt, A, B, C = self._get_xdtABC()
-        y_alt = ssd_minimal_discrete_alt_naive(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
         )
         y_discrete, _ = ssd_minimal_discrete(

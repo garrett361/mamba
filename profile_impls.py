@@ -6,9 +6,6 @@ import torch.nn.functional as F
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
-    ssd_minimal_discrete_alt_slow,
-    ssd_minimal_discrete_alt_slow2,
-    ssd_minimal_discrete_alt_slow3,
 )
 from torch.profiler import profile, ProfilerActivity
 
@@ -80,20 +77,13 @@ def get_xdtABC(
 
 
 if __name__ == "__main__":
-    seqlen = 4096
+    seqlen = 131072
+    batch_size = 1
     chunk_size = 32
-    x, dt, A, B, C = get_xdtABC(seqlen=seqlen)
-    y_alt = ssd_minimal_discrete_alt(x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
-    y_discrete, _ = ssd_minimal_discrete(x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
+    x, dt, A, B, C = get_xdtABC(seqlen=seqlen, batch_size=batch_size)
 
     args = (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
-    for impl in (
-        # ssd_minimal_discrete_alt_slow3,
-        # ssd_minimal_discrete_alt_slow2,
-        ssd_minimal_discrete_alt_slow,
-        ssd_minimal_discrete_alt,
-        ssd_minimal_discrete,
-    ):
+    for impl in (ssd_minimal_discrete_alt, ssd_minimal_discrete):
         for warmup in range(5):
             impl(*args)
         with profile(
@@ -103,6 +93,6 @@ if __name__ == "__main__":
             impl(*args)
         print(
             f"{impl.__name__}: ",
-            prof.key_averages().table(sort_by="cuda_time_total", row_limit=50),
+            prof.key_averages().table(sort_by="cuda_time_total", row_limit=20),
         )
         prof.export_chrome_trace(f"traces/{impl.__name__}_trace.json")

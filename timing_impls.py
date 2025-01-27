@@ -4,12 +4,9 @@ import torch
 import torch.nn.functional as F
 
 from mamba_ssm.modules.ssd_minimal import (
-    ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
-    ssd_minimal_discrete_alt_slow,
-    ssd_minimal_discrete_alt_slow2,
-    ssd_minimal_discrete_alt_slow3,
 )
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
 class CudaTimer:
@@ -119,29 +116,36 @@ def get_xdtABC(
 
 
 if __name__ == "__main__":
-    seqlen = 4096
-    chunk_size = 32
-    x, dt, A, B, C = get_xdtABC(seqlen=seqlen)
-    y_alt = ssd_minimal_discrete_alt(x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
-    y_discrete, _ = ssd_minimal_discrete(x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
+    seqlen = 8192
+    batch_size = 8
+    chunk_size = 8
+    warmups = 10
+    iters = 25
+    x, dt, A, B, C = get_xdtABC(seqlen=seqlen, batch_size=batch_size)
 
     args = (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
     results = {}
-    for impl in (
-        ssd_minimal_discrete_alt_slow3,
-        ssd_minimal_discrete_alt_slow2,
-        ssd_minimal_discrete_alt_slow,
-        ssd_minimal_discrete_alt,
-        ssd_minimal_discrete,
-    ):
-        for warmup in range(5):
+    for impl in (ssd_minimal_discrete_alt,):
+        for warmup in range(warmups):
             impl(*args)
         timer = CudaTimer()
         with timer:
-            for iteration in range(25):
+            for iteration in range(iters):
                 impl(*args)
         print(f"{impl.__name__}: {timer.get_mean_time_s()=}")
         results[impl.__name__] = timer.get_mean_time_s()
+
+    impl = mamba_chunk_scan_combined
+    args = (x, dt, A, B, C, chunk_size)
+    for warmup in range(warmups):
+        impl(*args)
+    timer = CudaTimer()
+    with timer:
+        for iteration in range(iters):
+            impl(*args)
+    print(f"{impl.__name__}: {timer.get_mean_time_s()=}")
+    results[impl.__name__] = timer.get_mean_time_s()
+
     min_time = min(results.values())
     for name, r in results.items():
         results[name] = r / min_time
