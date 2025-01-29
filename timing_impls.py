@@ -1,52 +1,16 @@
 from typing import Optional
+import argparse
 
 import torch
 import torch.nn.functional as F
 
 from mamba_ssm.modules.ssd_minimal import (
+    ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
+    ssd_minimal_no_chunk_linear,
 )
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-
-
-class CudaTimer:
-    def __init__(self) -> None:
-        self._start_events: list[torch.cuda.Event] = []
-        self._end_events: list[torch.cuda.Event] = []
-
-    def __enter__(self) -> None:
-        start = torch.cuda.Event(enable_timing=True)
-        stop = torch.cuda.Event(enable_timing=True)
-        start.record()
-        self._start_events.append(start)
-        self._end_events.append(stop)
-
-    def __exit__(self, *args, **kwargs) -> None:
-        self._end_events[-1].record()
-
-    def __len__(self) -> int:
-        return len(self._start_events)
-
-    def get_time_list_s(self) -> list[float]:
-        if not self._start_events:
-            return [0.0]
-        torch.cuda.synchronize()
-        time_list_s = [
-            start.elapsed_time(end) / 1e3
-            for start, end in zip(self._start_events, self._end_events)
-        ]
-        return time_list_s
-
-    def get_total_time_s(self) -> float:
-        return sum(self.get_time_list_s())
-
-    def get_mean_time_s(self) -> float:
-        time_list_s = self.get_time_list_s()
-        return sum(time_list_s) / len(time_list_s)
-
-    def reset(self) -> None:
-        self._start_events.clear()
-        self._end_events.clear()
+from triton.testing import do_bench
 
 
 def get_xdtABC(
@@ -112,41 +76,64 @@ def get_xdtABC(
         device=device,
         requires_grad=requires_grad,
     )
-    return x, dt, A, B, C
+    return (
+        x.contiguous(),
+        dt.contiguous(),
+        A.contiguous(),
+        B.contiguous(),
+        C.contiguous(),
+    )
 
 
 if __name__ == "__main__":
-    seqlen = 8192
-    batch_size = 8
-    chunk_size = 8
-    warmups = 10
-    iters = 25
-    x, dt, A, B, C = get_xdtABC(seqlen=seqlen, batch_size=batch_size)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seqlen", type=int, default=8192)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--chunk_size", type=int, default=64)
+    parser.add_argument("--warmup", type=int, default=25)
+    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--no_mamba", action="store_true")
 
-    args = (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
-    results = {}
-    for impl in (ssd_minimal_discrete_alt,):
-        for warmup in range(warmups):
-            impl(*args)
-        timer = CudaTimer()
-        with timer:
-            for iteration in range(iters):
-                impl(*args)
-        print(f"{impl.__name__}: {timer.get_mean_time_s()=}")
-        results[impl.__name__] = timer.get_mean_time_s()
+    args = parser.parse_args()
+    x, dt, A, B, C = get_xdtABC(seqlen=args.seqlen, batch_size=args.batch_size)
 
-    impl = mamba_chunk_scan_combined
-    args = (x, dt, A, B, C, chunk_size)
-    for warmup in range(warmups):
-        impl(*args)
-    timer = CudaTimer()
-    with timer:
-        for iteration in range(iters):
-            impl(*args)
-    print(f"{impl.__name__}: {timer.get_mean_time_s()=}")
-    results[impl.__name__] = timer.get_mean_time_s()
+    kernel_args = (x, dt, A, B, C, args.chunk_size)
+
+    def kernel_args_wrapper(x, dt, A, B, C, chunk_size):
+        return (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
+
+    impl_dict = {
+        "discrete": lambda *kernel_args: ssd_minimal_discrete(
+            *kernel_args_wrapper(*kernel_args)
+        ),
+        "discrete_alt": lambda *kernel_args: ssd_minimal_discrete_alt(
+            *kernel_args_wrapper(*kernel_args)
+        ),
+        "no_chunk_linear": lambda *kernel_args: ssd_minimal_no_chunk_linear(
+            *kernel_args_wrapper(*kernel_args)[:-1]
+        ),
+    }
+    if not args.no_mamba:
+        impl_dict["mamba_ssm"] = mamba_chunk_scan_combined
+
+    results: dict[str, float] = {}
+    for name, impl in impl_dict.items():
+        # Don't compile the mamba impl
+        if name != "mamba_ssm" and args.compile:
+            impl = torch.compile(impl)
+            name += "_compile"
+
+        bench_fn = lambda: impl(*kernel_args)
+        if name != "mamba_ssm" and args.compile:
+            # Compile
+            bench_fn()
+
+        mean_time_ms = do_bench(bench_fn, warmup=args.warmup, rep=args.rep)
+        print(f"Mean time {name}: {mean_time_ms:.2f} ms")
+        results[name] = mean_time_ms
 
     min_time = min(results.values())
-    for name, r in results.items():
-        results[name] = r / min_time
-    print(f"Relative times: {results}")
+    print("\nRelative times:")
+    for name, r in sorted(results.items(), key=lambda x: x[1]):
+        print(f"{name}: {r / min_time}")
