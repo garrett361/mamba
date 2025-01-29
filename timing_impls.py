@@ -90,8 +90,8 @@ if __name__ == "__main__":
     parser.add_argument("--seqlen", type=int, default=8192)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--chunk_size", type=int, default=64)
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--rep", type=int, default=500)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--no_mamba", action="store_true")
 
