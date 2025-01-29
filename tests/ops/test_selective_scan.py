@@ -540,6 +540,21 @@ class TestSSDImpls:
         atol = rtol = 1e-5
         assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
 
+    def test_no_chunk_linear_equiv(self) -> None:
+        """
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunk_linear, which
+        does not chunk over the sequence dimension.
+        """
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+        y_no_chunk = ssd_minimal_no_chunk_linear(x * dt.unsqueeze(-1), A * dt, B, C)
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
+
     def test_alt_chunk(self) -> None:
         """
         Test the equivalence between ssd_minimal_discrete and ssd_minimal_discrete_alt, which uses a
