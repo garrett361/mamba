@@ -103,6 +103,23 @@ def ssd_minimal_no_chunk_quadratic(X, A, B, C):
     return Y
 
 
+def ssd_minimal_no_chunk_linear(X, A, B, C):
+    """
+    Arguments:
+        X: (batch, length, n_heads, d_head)
+        A: (batch, length, n_heads)
+        B: (batch, length, n_groups, d_state)
+        C: (batch, length, n_groups, d_state)
+    Return:
+        Y: (batch, length, n_heads, d_head)
+    """
+    assert X.dtype == A.dtype == B.dtype == C.dtype
+    A_cs = A.cumsum(dim=1)
+    out = torch.einsum("bsh,bsgn,bshp->bsghp", (-A_cs).exp(), B, X).cumsum(dim=1)
+    out = torch.einsum("bsgp,bsh,bsghp->bshp", C, A_cs.exp(), out)
+    return out
+
+
 def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     """
     An alternative pure pytorch implementation. Uses masks, rather than relying on cancellations of
