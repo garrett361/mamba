@@ -115,8 +115,8 @@ def ssd_minimal_no_chunk_linear(X, A, B, C):
     """
     assert X.dtype == A.dtype == B.dtype == C.dtype
     A_cs = A.cumsum(dim=1)
-    out = torch.einsum("bsh,bsgn,bshp->bsghp", (-A_cs).exp(), B, X).cumsum(dim=1)
-    out = torch.einsum("bsgp,bsh,bsghp->bshp", C, A_cs.exp(), out)
+    out = torch.einsum("bsh,bsgn,bshp->bsghpn", (-A_cs).exp(), B, X).cumsum(dim=1)
+    out = torch.einsum("bsgn,bsh,bsghpn->bshp", C, A_cs.exp(), out)
     return out
 
 
