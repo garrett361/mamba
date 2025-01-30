@@ -10,7 +10,6 @@ from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete_alt,
     ssd_minimal_no_chunk_linear,
 )
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
 def get_xdtABC(
@@ -108,13 +107,13 @@ if __name__ == "__main__":
         "no_chunk_linear": lambda *kernel_args: ssd_minimal_no_chunk_linear(
             *kernel_args_wrapper(*kernel_args)[:-1]
         ),
-        "triton": mamba_chunk_scan_combined,
     }
 
     def kernel_args_wrapper(x, dt, A, B, C, chunk_size):
         return (x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
 
     for name, impl in impl_dict.items():
+        impl = torch.compile(impl, mode="max-autotune")
         for warmup in range(5):
             impl(*kernel_args)
         with profile(
@@ -128,4 +127,4 @@ if __name__ == "__main__":
                 sort_by="cuda_time_total", row_limit=args.row_limit
             ),
         )
-        prof.export_chrome_trace(f"traces/{name}_trace.json")
+        prof.export_chrome_trace(f"traces/{name}_compiled_trace.json")

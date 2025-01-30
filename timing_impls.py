@@ -121,7 +121,7 @@ if __name__ == "__main__":
     for name, impl in impl_dict.items():
         # Don't compile the mamba impl
         if name != "mamba_ssm" and args.compile:
-            impl = torch.compile(impl)
+            impl = torch.compile(impl, fullgraph=True, mode="max-autotune")
             name += "_compile"
 
         bench_fn = lambda: impl(*kernel_args)
