@@ -6,7 +6,9 @@ import torch.nn.functional as F
 from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
+    ssd_minimal_no_chunk_linear,
     ssd_minimal_no_chunk_quadratic,
+    ssd_chunked_linear_alt_sig,
 )
 from mamba_ssm.ops.selective_scan_interface import (
     mamba_inner_fn,
@@ -525,7 +527,7 @@ class TestSSDImpls:
             assert torch.allclose(B.grad, B_c.grad, rtol=rtol, atol=atol)
             assert torch.allclose(C.grad, C_c.grad, rtol=rtol, atol=atol)
 
-    def test_no_chunk_equiv(self) -> None:
+    def test_no_chunk_quadratic_equiv(self) -> None:
         """
         Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunk_quadratic, which
         does not chunk over the sequence dimension.
@@ -565,6 +567,29 @@ class TestSSDImpls:
         x, dt, A, B, C = self._get_xdtABC()
         y_alt = ssd_minimal_discrete_alt(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_alt, y_discrete, atol=atol, rtol=rtol)
+
+    def test_ssd_chunked_linear_alt_sig(self) -> None:
+        """
+        Test the equivalence between ssd_minimal_discrete and ssd_minimal_no_chunk_linear, which
+        does not chunk over the sequence dimension.
+        """
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+
+        y_alt = ssd_chunked_linear_alt_sig(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size=self.chunk_size,
         )
         y_discrete, _ = ssd_minimal_discrete(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
