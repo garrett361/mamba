@@ -120,6 +120,26 @@ def ssd_minimal_no_chunk_linear(X, A, B, C):
     return out
 
 
+def ssd_minimal_no_chunk_linear_alt_sig(
+    x: torch.Tensor,  # (batch_size, seq_len, n_heads * d_head)
+    dt: torch.Tensor,  # (batch_size, seq_len, n_heads)
+    A: torch.Tensor,  # (n_heads,)
+    B: torch.Tensor,  # (batch_size, seq_len, n_groups * d_state)
+    C: torch.Tensor,  # (batch_size, seq_len, n_groups * d_state)
+    chunk_size: int,
+    D: Optional[torch.Tensor] = None,
+):
+    X = x * dt[..., None]
+    A = A * dt
+
+    assert X.dtype == A.dtype == B.dtype == C.dtype
+    A_cs = A.cumsum(dim=1)
+    out = torch.einsum("bsh,bsgn,bshp->bsghpn", (-A_cs).exp(), B, X).cumsum(dim=1)
+    out = torch.einsum("bsgn,bsghpn->bshp", C, out)
+    out = torch.einsum("bsh,bshp->bshp", A_cs.exp(), out)
+    return out
+
+
 def ssd_minimal_discrete_alt(X, A, B, C, block_len):
     """
     An alternative pure pytorch implementation. Uses masks, rather than relying on cancellations of

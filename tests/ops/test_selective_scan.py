@@ -7,6 +7,7 @@ from mamba_ssm.modules.ssd_minimal import (
     ssd_minimal_discrete,
     ssd_minimal_discrete_alt,
     ssd_minimal_no_chunk_linear,
+    ssd_minimal_no_chunk_linear_alt_sig,
     ssd_minimal_no_chunk_quadratic,
     ssd_chunked_linear_alt_sig,
 )
@@ -417,16 +418,15 @@ def get_seq_idx_and_cu_seqlens(
 
 
 class TestSSDImpls:
-    seqlen = 256
+    seqlen = 512
     chunk_size = 32
     dim = 128
     headdim = 32
     nheads = dim // headdim
-    ngroups = 1
-    dstate = 1
+    ngroups = 2  # The fwd/bwd tests fail when ngroups=2
+    dstate = 16
     dtype = torch.float32
     device = "cuda"
-    max_splits = 4
 
     def _get_xdtABC(self, requires_grad: bool = False, batch_size: int = 1):
         x = torch.randn(
@@ -554,6 +554,20 @@ class TestSSDImpls:
         y_discrete, _ = ssd_minimal_discrete(
             x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
         )
+        atol = rtol = 1e-5
+        assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
+
+    def test_no_chunk_linear_equiv_alt_sig(self) -> None:
+        torch.manual_seed(42)
+
+        x, dt, A, B, C = self._get_xdtABC()
+        y_no_chunk = ssd_minimal_no_chunk_linear_alt_sig(
+            x, dt, A, B, C, self.chunk_size, D=None
+        )
+        y_discrete, _ = ssd_minimal_discrete(
+            x * dt.unsqueeze(-1), A * dt, B, C, self.chunk_size
+        )
+
         atol = rtol = 1e-5
         assert torch.allclose(y_no_chunk, y_discrete, atol=atol, rtol=rtol)
 
