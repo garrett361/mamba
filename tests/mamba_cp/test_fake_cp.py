@@ -2,7 +2,7 @@ from copy import deepcopy
 import torch
 from einops import rearrange
 import torch.nn.functional as F
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_ssm.ops.triton.ssd_combined_split import mamba_chunk_scan_combined_split
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -79,7 +79,7 @@ def scan(
         dim=-1,
     )
     A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
-    y, final_state = mamba_chunk_scan_combined(
+    y, final_state = mamba_chunk_scan_combined_split(
         rearrange(x, "b l (h p) -> b l h p", p=model.headdim),
         dt,
         A,
@@ -165,6 +165,19 @@ class TestLocalChunking:
         outputs = model(inputs)
         outputs_fwd = fwd(inputs, model)
         torch.testing.assert_close(outputs, outputs_fwd)
+
+    def test_bwd(self) -> None:
+        model_copy = deepcopy(self.model)
+        torch.manual_seed(42)
+        inputs = self.get_inputs(requires_grad=True)
+        torch.manual_seed(42)
+        inputs_copy = self.get_inputs(requires_grad=True)
+        self.model(inputs).sum().backward()
+
+        fwd(inputs_copy, model_copy).sum().backward()
+        for p1, p2 in zip(self.model.parameters(), model_copy.parameters()):
+            torch.testing.assert_close(p1, p2)
+        torch.testing.assert_close(inputs.grad, inputs_copy.grad)
 
     def test_conv(self) -> None:
         xBC = self.get_xBC()
