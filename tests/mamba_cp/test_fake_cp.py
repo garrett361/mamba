@@ -237,3 +237,27 @@ class TestLocalChunking:
             torch.testing.assert_close(p1, p2)
         tol = 5e-3
         torch.testing.assert_close(xBC.grad, xBC_clone.grad, atol=tol, rtol=tol)
+
+    def test_chunked_state_passing_sequential_fwd(self) -> None:
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+
+        # Shard and create the conv states
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+        )
+
+        out, _ = _state_passing_fwd(states, dA_chunk_cumsum)
+
+        out_cp_list = []
+        initial_states = None
+        for cp_rank in range(self.cp_dim):
+            cp_out, initial_states = _state_passing_fwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+                initial_states,
+            )
+            out_cp_list.append(cp_out)
+        out_cp = torch.cat(out_cp_list, dim=1)
+        torch.testing.assert_close(out, out_cp)
