@@ -216,11 +216,8 @@ class TestLocalChunking:
         model_cp = deepcopy(self.model)
 
         # Shard and create the conv states
-        xBC_cp = rearrange(xBC_clone, "b (c l) d -> b l d c ", c=self.cp_dim)
+        xBC_cp = rearrange(xBC_clone, "b (r l) d -> b l d r ", r=self.cp_dim)
         xBC_cp_conv_states = xBC_cp[:, -(self.model.d_conv - 1) :]
-        xBC_cp_conv_states = xBC_cp_conv_states.roll(1, dims=-1)
-        # First conv state is trivial (could also make it None)
-        xBC_cp_conv_states[..., 0] = 0.0
 
         outputs = conv(xBC, self.model)
         outputs.sum().backward()
@@ -229,10 +226,11 @@ class TestLocalChunking:
             cp_out = conv(
                 xBC_cp[..., cp_rank],
                 model=model_cp,
-                conv_state=xBC_cp_conv_states[..., cp_rank],
+                conv_state=None
+                if not cp_rank
+                else xBC_cp_conv_states[..., cp_rank - 1],
             )
-            # Not sure why, but I am being required to retain the graph.
-            cp_out.sum().backward(retain_graph=True)
+            cp_out.sum().backward()
         for p1, p2 in zip(self.model.parameters(), model_cp.parameters()):
             torch.testing.assert_close(p1, p2)
         tol = 5e-3
@@ -248,7 +246,7 @@ class TestLocalChunking:
             dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
         )
 
-        out, _ = _state_passing_fwd(states, dA_chunk_cumsum)
+        out, final_state = _state_passing_fwd(states, dA_chunk_cumsum)
 
         out_cp_list = []
         initial_states = None
@@ -261,3 +259,4 @@ class TestLocalChunking:
             out_cp_list.append(cp_out)
         out_cp = torch.cat(out_cp_list, dim=1)
         torch.testing.assert_close(out, out_cp)
+        torch.testing.assert_close(final_state, initial_states)
