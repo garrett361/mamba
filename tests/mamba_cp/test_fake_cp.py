@@ -3,6 +3,14 @@ import torch
 from einops import rearrange
 import torch.nn.functional as F
 from mamba_ssm.ops.triton.ssd_combined_split import mamba_chunk_scan_combined_split
+from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan
+from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state
+from mamba_ssm.ops.triton.ssd_state_passing import state_passing
+
+from mamba_ssm.ops.triton.ssd_combined import (
+    _chunk_cumsum_fwd,
+    _state_passing_fwd,
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -21,6 +29,7 @@ except ImportError:
 
 
 from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
 
 def in_proj_split(inputs, model: Mamba2, seq_idx=None):
@@ -127,11 +136,76 @@ def fwd(
     return out
 
 
-class TestLocalChunking:
+def scan_alt(
+    xBC: torch.Tensor,
+    dt: torch.Tensor,
+    z: torch.Tensor,
+    model: Mamba2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x, B, C = torch.split(
+        xBC,
+        [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
+        dim=-1,
+    )
+    x = rearrange(x, "b l (h p) -> b l h p", p=model.headdim)
+    B = rearrange(B, "b l (g n) -> b l g n", g=model.ngroups)
+    C = rearrange(C, "b l (g n) -> b l g n", g=model.ngroups)
+    D = (
+        rearrange(model.D, "(h p) -> h p", p=model.headdim)
+        if model.D_has_hdim
+        else model.D
+    )
+    z = (
+        rearrange(z, "b l (h p) -> b l h p", p=model.headdim)
+        if not model.rmsnorm
+        else None
+    )
+
+    A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
+    dA_cumsum, dt = _chunk_cumsum_fwd(
+        dt, A, model.chunk_size, dt_bias=model.dt_bias, dt_softplus=True
+    )
+    states = chunk_state(
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        states_in_fp32=True,
+    )
+    states = rearrange(states, "... p n -> ... (p n)")
+    states, final_states = state_passing(
+        states,
+        dA_cumsum[..., -1],
+    )
+    states = rearrange(states, "... (p n) -> ... p n", n=model.d_state)
+    out = chunk_scan(
+        B,
+        C,
+        x,
+        dt,
+        dA_cumsum,
+        states,
+        D=D,
+        z=None,  # z,
+    )
+    out = rearrange(out, "... h p -> ... (h p)")
+    final_states = rearrange(final_states, "... (p n) -> ... p n", n=model.d_state)
+
+    return out, final_states
+
+
+class TestLocalCP:
+    """
+    Single-device mock ups of CP, and other related tests.
+    """
+
     batch_size = 2
     cp_dim = 4
-    seq_len = 32
-    d_model = 256
+    chunk_size = 4
+    seq_len = 4 * cp_dim * chunk_size
+    n_chunks = seq_len // chunk_size
+    d_model = 128
+    d_state = 16
     factory_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
     model = Mamba2(d_model, **factory_kwargs)
 
@@ -152,6 +226,27 @@ class TestLocalChunking:
             **self.factory_kwargs,
             requires_grad=requires_grad,
         )
+
+    def get_states_dA_chunk_cumum(
+        self, requires_grad: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n_heads = self.model.d_model * self.model.expand // self.model.headdim
+        states = torch.randn(
+            self.batch_size,
+            self.n_chunks,
+            n_heads,
+            self.model.headdim,
+            **self.factory_kwargs,
+            requires_grad=requires_grad,
+        )
+        dA_chunk_cumsum = torch.randn(
+            self.batch_size,
+            n_heads,
+            self.n_chunks,
+            **self.factory_kwargs,
+            requires_grad=requires_grad,
+        )
+        return states, dA_chunk_cumsum
 
     def test(self) -> None:
         model = Mamba2(self.d_model, **self.factory_kwargs)
@@ -178,6 +273,14 @@ class TestLocalChunking:
         for p1, p2 in zip(self.model.parameters(), model_copy.parameters()):
             torch.testing.assert_close(p1, p2)
         torch.testing.assert_close(inputs.grad, inputs_copy.grad)
+
+    def test_alt_scan(self) -> None:
+        z0, x0, z, xBC, dt = in_proj_split(self.get_inputs(), self.model)
+        out, final_state = scan(xBC, dt, z, self.model)
+        out_alt, final_state_alt = scan_alt(xBC, dt, z, self.model)
+        torch.testing.assert_close(final_state, final_state_alt)
+        tol = 1e-2
+        torch.testing.assert_close(out, out_alt, atol=tol, rtol=tol)
 
     def test_conv(self) -> None:
         xBC = self.get_xBC()
@@ -260,3 +363,104 @@ class TestLocalChunking:
         out_cp = torch.cat(out_cp_list, dim=1)
         torch.testing.assert_close(out, out_cp)
         torch.testing.assert_close(final_state, initial_states)
+
+    def test_chunked_state_passing_allgather_fwd(self) -> None:
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        # states: (b, c, h, p)
+        # dA_chunk_cumsum: (b, h, c)
+
+        # Shard and create the conv states
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+        )
+
+        out, final_state = _state_passing_fwd(states, dA_chunk_cumsum)
+
+        # Compute the states local to each rank (trivial initial_states)
+        out_partial_cp_list = []
+        final_state_cp_list = []
+        for cp_rank in range(self.cp_dim):
+            cp_out_partial, final_state_cp = _state_passing_fwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+            )
+            out_partial_cp_list.append(cp_out_partial)
+            final_state_cp_list.append(final_state_cp)
+
+        # Simulate all-gathering the final states summed dA_chunk_cumsum_cp per rank.
+        out_partial_cp = torch.stack(out_partial_cp_list, dim=-1)
+        final_states_cp = torch.stack(final_state_cp_list, dim=1)
+        dA_chunk_cumsum_last_cp = dA_chunk_cumsum_cp[:, :, -1]
+
+        # State passing on the final states.
+        all_gathered_out_states, _ = _state_passing_fwd(
+            final_states_cp,
+            dA_chunk_cumsum_last_cp,
+        )
+        all_gathered_out_states = rearrange(
+            all_gathered_out_states, "b r h p -> b h p r"
+        )
+        # Need to multiply by the cumsum over chunks of A.
+        dA_chunk_cumsum2_cp = dA_chunk_cumsum_cp.cumsum(dim=2)
+
+        state_corrections_cp = torch.einsum(
+            "bhpr,bhcr->bchpr", all_gathered_out_states, dA_chunk_cumsum2_cp
+        )
+        state_corrections = rearrange(state_corrections_cp, "b c h p r -> b (r c) h p")
+        out_partial = rearrange(out_partial_cp, "b c h p r -> b (r c) h p")
+        out_partial_corrected = out_partial + state_corrections
+
+        torch.testing.assert_close(out, out_partial + state_corrections)
+        torch.testing.assert_close(final_state, initial_states)
+
+    def test_chunked_final_state_allgather_fwd(self) -> None:
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        # states: (b, c, h, p)
+        # dA_chunk_cumsum: (b, h, c)
+
+        # Shard and create the conv states
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+        )
+
+        # The proper computation with final state passing
+        actual_final_state_list = []
+        final_state = None
+        for cp_rank in range(self.cp_dim):
+            _, final_state = _state_passing_fwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+                final_state,
+            )
+            actual_final_state_list.append(final_state)
+
+        # Partial computation using only states local to each rank (trivial initial_states)
+        out_partial_cp_list = []
+        final_state_cp_list = []
+        for cp_rank in range(self.cp_dim):
+            cp_out_partial, final_state_cp = _state_passing_fwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+            )
+            out_partial_cp_list.append(cp_out_partial)
+            final_state_cp_list.append(final_state_cp)
+
+        # Simulate all-gathering the final states summed dA_chunk_cumsum_cp per rank.
+        out_partial_cp = torch.stack(out_partial_cp_list, dim=-1)
+        final_states_cp = torch.stack(final_state_cp_list, dim=1)
+        dA_chunk_cumsum_last_cp = dA_chunk_cumsum_cp[:, :, -1]
+
+        # State passing on the final states.
+        all_gathered_out_states, _ = _state_passing_fwd(
+            final_states_cp,
+            dA_chunk_cumsum_last_cp,
+        )
+
+        for rank in range(1, 4):
+            fs1 = actual_final_state_list[rank - 1]
+            fs2 = all_gathered_out_states[:, rank]
+            torch.testing.assert_close(fs1, fs2)
