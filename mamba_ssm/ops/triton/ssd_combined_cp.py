@@ -338,6 +338,57 @@ def _mamba_chunk_scan_combined_post_states_bwd(
     # The final states is not stored.
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
     dstates = rearrange(dstates, "... (p n) -> ... p n", n=dstate)
+    return (
+        dstates,
+        dinitial_states,
+        dA_cumsum,
+        CB,
+        states,
+        outz,
+        dB_given,
+        dC_given,
+        ddt_given,
+        ddA_chunk_cumsum,
+        dt_in,
+    )
+
+
+def _mamba_chunk_scan_combined_post_dstates_bwd(
+    dout,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    chunk_size,
+    dstates,
+    dinitial_states,
+    dA_cumsum,
+    CB,
+    states,
+    outz,
+    dB_given,
+    dC_given,
+    ddt_given,
+    ddA_chunk_cumsum,
+    dt_in,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    dx=None,
+    ddt=None,
+    dB=None,
+    dC=None,
+    dz=None,
+    recompute_output=False,
+):
+    _, _, ngroups, dstate = B.shape
     dinitial_states = (
         rearrange(dinitial_states, "... (p n) -> ... p n", n=dstate)
         if dinitial_states is not None
@@ -458,7 +509,20 @@ def _mamba_chunk_scan_combined_bwd(
             recompute_output,
         )
     )
-    return _mamba_chunk_scan_combined_post_states_bwd(
+
+    (
+        dstates,
+        dinitial_states,
+        dA_cumsum,
+        CB,
+        states,
+        outz,
+        dB_given,
+        dC_given,
+        ddt_given,
+        ddA_chunk_cumsum,
+        dt_in,
+    ) = _mamba_chunk_scan_combined_post_states_bwd(
         dout,
         x,
         dt,
@@ -470,6 +534,41 @@ def _mamba_chunk_scan_combined_bwd(
         states,
         dA_cumsum,
         CB,
+        dt_in,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        dfinal_states,
+        seq_idx,
+        dt_softplus,
+        dt_limit,
+        dx,
+        ddt,
+        dB,
+        dC,
+        dz,
+        recompute_output,
+    )
+    return _mamba_chunk_scan_combined_post_dstates_bwd(
+        dout,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        chunk_size,
+        dstates,
+        dinitial_states,
+        dA_cumsum,
+        CB,
+        states,
+        outz,
+        dB_given,
+        dC_given,
+        ddt_given,
+        ddA_chunk_cumsum,
         dt_in,
         D,
         z,
