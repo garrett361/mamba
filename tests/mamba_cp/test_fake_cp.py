@@ -3,9 +3,6 @@ import torch
 from einops import rearrange
 import torch.nn.functional as F
 from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
-from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan
-from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state
-from mamba_ssm.ops.triton.ssd_state_passing import state_passing
 
 from mamba_ssm.ops.triton.ssd_combined import (
     _chunk_cumsum_fwd,
@@ -169,65 +166,6 @@ class ChunkCumsumFn(torch.autograd.Function):
         _chunk_cumsum_bwd
 
 
-def scan_alt(
-    xBC: torch.Tensor,
-    dt: torch.Tensor,
-    z: torch.Tensor,
-    model: Mamba2,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x, B, C = torch.split(
-        xBC,
-        [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
-        dim=-1,
-    )
-    # Follow Mamba2.forward processing:
-    x = rearrange(x, "b l (h p) -> b l h p", p=model.headdim)
-    B = rearrange(B, "b l (g n) -> b l g n", g=model.ngroups)
-    C = rearrange(C, "b l (g n) -> b l g n", g=model.ngroups)
-    D = (
-        rearrange(model.D, "(h p) -> h p", p=model.headdim)
-        if model.D_has_hdim
-        else model.D
-    )
-    z = (
-        rearrange(z, "b l (h p) -> b l h p", p=model.headdim)
-        if not model.rmsnorm
-        else None
-    )
-
-    A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
-    dA_cumsum, dt = _chunk_cumsum_fwd(
-        dt, A, model.chunk_size, dt_bias=model.dt_bias, dt_softplus=True
-    )
-    states = chunk_state(
-        B,
-        x,
-        dt,
-        dA_cumsum,
-        states_in_fp32=True,
-    )
-    states = rearrange(states, "... p n -> ... (p n)")
-    states, final_states = state_passing(
-        states,
-        dA_cumsum[..., -1],
-    )
-    states = rearrange(states, "... (p n) -> ... p n", n=model.d_state)
-    out = chunk_scan(
-        B,
-        C,
-        x,
-        dt,
-        dA_cumsum,
-        states,
-        D=D,
-        z=z,
-    )
-    out = rearrange(out, "... h p -> ... (h p)")
-    final_states = rearrange(final_states, "... (p n) -> ... p n", n=model.d_state)
-
-    return out, final_states
-
-
 class TestLocalCP:
     """
     Single-device mock ups of CP, and other related tests.
@@ -303,14 +241,6 @@ class TestLocalCP:
         for p1, p2 in zip(self.model.parameters(), model_copy.parameters()):
             torch.testing.assert_close(p1, p2)
         torch.testing.assert_close(inputs.grad, inputs_copy.grad)
-
-    def test_alt_scan(self) -> None:
-        z0, x0, z, xBC, dt = in_proj_split(self.get_inputs(), self.model)
-        out, final_state = scan(xBC, dt, z, self.model)
-        out_alt, final_state_alt = scan_alt(xBC, dt, z, self.model)
-        torch.testing.assert_close(final_state, final_state_alt)
-        tol = 1e-2
-        torch.testing.assert_close(out, out_alt, atol=tol, rtol=tol)
 
     def test_conv(self) -> None:
         xBC = self.get_xBC()
