@@ -1,31 +1,37 @@
+"""
+Split the ssd_combined kernels at the state_passing step so that custom logic for CP can be
+inserted at this point.
+"""
+
+import math
+
 import torch
 import triton
-import math
 from einops import rearrange
 from packaging import version
 
 from mamba_ssm.ops.triton.ssd_combined import (
-    _bmm_chunk_fwd,
     _bmm_chunk_bwd,
-    _chunk_scan_bwd_dz,
-    _chunk_scan_fwd,
-    _chunk_scan_bwd_dstates,
+    _bmm_chunk_fwd,
     _chunk_cumsum_bwd,
     _chunk_cumsum_fwd,
-    _state_passing_bwd,
-    _chunk_scan_chunk_state_bwd_dx,
-    _chunk_state_bwd_db,
     _chunk_scan_bwd_dC,
-    _chunk_state_fwd,
     _chunk_scan_bwd_dcb,
-    _state_passing_fwd,
     _chunk_scan_bwd_ddAcs_stable,
+    _chunk_scan_bwd_dstates,
+    _chunk_scan_bwd_dz,
+    _chunk_scan_chunk_state_bwd_dx,
+    _chunk_scan_fwd,
+    _chunk_state_bwd_db,
+    _chunk_state_fwd,
+    _state_passing_bwd,
+    _state_passing_fwd,
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
-def _mamba_chunk_scan_get_states_fwd(
+def _mamba_chunk_scan_states_fwd(
     x,
     dt,
     A,
@@ -88,20 +94,26 @@ def _mamba_chunk_scan_get_states_fwd(
     states, final_states = [
         rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
     ]
-    return dt, dA_cumsum, states, final_states
+    return states, final_states, dt, dA_cumsum
 
 
-def _mamba_chunk_scan_get_out_fwd(
+def _mamba_chunk_scan_post_states_fwd(
     x,
     dt,
+    A,
     B,
     C,
+    chunk_size,
     states,
     dA_cumsum,
-    chunk_size,
     D=None,
     z=None,
+    dt_bias=None,
+    initial_states=None,
     seq_idx=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
 ):
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
     out, out_x = _chunk_scan_fwd(
@@ -126,7 +138,7 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
 ):
-    dt, dA_cumsum, states, final_states = _mamba_chunk_scan_get_states_fwd(
+    states, final_states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
         x,
         dt,
         A,
@@ -142,23 +154,29 @@ def _mamba_chunk_scan_combined_fwd(
         dt_softplus,
         dt_limit,
     )
-    out, out_x = _mamba_chunk_scan_get_out_fwd(
+    out, out_x = _mamba_chunk_scan_post_states_fwd(
         x,
         dt,
+        A,
         B,
         C,
+        chunk_size,
         states,
         dA_cumsum,
-        chunk_size,
         D,
         z,
+        dt_bias,
+        initial_states,
         seq_idx,
+        cu_seqlens,
+        dt_softplus,
+        dt_limit,
     )
 
     return out, out_x, dt, dA_cumsum, states, final_states
 
 
-def _mamba_chunk_scan_combined_bwd(
+def _mamba_chunk_scan_combined_states_bwd(
     dout,
     x,
     dt,
@@ -200,6 +218,63 @@ def _mamba_chunk_scan_combined_bwd(
         assert seq_idx.shape == (batch, seqlen)
     if dx is not None:
         assert dx.shape == x.shape
+    # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
+    # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
+    dt_in = dt.clone()
+    dA_cumsum, dt = _chunk_cumsum_fwd(
+        dt_in,
+        A,
+        chunk_size,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+    )
+    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+    states, final_state = _state_passing_fwd(
+        rearrange(states, "... p n -> ... (p n)"),
+        dA_cumsum[:, :, :, -1],
+        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
+        if initial_states is not None
+        else None,
+        seq_idx=seq_idx,
+        chunk_size=chunk_size,
+    )
+    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+    # dt has been overwritten here and we need to pass the overwritten dt into the next parts of the
+    # kernel.
+    return states, final_state, dA_cumsum, dstate, dt_in, dt, CB
+
+
+def _mamba_chunk_scan_combined_post_states_bwd(
+    dout,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    chunk_size,
+    states,
+    dA_cumsum,
+    CB,
+    dt_in,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    dx=None,
+    ddt=None,
+    dB=None,
+    dC=None,
+    dz=None,
+    recompute_output=False,
+):
+    _, _, ngroups, dstate = B.shape
     if dB is not None:
         assert dB.shape == B.shape
         dB_given = dB
@@ -214,33 +289,11 @@ def _mamba_chunk_scan_combined_bwd(
         assert z is not None
         assert dz.shape == z.shape
     if ddt is not None:
-        assert ddt.shape == dt.shape
+        # Needs to be dt_in here and below, not the overwritten dt here
+        assert ddt.shape == dt_in.shape
         ddt_given = ddt
     else:
-        ddt_given = torch.empty_like(dt)
-    # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
-    # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
-    dt_in = dt.clone()
-    dA_cumsum, dt = _chunk_cumsum_fwd(
-        dt_in,
-        A,
-        chunk_size,
-        dt_bias=dt_bias,
-        dt_softplus=dt_softplus,
-        dt_limit=dt_limit,
-    )
-    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-    states, _ = _state_passing_fwd(
-        rearrange(states, "... p n -> ... (p n)"),
-        dA_cumsum[:, :, :, -1],
-        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-        if initial_states is not None
-        else None,
-        seq_idx=seq_idx,
-        chunk_size=chunk_size,
-    )
-    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+        ddt_given = torch.empty_like(dt_in)
     if z is not None:
         dz, dout, dD, *rest = _chunk_scan_bwd_dz(
             x,
@@ -264,6 +317,8 @@ def _mamba_chunk_scan_combined_bwd(
     # gradient to the states of chunk (nchunks - 2) at index (nchunks - 1)
     # Do computation in fp32 but convert dstates and states to fp16/bf16 since dstates and states
     # will be used in matmul in the next kernels.
+
+    # GG: `states` here is just a dtype-coverted version of the states above, I believe.
     dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum[:, :, :, -1],
@@ -351,6 +406,86 @@ def _mamba_chunk_scan_combined_bwd(
         dinitial_states,
     )
     return return_vals if not recompute_output else (*return_vals, outz)
+
+
+def _mamba_chunk_scan_combined_bwd(
+    dout,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    dx=None,
+    ddt=None,
+    dB=None,
+    dC=None,
+    dz=None,
+    recompute_output=False,
+):
+    states, final_state, dA_cumsum, dstate, dt_in, dt, CB = (
+        _mamba_chunk_scan_combined_states_bwd(
+            dout,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            out,
+            chunk_size,
+            D,
+            z,
+            dt_bias,
+            initial_states,
+            dfinal_states,
+            seq_idx,
+            dt_softplus,
+            dt_limit,
+            dx,
+            ddt,
+            dB,
+            dC,
+            dz,
+            recompute_output,
+        )
+    )
+    return _mamba_chunk_scan_combined_post_states_bwd(
+        dout,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        chunk_size,
+        states,
+        dA_cumsum,
+        CB,
+        dt_in,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        dfinal_states,
+        seq_idx,
+        dt_softplus,
+        dt_limit,
+        dx,
+        ddt,
+        dB,
+        dC,
+        dz,
+        recompute_output,
+    )
 
 
 class MambaChunkScanCombinedFn(torch.autograd.Function):

@@ -2,13 +2,14 @@ from copy import deepcopy
 import torch
 from einops import rearrange
 import torch.nn.functional as F
-from mamba_ssm.ops.triton.ssd_combined_split import mamba_chunk_scan_combined_split
+from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
 from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan
 from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state
 from mamba_ssm.ops.triton.ssd_state_passing import state_passing
 
 from mamba_ssm.ops.triton.ssd_combined import (
     _chunk_cumsum_fwd,
+    _chunk_cumsum_bwd,
     _state_passing_fwd,
 )
 
@@ -56,6 +57,9 @@ def in_proj_split(inputs, model: Mamba2, seq_idx=None):
 
 
 def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
+    """
+    Perform causal_conv1d_fn correcting for any previous conv_state, if any.
+    """
     assert seq_idx is None, "seq_idx not currently supported"
     out = causal_conv1d_fn(
         xBC.transpose(1, 2),
@@ -136,6 +140,35 @@ def fwd(
     return out
 
 
+class ChunkCumsumFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        dt,
+        A,
+        chunk_size,
+        dt_bias=None,
+        dt_softplus=False,
+        dt_limit=(0.0, float("inf")),
+    ):
+        dA_cumsum, dt = _chunk_cumsum_fwd(
+            dt,
+            A,
+            chunk_size,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+        )
+        ctx.save_for_backward(
+            dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx
+        )
+        return dA_cumsum, dt
+
+    @staticmethod
+    def backward(ctx, dout, dfinal_states):
+        _chunk_cumsum_bwd
+
+
 def scan_alt(
     xBC: torch.Tensor,
     dt: torch.Tensor,
@@ -147,6 +180,7 @@ def scan_alt(
         [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
         dim=-1,
     )
+    # Follow Mamba2.forward processing:
     x = rearrange(x, "b l (h p) -> b l h p", p=model.headdim)
     B = rearrange(B, "b l (g n) -> b l g n", g=model.ngroups)
     C = rearrange(C, "b l (g n) -> b l g n", g=model.ngroups)
@@ -186,7 +220,7 @@ def scan_alt(
         dA_cumsum,
         states,
         D=D,
-        z=None,  # z,
+        z=z,
     )
     out = rearrange(out, "... h p -> ... (h p)")
     final_states = rearrange(final_states, "... (p n) -> ... p n", n=model.d_state)
@@ -204,10 +238,12 @@ class TestLocalCP:
     chunk_size = 4
     seq_len = 4 * cp_dim * chunk_size
     n_chunks = seq_len // chunk_size
-    d_model = 128
-    d_state = 16
+    d_model = 256
+    d_state = 128
     factory_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
-    model = Mamba2(d_model, **factory_kwargs)
+    model = Mamba2(
+        d_model=d_model, d_state=d_state, chunk_size=chunk_size, **factory_kwargs
+    )
 
     def get_inputs(self, requires_grad: bool = False) -> torch.Tensor:
         return torch.randn(
@@ -247,12 +283,6 @@ class TestLocalCP:
             requires_grad=requires_grad,
         )
         return states, dA_chunk_cumsum
-
-    def test(self) -> None:
-        model = Mamba2(self.d_model, **self.factory_kwargs)
-        inputs = self.get_inputs()
-        outputs = model(inputs)
-        outputs
 
     def test_fwd(self) -> None:
         model = Mamba2(self.d_model, **self.factory_kwargs)
