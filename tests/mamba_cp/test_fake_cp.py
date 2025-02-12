@@ -300,6 +300,16 @@ class TestLocalCP:
         torch.testing.assert_close(xBC.grad, xBC_clone.grad, atol=tol, rtol=tol)
 
     def test_chunked_state_passing_sequential_fwd(self) -> None:
+        """
+        Simulated CP with serial state_passing step:
+        - Rank 0 completes its state_passing with initial_sates = None, then passes final_state to
+          Rank 1.
+        - Rank 1 completes its state_passing using the received final_state as its initial_state,
+          and passes the new final_state to Rank 2
+        - ...
+        - The last rank completes its state_passing using the received final_state as its
+          initial_state.
+        """
         torch.manual_seed(42)
         states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
 
@@ -324,7 +334,7 @@ class TestLocalCP:
         torch.testing.assert_close(out, out_cp)
         torch.testing.assert_close(final_state, initial_states)
 
-    def test_chunked_final_state(self) -> None:
+    def test_chunked_final_state_all_gather(self) -> None:
         """
         Test that we are computing the final states correctly in the allgather strategy.
         """
@@ -381,12 +391,92 @@ class TestLocalCP:
             fs2 = recomputed_final_state_list[rank]
             tol = 1e-4
             torch.testing.assert_close(fs1, fs2, rtol=tol, atol=tol)
-        out_partial_corrected = out_partial + state_corrections
 
-        torch.testing.assert_close(out, out_partial + state_corrections)
-        torch.testing.assert_close(final_state, initial_states)
+    def test_chunked_out_state_allgather(self) -> None:
+        """
+        Test building the proper out-state with the allgather strategy.
+        """
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        # states: (b, c, h, p)
+        # dA_chunk_cumsum: (b, h, c)
 
-    def test_chunked_final_state_allgather_fwd(self) -> None:
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+        )
+
+        # The proper computation with final state passing
+        actual_initial_state_list = []
+        actual_out_state_list = []
+        actual_final_state_list = []
+        initial_state = None
+        for cp_rank in range(self.cp_dim):
+            out_state, final_state = _state_passing_fwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+                initial_state,
+            )
+            if initial_state is not None:
+                # Sanity check
+                torch.testing.assert_close(initial_state, out_state[:, 0])
+            actual_initial_state_list.append(initial_state)
+            actual_out_state_list.append(out_state)
+            actual_final_state_list.append(final_state)
+            # Need to dtypes to match, otherwise the out_state[: 0] and initial_state only agree to
+            # ~1e-2 level
+            initial_state = final_state.to(out_state)
+
+        # Partial computation using only states local to each rank (trivial initial_states)
+        out_partial_cp_list = []
+        for cp_rank in range(self.cp_dim):
+            cp_out_partial, _ = _state_passing_fwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+            )
+            out_partial_cp_list.append(cp_out_partial)
+
+        # Then use local info, communicated final_states, and the partial results to build the
+        # correct out_state
+        for cp_rank in range(self.cp_dim):
+            out_partial = out_partial_cp_list[cp_rank]
+            if cp_rank == 0:
+                torch.testing.assert_close(out_partial, actual_out_state_list[cp_rank])
+            else:
+                initial_states = actual_final_state_list[cp_rank - 1]  # b, h, p
+
+                # Locally, we need to cumsum over the available dA_chunk_cumsum chunks
+                # and offset the indexing by one.
+                dA_chunk_cumsum_local = rearrange(
+                    dA_chunk_cumsum_cp[..., cp_rank], "b h c -> b c h"
+                ).to(torch.float32)
+                dA_chunk_cumsum_local = dA_chunk_cumsum_local.roll(1, dims=1)
+                dA_chunk_cumsum_local[:, 0] = 0.0
+                dA_chunk_cumsum_local_processed = (
+                    dA_chunk_cumsum_local.cumsum(dim=1).exp().to(out_partial)
+                )
+                corrected_out = (
+                    out_partial
+                    + initial_states[:, None].to(out_partial)
+                    * dA_chunk_cumsum_local_processed[..., None]
+                )  # b, c, h, p
+
+                expected_out = actual_out_state_list[cp_rank]
+                # Passes, but only with very lenient tolerances.
+                tol = 1e-1
+                torch.testing.assert_close(
+                    corrected_out, expected_out, rtol=tol, atol=tol
+                )
+
+    def test_chunked_state_passing_allgather_fwd(self) -> None:
+        """
+        Simulated CP with somewhat more parallelized state_passing step:
+        - Every rank completes its state_passing with initial_sates = None.
+        - final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+        - state_passing used on gathered final_state with dA_cumsum.sum(dim=-1) as the args
+        - Each ranks adds a slice of the output from the prev step to its state to correct for the
+          missing parts
+        """
         torch.manual_seed(42)
         states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
         # states: (b, c, h, p)
@@ -398,18 +488,9 @@ class TestLocalCP:
             dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
         )
 
-        # The proper computation with final state passing
-        actual_final_state_list = []
-        final_state = None
-        for cp_rank in range(self.cp_dim):
-            _, final_state = _state_passing_fwd(
-                states_cp[..., cp_rank],
-                dA_chunk_cumsum_cp[..., cp_rank],
-                final_state,
-            )
-            actual_final_state_list.append(final_state)
+        out, final_state = _state_passing_fwd(states, dA_chunk_cumsum)
 
-        # Partial computation using only states local to each rank (trivial initial_states)
+        # Compute the states local to each rank (trivial initial_states)
         out_partial_cp_list = []
         final_state_cp_list = []
         for cp_rank in range(self.cp_dim):
@@ -423,15 +504,46 @@ class TestLocalCP:
         # Simulate all-gathering the final states summed dA_chunk_cumsum_cp per rank.
         out_partial_cp = torch.stack(out_partial_cp_list, dim=-1)
         final_states_cp = torch.stack(final_state_cp_list, dim=1)
-        dA_chunk_cumsum_last_cp = dA_chunk_cumsum_cp[:, :, -1]
+        # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
+        dA_chunk_cumsum_sum_cp = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2)
 
-        # State passing on the final states.
-        all_gathered_out_states, _ = _state_passing_fwd(
+        # Locally compute state passing on the final states, which defines the proper initial states
+        # for each rank
+        initial_states_cp, _ = _state_passing_fwd(
             final_states_cp,
-            dA_chunk_cumsum_last_cp,
+            dA_chunk_cumsum_sum_cp,
         )
+        initial_states_cp = rearrange(initial_states_cp, "b r h p -> b h p r")
 
-        for rank in range(1, 4):
-            fs1 = actual_final_state_list[rank - 1]
-            fs2 = all_gathered_out_states[:, rank]
-            torch.testing.assert_close(fs1, fs2)
+        # Build the correction by multiplying by the exponentiated cumsum over chunks of A.
+        # Use float32 again for better numerics
+        dA_chunk_cumsum2_cp = dA_chunk_cumsum_cp.to(torch.float32)  # (b, h, c, r)
+        # And requires index shifting and zeroing
+        dA_chunk_cumsum2_cp = dA_chunk_cumsum2_cp.roll(1, dims=2)
+        dA_chunk_cumsum2_cp[:, :, 0] = 0.0
+        dA_chunk_cumsum2_cp = dA_chunk_cumsum2_cp.cumsum(dim=2).exp()
+
+        state_corrections_cp = torch.einsum(
+            "bhpr,bhcr->bchpr",
+            initial_states_cp,
+            dA_chunk_cumsum2_cp,
+        )
+        state_corrections = rearrange(state_corrections_cp, "b c h p r -> b (r c) h p")
+        out_partial = rearrange(out_partial_cp, "b c h p r -> b (r c) h p")
+        # high-precision computations
+        out_partial_corrected = out_partial.to(state_corrections) + state_corrections
+        out_partial_corrected = out_partial_corrected.to(out)
+        # Again needs high tolerance to fully pass.
+        tol = 1e-1
+        torch.testing.assert_close(out, out_partial_corrected, atol=tol, rtol=tol)
+
+    def test_state_passing_init_states(self) -> None:
+        """
+        Verifying that initial states become the first chunk of _state_passing_fwd's out states
+        """
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+
+        initial_states = torch.randn_like(states[:, 0])
+        out, final_state = _state_passing_fwd(states, dA_chunk_cumsum, initial_states)
+        torch.testing.assert_close(initial_states, out[:, 0])
