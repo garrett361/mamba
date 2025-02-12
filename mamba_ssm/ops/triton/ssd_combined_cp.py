@@ -6,6 +6,7 @@ inserted at this point.
 import math
 
 import torch
+import torch.distributed as dist
 import triton
 from einops import rearrange
 from packaging import version
@@ -29,6 +30,41 @@ from mamba_ssm.ops.triton.ssd_combined import (
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+
+
+def _state_passing_fwd_single(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    states,
+    dA_cumsum,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    seq_idx=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+):
+    _, _, ngroups, dstate = B.shape
+    states, final_states = _state_passing_fwd(
+        rearrange(states, "... p n -> ... (p n)"),
+        dA_cumsum[:, :, :, -1],
+        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
+        if initial_states is not None
+        else None,
+        seq_idx=seq_idx,
+        chunk_size=chunk_size,
+        out_dtype=C.dtype,
+    )
+    states, final_states = [
+        rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
+    ]
+    return states, final_states
 
 
 def _mamba_chunk_scan_states_fwd(
@@ -81,20 +117,7 @@ def _mamba_chunk_scan_states_fwd(
         dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
     )
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-    states, final_states = _state_passing_fwd(
-        rearrange(states, "... p n -> ... (p n)"),
-        dA_cumsum[:, :, :, -1],
-        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-        if initial_states is not None
-        else None,
-        seq_idx=seq_idx,
-        chunk_size=chunk_size,
-        out_dtype=C.dtype,
-    )
-    states, final_states = [
-        rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
-    ]
-    return states, final_states, dt, dA_cumsum
+    return states, dt, dA_cumsum
 
 
 def _mamba_chunk_scan_post_states_fwd(
@@ -138,13 +161,31 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
 ):
-    states, final_states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
+    states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
         x,
         dt,
         A,
         B,
         C,
         chunk_size,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        cu_seqlens,
+        dt_softplus,
+        dt_limit,
+    )
+    states, final_states = _state_passing_fwd_single(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        states,
+        dA_cumsum,
         D,
         z,
         dt_bias,
@@ -765,3 +806,61 @@ def mamba_chunk_scan_combined_split(
         return_final_states,
         return_varlen_states,
     )
+
+
+def _mamba_chunk_scan_combined_cp_serial_fwd(
+    group: dist.ProcessGroup,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    seq_idx=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+):
+    """
+    CP scan with serial state passing.
+    """
+    states, final_states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        cu_seqlens,
+        dt_softplus,
+        dt_limit,
+    )
+    out, out_x = _mamba_chunk_scan_post_states_fwd(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        states,
+        dA_cumsum,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        cu_seqlens,
+        dt_softplus,
+        dt_limit,
+    )
+
+    return out, out_x, dt, dA_cumsum, states, final_states
