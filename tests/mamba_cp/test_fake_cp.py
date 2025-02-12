@@ -1,14 +1,17 @@
 from copy import deepcopy
-import torch
-from einops import rearrange
-import torch.nn.functional as F
-from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
 
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.ops.triton.ssd_combined import (
-    _chunk_cumsum_fwd,
     _chunk_cumsum_bwd,
+    _chunk_cumsum_fwd,
     _state_passing_fwd,
 )
+from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -24,10 +27,6 @@ try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 except ImportError:
     selective_state_update = None
-
-
-from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
 
 def in_proj_split(inputs, model: Mamba2, seq_idx=None):

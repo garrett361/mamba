@@ -1,6 +1,10 @@
 """
 Split the ssd_combined kernels at the state_passing step so that custom logic for CP can be
 inserted at this point.
+
+`_mamba_chunk_scan_combined_fwd` is equivalent to the proper `_mamba_chunk_scan_fwd` and similar for
+`bwd`, which we verify through tests.
+
 """
 
 import math
@@ -32,7 +36,7 @@ from mamba_ssm.ops.triton.ssd_combined import (
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
-def _state_passing_fwd_single(
+def _state_passing_single_fwd(
     x,
     dt,
     A,
@@ -177,7 +181,7 @@ def _mamba_chunk_scan_combined_fwd(
         dt_softplus,
         dt_limit,
     )
-    states, final_states = _state_passing_fwd_single(
+    states, final_states = _state_passing_single_fwd(
         x,
         dt,
         A,
@@ -808,8 +812,104 @@ def mamba_chunk_scan_combined_split(
     )
 
 
+#### Start CP Impls ####
+
+
+def _state_passing_cp_serial_fwd(
+    mesh: dist.device_mesh.DeviceMesh,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    states,
+    dA_cumsum,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    seq_idx=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+):
+    rank = mesh.get_rank()
+    for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
+        if rank == send_rank:
+            states, final_states = _state_passing_single_fwd(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                chunk_size,
+                states,
+                dA_cumsum,
+                D,
+                z,
+                dt_bias,
+                initial_states,
+                seq_idx,
+                cu_seqlens,
+                dt_softplus,
+                dt_limit,
+            )
+
+            # TODO: @goon - should just use dist.send, but this gave:
+            # ncclInternalError: Internal check failed.
+            # Last error:
+            # ncclSocketInit: connecting to address  with family 59408 is neither AF_INET(2) nor AF_INET6(10)
+            #
+            # Probably some local dev env issue?
+
+            dist.batch_isend_irecv(
+                [dist.P2POp(dist.isend, final_states, recv_rank, mesh.get_group())]
+            )[0].wait()
+            # dist.send(
+            #     final_states,
+            #     dst=recv_rank,
+            #     group=mesh.get_group(),
+            # )
+        elif rank == recv_rank:
+            initial_states = torch.empty_like(states[:, 0])
+            print(f"Receiving on {rank} from {send_rank}")
+            # TODO: @goon - should use dist.recv; see above.
+            dist.batch_isend_irecv(
+                [dist.P2POp(dist.irecv, initial_states, send_rank, mesh.get_group())]
+            )[0].wait()
+            # dist.recv(
+            #     initial_states,
+            #     src=send_rank,
+            #     group=mesh.get_group(),
+            # )
+        dist.barrier()
+
+    # Final rank only:
+    if rank == recv_rank:
+        states, final_states = _state_passing_single_fwd(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            states,
+            dA_cumsum,
+            D,
+            z,
+            dt_bias,
+            initial_states,
+            seq_idx,
+            cu_seqlens,
+            dt_softplus,
+            dt_limit,
+        )
+    return states, final_states
+
+
 def _mamba_chunk_scan_combined_cp_serial_fwd(
-    group: dist.ProcessGroup,
+    mesh: dist.device_mesh.DeviceMesh,
     x,
     dt,
     A,
@@ -825,16 +925,32 @@ def _mamba_chunk_scan_combined_cp_serial_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
 ):
-    """
-    CP scan with serial state passing.
-    """
-    states, final_states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
+    states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
         x,
         dt,
         A,
         B,
         C,
         chunk_size,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        cu_seqlens,
+        dt_softplus,
+        dt_limit,
+    )
+    states, final_states = _state_passing_cp_serial_fwd(
+        mesh,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        states,
+        dA_cumsum,
         D,
         z,
         dt_bias,
