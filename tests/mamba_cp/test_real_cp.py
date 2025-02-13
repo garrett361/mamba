@@ -1,14 +1,14 @@
 import torch
 import torch.distributed as dist
 from einops import rearrange
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from test_fake_cp import in_proj_split
 
 from dtest import DTest
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import RingCommsFn
 from mamba_ssm.ops.triton.ssd_combined_cp import (
-    _mamba_chunk_scan_combined_fwd,
-    _mamba_chunk_scan_combined_cp_serial_fwd,
+    mamba_chunk_scan_combined_serial_cp,
 )
 
 
@@ -160,20 +160,21 @@ class TestSerialCP(DTest):
         non_seq_dim_kwargs = self._get_non_seq_dim_kwargs(model)
         return {**cp_seq_dim_kwargs, **non_seq_dim_kwargs}
 
-    def test_serial_cp_fwd(self):
-        self.print_rank("Test 1")
+    def test_fwd(self):
         torch.manual_seed(42)
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         inputs = self.get_inputs()
         model = self.get_model()
+
         # The correct global outputs:
         kwargs = self.get_scan_kwargs(inputs, model)
-        outputs = _mamba_chunk_scan_combined_fwd(**kwargs)[0]
+        outputs = mamba_chunk_scan_combined(**kwargs)
+
         # And the CP output:
         cp_kwargs = self.get_cp_scan_kwargs(inputs, model)
-        self.print_rank("Test 2")
-        outputs_cp = _mamba_chunk_scan_combined_cp_serial_fwd(mesh=mesh, **cp_kwargs)[0]
-        self.print_rank("Test 3")
+        outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **cp_kwargs)
+        self.print_rank(f"{outputs.shape=}, {outputs_cp.shape=}")
+
         # All-gather and verify correctness
         outputs_cp_all_gathered = torch.empty(
             self.world_size,
