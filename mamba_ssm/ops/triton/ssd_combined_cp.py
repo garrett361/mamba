@@ -72,6 +72,51 @@ def _state_passing_single_fwd(
     return states, final_states
 
 
+def _state_passing_single_bwd(
+    dout,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    chunk_size,
+    states,
+    dA_cumsum,
+    CB,
+    dt_in,
+    dstates,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    dx=None,
+    ddt=None,
+    dB=None,
+    dC=None,
+    dz=None,
+    recompute_output=False,
+):
+    dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
+        rearrange(states, "... p n -> ... (p n)"),
+        dA_cumsum[:, :, :, -1],
+        rearrange(dstates, "... p n -> ... (p n)"),
+        dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)")
+        if dfinal_states is not None
+        else None,
+        seq_idx=seq_idx,
+        has_initial_states=initial_states is not None,
+        dstates_dtype=x.dtype,
+        states_dtype=x.dtype,
+        chunk_size=chunk_size,
+    )
+    return dstates, ddA_chunk_cumsum, dinitial_states, states
+
+
 def _mamba_chunk_scan_states_fwd(
     x,
     dt,
@@ -354,18 +399,34 @@ def _mamba_chunk_scan_post_states_bwd(
     # will be used in matmul in the next kernels.
 
     # GG: `states` here is just a dtype-coverted version of the states above, I believe.
-    dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
-        rearrange(states, "... p n -> ... (p n)"),
-        dA_cumsum[:, :, :, -1],
-        rearrange(dstates, "... p n -> ... (p n)"),
-        dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)")
-        if dfinal_states is not None
-        else None,
-        seq_idx=seq_idx,
-        has_initial_states=initial_states is not None,
-        dstates_dtype=x.dtype,
-        states_dtype=x.dtype,
-        chunk_size=chunk_size,
+    dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_single_bwd(
+        dout,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        chunk_size,
+        states,
+        dA_cumsum,
+        CB,
+        dt_in,
+        dstates,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        dfinal_states,
+        seq_idx,
+        dt_softplus,
+        dt_limit,
+        dx,
+        ddt,
+        dB,
+        dC,
+        dz,
+        recompute_output,
     )
     # dstates has length nchunks, containing the gradient to states of chunk 0 at index 0 and
     # gradient to the final states at index (nchunks - 1)
