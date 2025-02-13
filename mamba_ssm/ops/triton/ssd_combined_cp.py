@@ -53,6 +53,7 @@ def _state_passing_single_fwd(
     cu_seqlens=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    out_dtype=None,
 ):
     _, _, ngroups, dstate = B.shape
     states, final_states = _state_passing_fwd(
@@ -63,7 +64,7 @@ def _state_passing_single_fwd(
         else None,
         seq_idx=seq_idx,
         chunk_size=chunk_size,
-        out_dtype=C.dtype,
+        out_dtype=out_dtype,
     )
     states, final_states = [
         rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
@@ -198,6 +199,7 @@ def _mamba_chunk_scan_combined_fwd(
         cu_seqlens,
         dt_softplus,
         dt_limit,
+        out_dtype=C.dtype,
     )
     out, out_x = _mamba_chunk_scan_post_states_fwd(
         x,
@@ -221,7 +223,7 @@ def _mamba_chunk_scan_combined_fwd(
     return out, out_x, dt, dA_cumsum, states, final_states
 
 
-def _mamba_chunk_scan_combined_states_bwd(
+def _mamba_chunk_scan_states_bwd(
     dout,
     x,
     dt,
@@ -276,22 +278,10 @@ def _mamba_chunk_scan_combined_states_bwd(
     )
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-    states, final_state = _state_passing_fwd(
-        rearrange(states, "... p n -> ... (p n)"),
-        dA_cumsum[:, :, :, -1],
-        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
-        if initial_states is not None
-        else None,
-        seq_idx=seq_idx,
-        chunk_size=chunk_size,
-    )
-    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
-    # dt has been overwritten here and we need to pass the overwritten dt into the next parts of the
-    # kernel.
-    return states, final_state, dA_cumsum, dstate, dt_in, dt, CB
+    return states, dA_cumsum, dstate, dt_in, dt, CB
 
 
-def _mamba_chunk_scan_combined_post_states_bwd(
+def _mamba_chunk_scan_post_states_bwd(
     dout,
     x,
     dt,
@@ -398,7 +388,7 @@ def _mamba_chunk_scan_combined_post_states_bwd(
     )
 
 
-def _mamba_chunk_scan_combined_post_dstates_bwd(
+def _mamba_chunk_scan_post_dstates_bwd(
     dout,
     x,
     dt,
@@ -528,31 +518,48 @@ def _mamba_chunk_scan_combined_bwd(
     dz=None,
     recompute_output=False,
 ):
-    states, final_state, dA_cumsum, dstate, dt_in, dt, CB = (
-        _mamba_chunk_scan_combined_states_bwd(
-            dout,
-            x,
-            dt,
-            A,
-            B,
-            C,
-            out,
-            chunk_size,
-            D,
-            z,
-            dt_bias,
-            initial_states,
-            dfinal_states,
-            seq_idx,
-            dt_softplus,
-            dt_limit,
-            dx,
-            ddt,
-            dB,
-            dC,
-            dz,
-            recompute_output,
-        )
+    states, dA_cumsum, dstate, dt_in, dt, CB = _mamba_chunk_scan_states_bwd(
+        dout,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        chunk_size,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        dfinal_states,
+        seq_idx,
+        dt_softplus,
+        dt_limit,
+        dx,
+        ddt,
+        dB,
+        dC,
+        dz,
+        recompute_output,
+    )
+
+    states, final_state = _state_passing_single_fwd(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        states,
+        dA_cumsum,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        None,  # cu_seq_lens
+        dt_softplus,
+        dt_limit,
     )
 
     (
@@ -567,7 +574,7 @@ def _mamba_chunk_scan_combined_bwd(
         ddt_given,
         ddA_chunk_cumsum,
         dt_in,
-    ) = _mamba_chunk_scan_combined_post_states_bwd(
+    ) = _mamba_chunk_scan_post_states_bwd(
         dout,
         x,
         dt,
@@ -595,7 +602,7 @@ def _mamba_chunk_scan_combined_bwd(
         dz,
         recompute_output,
     )
-    return _mamba_chunk_scan_combined_post_dstates_bwd(
+    return _mamba_chunk_scan_post_dstates_bwd(
         dout,
         x,
         dt,
