@@ -69,6 +69,7 @@ def _state_passing_single_bwd(
     dfinal_states=None,
     seq_idx=None,
 ):
+    dstate = states.shape[-1]
     dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum[:, :, :, -1],
@@ -82,6 +83,8 @@ def _state_passing_single_bwd(
         states_dtype=x.dtype,
         chunk_size=chunk_size,
     )
+    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+    dstates = rearrange(dstates, "... (p n) -> ... p n", n=dstate)
     return dstates, ddA_chunk_cumsum, dinitial_states, states
 
 
@@ -281,7 +284,6 @@ def _mamba_chunk_scan_post_states_bwd(
     dz=None,
     recompute_output=False,
 ):
-    _, _, _, dstate = B.shape
     if dB is not None:
         assert dB.shape == B.shape
         dB_given = dB
@@ -320,31 +322,9 @@ def _mamba_chunk_scan_post_states_bwd(
     dstates = _chunk_scan_bwd_dstates(
         C, dA_cumsum, dout, seq_idx=seq_idx, dtype=states.dtype
     )
-    # dstates has length nchunks, containing the gradient to initial states at index 0 and
-    # gradient to the states of chunk (nchunks - 2) at index (nchunks - 1)
-    # Do computation in fp32 but convert dstates and states to fp16/bf16 since dstates and states
-    # will be used in matmul in the next kernels.
 
-    # GG: `states` here is just a dtype-coverted version of the states above, I believe.
-    dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_single_bwd(
-        x,
-        chunk_size,
-        states,
-        dA_cumsum,
-        dstates,
-        initial_states,
-        dfinal_states,
-        seq_idx,
-    )
-    # dstates has length nchunks, containing the gradient to states of chunk 0 at index 0 and
-    # gradient to the final states at index (nchunks - 1)
-    # states has length nchunks, containing the initial states at index 0 and the state for chunk (nchunks - 2) at index (nchunks - 1)
-    # The final states is not stored.
-    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
-    dstates = rearrange(dstates, "... (p n) -> ... p n", n=dstate)
     return (
         dstates,
-        dinitial_states,
         dA_cumsum,
         CB,
         states,
@@ -352,7 +332,6 @@ def _mamba_chunk_scan_post_states_bwd(
         dB_given,
         dC_given,
         ddt_given,
-        ddA_chunk_cumsum,
         dt_in,
     )
 
@@ -510,7 +489,6 @@ def _mamba_chunk_scan_combined_bwd(
 
     (
         dstates,
-        dinitial_states,
         dA_cumsum,
         CB,
         states,
@@ -518,7 +496,6 @@ def _mamba_chunk_scan_combined_bwd(
         dB_given,
         dC_given,
         ddt_given,
-        ddA_chunk_cumsum,
         dt_in,
     ) = _mamba_chunk_scan_post_states_bwd(
         dout,
@@ -542,6 +519,17 @@ def _mamba_chunk_scan_combined_bwd(
         dz,
         recompute_output,
     )
+    dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_single_bwd(
+        x,
+        chunk_size,
+        states,
+        dA_cumsum,
+        dstates,
+        initial_states,
+        dfinal_states,
+        seq_idx,
+    )
+
     return _mamba_chunk_scan_post_dstates_bwd(
         dout,
         x,
