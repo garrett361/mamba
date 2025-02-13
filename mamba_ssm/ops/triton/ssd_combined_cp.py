@@ -275,8 +275,6 @@ def _mamba_chunk_scan_post_states_bwd(
     dt_in,
     D=None,
     z=None,
-    initial_states=None,
-    dfinal_states=None,
     seq_idx=None,
     ddt=None,
     dB=None,
@@ -510,8 +508,6 @@ def _mamba_chunk_scan_combined_bwd(
         dt_in,
         D,
         z,
-        initial_states,
-        dfinal_states,
         seq_idx,
         ddt,
         dB,
@@ -686,7 +682,7 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
         )
 
 
-def mamba_chunk_scan_combined_split(
+def mamba_chunk_scan_combined(
     x,
     dt,
     A,
@@ -781,7 +777,6 @@ def _state_passing_cp_serial_fwd(
             # )
         elif rank == recv_rank:
             initial_states = torch.empty_like(states[:, 0])
-            print(f"Receiving on {rank} from {send_rank}")
             # TODO: @goon - should use dist.recv; see above.
             dist.batch_isend_irecv(
                 [dist.P2POp(dist.irecv, initial_states, send_rank, mesh.get_group())]
@@ -805,7 +800,70 @@ def _state_passing_cp_serial_fwd(
     return states, final_states
 
 
-def _mamba_chunk_scan_combined_cp_serial_fwd(
+def _state_passing_serial_cp_bwd(
+    mesh: dist.device_mesh.DeviceMesh,
+    x,
+    chunk_size,
+    states,
+    dA_cumsum,
+    dstates,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+):
+    dstate = states.shape[-1]
+    rank = mesh.get_rank()
+    flipped_mesh = mesh.mesh.flip(0)
+    for send_rank, recv_rank in zip(flipped_mesh[:-1], flipped_mesh[1:]):
+        if rank == send_rank:
+            dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
+                rearrange(states, "... p n -> ... (p n)"),
+                dA_cumsum[:, :, :, -1],
+                rearrange(dstates, "... p n -> ... (p n)"),
+                dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)")
+                if dfinal_states is not None
+                else None,
+                seq_idx=seq_idx,
+                has_initial_states=initial_states is not None,
+                dstates_dtype=x.dtype,
+                states_dtype=x.dtype,
+                chunk_size=chunk_size,
+            )
+            # TODO: @goon - use dist.{send,receive}.
+            dist.batch_isend_irecv(
+                [dist.P2POp(dist.isend, dinitial_states, recv_rank, mesh.get_group())]
+            )[0].wait()
+        elif rank == recv_rank:
+            dfinal_states = torch.empty_like(states[:, 0])
+            # TODO: @goon - should use dist.recv; see above.
+            dist.batch_isend_irecv(
+                [dist.P2POp(dist.irecv, dfinal_states, send_rank, mesh.get_group())]
+            )[0].wait()
+
+        dist.barrier()
+
+    # Final rank only:
+    if rank == recv_rank:
+        dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
+            rearrange(states, "... p n -> ... (p n)"),
+            dA_cumsum[:, :, :, -1],
+            rearrange(dstates, "... p n -> ... (p n)"),
+            dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)")
+            if dfinal_states is not None
+            else None,
+            seq_idx=seq_idx,
+            has_initial_states=initial_states is not None,
+            dstates_dtype=x.dtype,
+            states_dtype=x.dtype,
+            chunk_size=chunk_size,
+        )
+
+    states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+    dstates = rearrange(dstates, "... (p n) -> ... p n", n=dstate)
+    return dstates, ddA_chunk_cumsum, dinitial_states, states
+
+
+def _mamba_chunk_scan_combined_serial_cp_fwd(
     mesh: dist.device_mesh.DeviceMesh,
     x,
     dt,
@@ -858,3 +916,316 @@ def _mamba_chunk_scan_combined_cp_serial_fwd(
     )
 
     return out, out_x, dt, dA_cumsum, states, final_states
+
+
+def _mamba_chunk_scan_combined_serial_cp_bwd(
+    mesh: dist.device_mesh.DeviceMesh,
+    dout,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    dx=None,
+    ddt=None,
+    dB=None,
+    dC=None,
+    dz=None,
+    recompute_output=False,
+):
+    states, dA_cumsum, _, dt_in, dt, CB = _mamba_chunk_scan_states_bwd(
+        dout,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        chunk_size,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        dt_softplus,
+        dt_limit,
+        dx,
+    )
+
+    states, _ = _state_passing_cp_serial_fwd(
+        mesh,
+        chunk_size,
+        states,
+        dA_cumsum,
+        initial_states,
+        seq_idx,
+    )
+
+    (
+        dstates,
+        dA_cumsum,
+        CB,
+        states,
+        outz,
+        dB_given,
+        dC_given,
+        ddt_given,
+        dt_in,
+    ) = _mamba_chunk_scan_post_states_bwd(
+        dout,
+        x,
+        B,
+        C,
+        out,
+        chunk_size,
+        states,
+        dA_cumsum,
+        CB,
+        dt_in,
+        D,
+        z,
+        seq_idx,
+        ddt,
+        dB,
+        dC,
+        dz,
+        recompute_output,
+    )
+    dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_serial_cp_bwd(
+        mesh,
+        x,
+        chunk_size,
+        states,
+        dA_cumsum,
+        dstates,
+        initial_states,
+        dfinal_states,
+        seq_idx,
+    )
+
+    return _mamba_chunk_scan_post_dstates_bwd(
+        dout,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        dstates,
+        dinitial_states,
+        dA_cumsum,
+        CB,
+        states,
+        outz,
+        dB_given,
+        dC_given,
+        ddt_given,
+        ddA_chunk_cumsum,
+        dt_in,
+        D,
+        z,
+        dt_bias,
+        seq_idx,
+        dt_softplus,
+        dt_limit,
+        dx,
+        ddt,
+        dB,
+        dC,
+        dz,
+        recompute_output,
+    )
+
+
+class MambaChunkScanCombinedSerialCPFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        mesh: dist.device_mesh.DeviceMesh,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        z=None,
+        dt_bias=None,
+        initial_states=None,
+        seq_idx=None,
+        cu_seqlens=None,
+        dt_softplus=False,
+        dt_limit=(0.0, float("inf")),
+        return_final_states=False,
+        return_varlen_states=False,
+    ):
+        ctx.dt_dtype = dt.dtype
+        if not return_varlen_states:
+            cu_seqlens = None
+        else:
+            assert (
+                cu_seqlens is not None
+            ), "cu_seqlens must be provided if return_varlen_states is True"
+        out, out_x, _, dA_cumsum, _, final_states, *rest = (
+            _mamba_chunk_scan_combined_serial_cp_fwd(
+                mesh,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                chunk_size,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+            )
+        )
+        ctx.save_for_backward(
+            out if z is None else out_x,
+            x,
+            dt,
+            dA_cumsum,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            initial_states,
+            seq_idx,
+        )
+        ctx.mesh = mesh
+        ctx.dt_softplus = dt_softplus
+        ctx.chunk_size = chunk_size
+        ctx.dt_limit = dt_limit
+        ctx.return_final_states = return_final_states
+        ctx.return_varlen_states = return_varlen_states
+        if not return_varlen_states:
+            return out if not return_final_states else (out, final_states)
+        else:
+            varlen_states = rest[0]
+            return (
+                (out, varlen_states)
+                if not return_final_states
+                else (out, final_states, varlen_states)
+            )
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        out, x, dt, _, A, B, C, D, z, dt_bias, initial_states, seq_idx = (
+            ctx.saved_tensors
+        )
+        assert (
+            not ctx.return_varlen_states
+        ), "return_varlen_states is not supported in backward"
+        dfinal_states = args[0] if ctx.return_final_states else None
+        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
+            _mamba_chunk_scan_combined_serial_cp_bwd(
+                ctx.mesh,
+                dout,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                out,
+                ctx.chunk_size,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                dfinal_states=dfinal_states,
+                seq_idx=seq_idx,
+                dt_softplus=ctx.dt_softplus,
+                dt_limit=ctx.dt_limit,
+            )
+        )
+        return (
+            None,
+            dx,
+            ddt,
+            dA,
+            dB,
+            dC,
+            None,
+            dD,
+            dz,
+            ddt_bias,
+            dinitial_states,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def mamba_chunk_scan_combined_serial_cp(
+    mesh: dist.device_mesh.DeviceMesh,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    seq_idx=None,
+    cu_seqlens=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    return_final_states=False,
+    return_varlen_states=False,
+):
+    """
+    Argument:
+        mesh: 1D DeviceMesh
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, seqlen, nheads)
+        A: (nheads)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        chunk_size: int
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+        dt_bias: (nheads,)
+        initial_states: (batch, nheads, headdim, dstate)
+        seq_idx: (batch, seqlen)
+        cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
+        dt_softplus: Whether to apply softplus to dt
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    return MambaChunkScanCombinedFn.apply(
+        mesh,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D,
+        z,
+        dt_bias,
+        initial_states,
+        seq_idx,
+        cu_seqlens,
+        dt_softplus,
+        dt_limit,
+        return_final_states,
+        return_varlen_states,
+    )

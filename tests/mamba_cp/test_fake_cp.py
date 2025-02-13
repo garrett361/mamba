@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
+from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
 try:
@@ -76,7 +76,7 @@ def scan(
         dim=-1,
     )
     A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
-    y, final_state = mamba_chunk_scan_combined_split(
+    y, final_state = mamba_chunk_scan_combined(
         rearrange(x, "b l (h p) -> b l h p", p=model.headdim),
         dt,
         A,
