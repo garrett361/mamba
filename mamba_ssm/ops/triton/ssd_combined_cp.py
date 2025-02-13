@@ -7,7 +7,7 @@ inserted at this point.
 
 """
 
-from typing import Optional, Callable
+from typing import Optional, Callable, Type
 import torch
 import torch.distributed as dist
 import triton
@@ -70,6 +70,202 @@ class _StatePassingImpl(ABC):
         Returns a tuple of dstates, ddA_chunk_cumsum, dinitial_states, states
         """
         ...
+
+
+def _get_chunk_scan_autograd_fn(state_passing_impl: Type[_StatePassingImpl]):
+    class _Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D=None,
+            z=None,
+            dt_bias=None,
+            initial_states=None,
+            seq_idx=None,
+            cu_seqlens=None,
+            dt_softplus=False,
+            dt_limit=(0.0, float("inf")),
+            return_final_states=False,
+            return_varlen_states=False,
+            mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        ):
+            if not return_varlen_states:
+                cu_seqlens = None
+            else:
+                assert (
+                    cu_seqlens is not None
+                ), "cu_seqlens must be provided if return_varlen_states is True"
+            out, out_x, _, dA_cumsum, _, final_states, *rest = (
+                _mamba_chunk_scan_combined_fwd_template(
+                    state_passing_impl.fwd,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    chunk_size,
+                    D=D,
+                    z=z,
+                    dt_bias=dt_bias,
+                    initial_states=initial_states,
+                    seq_idx=seq_idx,
+                    dt_softplus=dt_softplus,
+                    dt_limit=dt_limit,
+                    mesh=mesh,
+                )
+            )
+
+            ctx.save_for_backward(
+                out if z is None else out_x,
+                x,
+                dt,
+                dA_cumsum,
+                A,
+                B,
+                C,
+                D,
+                z,
+                dt_bias,
+                initial_states,
+                seq_idx,
+            )
+            ctx.chunk_size = chunk_size
+            ctx.dt_dtype = dt.dtype
+            ctx.dt_limit = dt_limit
+            ctx.dt_softplus = dt_softplus
+            ctx.mesh = mesh
+            ctx.return_final_states = return_final_states
+            ctx.return_varlen_states = return_varlen_states
+
+            if not return_varlen_states:
+                return out if not return_final_states else (out, final_states)
+            else:
+                varlen_states = rest[0]
+                return (
+                    (out, varlen_states)
+                    if not return_final_states
+                    else (out, final_states, varlen_states)
+                )
+
+        @staticmethod
+        def backward(ctx, dout, *args):
+            out, x, dt, _, A, B, C, D, z, dt_bias, initial_states, seq_idx = (
+                ctx.saved_tensors
+            )
+            assert (
+                not ctx.return_varlen_states
+            ), "return_varlen_states is not supported in backward"
+            dfinal_states = args[0] if ctx.return_final_states else None
+            dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
+                _mamba_chunk_scan_combined_bwd_template(
+                    state_passing_impl.fwd,
+                    state_passing_impl.bwd,
+                    dout,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    out,
+                    ctx.chunk_size,
+                    D=D,
+                    z=z,
+                    dt_bias=dt_bias,
+                    initial_states=initial_states,
+                    dfinal_states=dfinal_states,
+                    seq_idx=seq_idx,
+                    dt_softplus=ctx.dt_softplus,
+                    dt_limit=ctx.dt_limit,
+                    mesh=ctx.mesh,
+                )
+            )
+            return (
+                dx,
+                ddt,
+                dA,
+                dB,
+                dC,
+                None,
+                dD,
+                dz,
+                ddt_bias,
+                dinitial_states,
+                None,  # seq_idx
+                None,  # cu_seqlens
+                None,  # dt_softplus
+                None,  # dt_limit
+                None,  # return_final_states
+                None,  # return_varlen_states
+                None,  # mesh
+            )
+
+    _Fn.__name__ = f"{state_passing_impl.__name__}Fn"
+
+    def fn(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        z=None,
+        dt_bias=None,
+        initial_states=None,
+        seq_idx=None,
+        cu_seqlens=None,
+        dt_softplus=False,
+        dt_limit=(0.0, float("inf")),
+        return_final_states=False,
+        return_varlen_states=False,
+        mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+    ):
+        """
+        Argument:
+            x: (batch, seqlen, nheads, headdim)
+            dt: (batch, seqlen, nheads)
+            A: (nheads)
+            B: (batch, seqlen, ngroups, dstate)
+            C: (batch, seqlen, ngroups, dstate)
+            chunk_size: int
+            D: (nheads, headdim) or (nheads,)
+            z: (batch, seqlen, nheads, headdim)
+            dt_bias: (nheads,)
+            initial_states: (batch, nheads, headdim, dstate)
+            seq_idx: (batch, seqlen)
+            cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
+            dt_softplus: Whether to apply softplus to dt
+            mesh: Optional[DeviceMesh]
+        Return:
+            out: (batch, seqlen, nheads, headdim)
+        """
+        return _Fn.apply(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            D,
+            z,
+            dt_bias,
+            initial_states,
+            seq_idx,
+            cu_seqlens,
+            dt_softplus,
+            dt_limit,
+            return_final_states,
+            return_varlen_states,
+            mesh,
+        )
+
+    return fn
 
 
 def _mamba_chunk_scan_states_fwd(
@@ -742,60 +938,7 @@ class MambaChunkScanNonCPRefFn(torch.autograd.Function):
         )
 
 
-def mamba_chunk_scan_combined_non_cp_ref(
-    x,
-    dt,
-    A,
-    B,
-    C,
-    chunk_size,
-    D=None,
-    z=None,
-    dt_bias=None,
-    initial_states=None,
-    seq_idx=None,
-    cu_seqlens=None,
-    dt_softplus=False,
-    dt_limit=(0.0, float("inf")),
-    return_final_states=False,
-    return_varlen_states=False,
-):
-    """
-    Argument:
-        x: (batch, seqlen, nheads, headdim)
-        dt: (batch, seqlen, nheads)
-        A: (nheads)
-        B: (batch, seqlen, ngroups, dstate)
-        C: (batch, seqlen, ngroups, dstate)
-        chunk_size: int
-        D: (nheads, headdim) or (nheads,)
-        z: (batch, seqlen, nheads, headdim)
-        dt_bias: (nheads,)
-        initial_states: (batch, nheads, headdim, dstate)
-        seq_idx: (batch, seqlen)
-        cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
-        dt_softplus: Whether to apply softplus to dt
-    Return:
-        out: (batch, seqlen, nheads, headdim)
-    """
-    return MambaChunkScanNonCPRefFn.apply(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size,
-        D,
-        z,
-        dt_bias,
-        initial_states,
-        seq_idx,
-        cu_seqlens,
-        dt_softplus,
-        dt_limit,
-        return_final_states,
-        return_varlen_states,
-    )
+mamba_chunk_scan_combined_non_cp_ref = _get_chunk_scan_autograd_fn(StatePassingNonCP)
 
 
 #### Start CP Impls ####
@@ -906,6 +1049,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                     )
                 )
                 # TODO: @goon - use dist.send; see above.
+                raise ValueError(f"{initial_states=}, {dinitial_states_passed=}")
                 dist.batch_isend_irecv(
                     [
                         dist.P2POp(
@@ -947,192 +1091,4 @@ class StatePassingSerialCP(_StatePassingImpl):
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 
 
-class MambaChunkScanCombinedSerialCPFn(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        mesh: dist.device_mesh.DeviceMesh,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size,
-        D=None,
-        z=None,
-        dt_bias=None,
-        initial_states=None,
-        seq_idx=None,
-        cu_seqlens=None,
-        dt_softplus=False,
-        dt_limit=(0.0, float("inf")),
-        return_final_states=False,
-        return_varlen_states=False,
-    ):
-        ctx.dt_dtype = dt.dtype
-        if not return_varlen_states:
-            cu_seqlens = None
-        else:
-            assert (
-                cu_seqlens is not None
-            ), "cu_seqlens must be provided if return_varlen_states is True"
-        out, out_x, _, dA_cumsum, _, final_states, *rest = (
-            _mamba_chunk_scan_combined_fwd_template(
-                StatePassingNonCP.fwd,
-                x,
-                dt,
-                A,
-                B,
-                C,
-                chunk_size,
-                D=D,
-                z=z,
-                dt_bias=dt_bias,
-                initial_states=initial_states,
-                seq_idx=seq_idx,
-                dt_softplus=dt_softplus,
-                dt_limit=dt_limit,
-                mesh=mesh,
-            )
-        )
-        ctx.save_for_backward(
-            out if z is None else out_x,
-            x,
-            dt,
-            dA_cumsum,
-            A,
-            B,
-            C,
-            D,
-            z,
-            dt_bias,
-            initial_states,
-            seq_idx,
-        )
-        ctx.mesh = mesh
-        ctx.dt_softplus = dt_softplus
-        ctx.chunk_size = chunk_size
-        ctx.dt_limit = dt_limit
-        ctx.return_final_states = return_final_states
-        ctx.return_varlen_states = return_varlen_states
-        if not return_varlen_states:
-            return out if not return_final_states else (out, final_states)
-        else:
-            varlen_states = rest[0]
-            return (
-                (out, varlen_states)
-                if not return_final_states
-                else (out, final_states, varlen_states)
-            )
-
-    @staticmethod
-    def backward(ctx, dout, *args):
-        out, x, dt, _, A, B, C, D, z, dt_bias, initial_states, seq_idx = (
-            ctx.saved_tensors
-        )
-        assert (
-            not ctx.return_varlen_states
-        ), "return_varlen_states is not supported in backward"
-        dfinal_states = args[0] if ctx.return_final_states else None
-        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
-            _mamba_chunk_scan_combined_bwd_template(
-                StatePassingSerialCP.fwd,
-                StatePassingSerialCP.bwd,
-                dout,
-                x,
-                dt,
-                A,
-                B,
-                C,
-                out,
-                ctx.chunk_size,
-                D=D,
-                z=z,
-                dt_bias=dt_bias,
-                initial_states=initial_states,
-                dfinal_states=dfinal_states,
-                seq_idx=seq_idx,
-                dt_softplus=ctx.dt_softplus,
-                dt_limit=ctx.dt_limit,
-                mesh=ctx.mesh,
-            )
-        )
-
-        return (
-            None,
-            dx,
-            ddt,
-            dA,
-            dB,
-            dC,
-            None,
-            dD,
-            dz,
-            ddt_bias,
-            dinitial_states,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-
-def mamba_chunk_scan_combined_serial_cp(
-    mesh: dist.device_mesh.DeviceMesh,
-    x,
-    dt,
-    A,
-    B,
-    C,
-    chunk_size,
-    D=None,
-    z=None,
-    dt_bias=None,
-    initial_states=None,
-    seq_idx=None,
-    cu_seqlens=None,
-    dt_softplus=False,
-    dt_limit=(0.0, float("inf")),
-    return_final_states=False,
-    return_varlen_states=False,
-):
-    """
-    Argument:
-        mesh: 1D DeviceMesh
-        x: (batch, seqlen, nheads, headdim)
-        dt: (batch, seqlen, nheads)
-        A: (nheads)
-        B: (batch, seqlen, ngroups, dstate)
-        C: (batch, seqlen, ngroups, dstate)
-        chunk_size: int
-        D: (nheads, headdim) or (nheads,)
-        z: (batch, seqlen, nheads, headdim)
-        dt_bias: (nheads,)
-        initial_states: (batch, nheads, headdim, dstate)
-        seq_idx: (batch, seqlen)
-        cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
-        dt_softplus: Whether to apply softplus to dt
-    Return:
-        out: (batch, seqlen, nheads, headdim)
-    """
-    return MambaChunkScanCombinedSerialCPFn.apply(
-        mesh,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size,
-        D,
-        z,
-        dt_bias,
-        initial_states,
-        seq_idx,
-        cu_seqlens,
-        dt_softplus,
-        dt_limit,
-        return_final_states,
-        return_varlen_states,
-    )
+mamba_chunk_scan_combined_serial_cp = _get_chunk_scan_autograd_fn(StatePassingSerialCP)
