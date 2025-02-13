@@ -125,40 +125,40 @@ def _mamba_chunk_scan_combined_fwd_template(
     mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
     states, dt, dA_cumsum = _mamba_chunk_scan_states_fwd(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size,
-        D,
-        z,
-        dt_bias,
-        initial_states,
-        seq_idx,
-        dt_softplus,
-        dt_limit,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        chunk_size=chunk_size,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        seq_idx=seq_idx,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
     )
     states, final_states = state_passing_fwd_impl(
-        chunk_size,
-        states,
-        dA_cumsum,
-        initial_states,
-        seq_idx,
+        chunk_size=chunk_size,
+        states=states,
+        dA_cumsum=dA_cumsum,
+        initial_states=initial_states,
+        seq_idx=seq_idx,
         out_dtype=C.dtype,
         mesh=mesh,
     )
     out, out_x = _mamba_chunk_scan_post_states_fwd(
-        x,
-        dt,
-        B,
-        C,
-        chunk_size,
-        states,
-        dA_cumsum,
-        D,
-        z,
-        seq_idx,
+        x=x,
+        dt=dt,
+        B=B,
+        C=C,
+        chunk_size=chunk_size,
+        states=states,
+        dA_cumsum=dA_cumsum,
+        D=D,
+        z=z,
+        seq_idx=seq_idx,
     )
 
     return out, out_x, dt, dA_cumsum, states, final_states
@@ -415,24 +415,30 @@ def _mamba_chunk_scan_combined_bwd_template(
     mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
     states, dA_cumsum, _, dt_in, dt, CB = _mamba_chunk_scan_states_bwd(
-        dout,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        out,
-        chunk_size,
-        dt_bias,
-        initial_states,
-        seq_idx,
-        dt_softplus,
-        dt_limit,
-        dx,
+        dout=dout,
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        out=out,
+        chunk_size=chunk_size,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        seq_idx=seq_idx,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        dx=dx,
     )
 
     states, _ = state_passing_fwd_impl(
-        chunk_size, states, dA_cumsum, initial_states, seq_idx, mesh
+        chunk_size=chunk_size,
+        states=states,
+        dA_cumsum=dA_cumsum,
+        initial_states=initial_states,
+        seq_idx=seq_idx,
+        out_dtype=None,
+        mesh=mesh,
     )
 
     (
@@ -446,35 +452,35 @@ def _mamba_chunk_scan_combined_bwd_template(
         ddt_given,
         dt_in,
     ) = _mamba_chunk_scan_post_states_bwd(
-        dout,
-        x,
-        B,
-        C,
-        out,
-        chunk_size,
-        states,
-        dA_cumsum,
-        CB,
-        dt_in,
-        D,
-        z,
-        seq_idx,
-        ddt,
-        dB,
-        dC,
-        dz,
-        recompute_output,
+        dout=dout,
+        x=x,
+        B=B,
+        C=C,
+        out=out,
+        chunk_size=chunk_size,
+        states=states,
+        dA_cumsum=dA_cumsum,
+        CB=CB,
+        dt_in=dt_in,
+        D=D,
+        z=z,
+        seq_idx=seq_idx,
+        ddt=ddt,
+        dB=dB,
+        dC=dC,
+        dz=dz,
+        recompute_output=recompute_output,
     )
     dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_bwd_impl(
-        x,
-        chunk_size,
-        states,
-        dA_cumsum,
-        dstates,
-        initial_states,
-        dfinal_states,
-        seq_idx,
-        mesh,
+        x=x,
+        chunk_size=chunk_size,
+        states=states,
+        dA_cumsum=dA_cumsum,
+        dstates=dstates,
+        initial_states=initial_states,
+        dfinal_states=dfinal_states,
+        seq_idx=seq_idx,
+        mesh=mesh,
     )
 
     return _mamba_chunk_scan_post_dstates_bwd(
@@ -765,6 +771,9 @@ def _state_passing_serial_cp_fwd(
     out_dtype=None,
     mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
 ):
+    """
+    Serially compute the final state on each rank and pass as initial_states to the next.
+    """
     assert mesh is not None
     rank = mesh.get_rank()
     for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
@@ -829,6 +838,10 @@ def _state_passing_serial_cp_bwd(
     seq_idx=None,
     mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
 ):
+    """
+    Starting from the final rank to compute in _state_passing_serial_cp_fwd,
+    compute dinitial_states and pass these back as the dfinal_states of the preceding rank.
+    """
     dstate = states.shape[-1]
     assert mesh is not None
     rank = mesh.get_rank()
@@ -970,7 +983,7 @@ class MambaChunkScanCombinedSerialCPFn(torch.autograd.Function):
         ), "return_varlen_states is not supported in backward"
         dfinal_states = args[0] if ctx.return_final_states else None
         dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
-            _mamba_chunk_scan_combined_fwd_template(
+            _mamba_chunk_scan_combined_bwd_template(
                 _state_passing_serial_cp_fwd,
                 _state_passing_serial_cp_bwd,
                 dout,
@@ -992,6 +1005,7 @@ class MambaChunkScanCombinedSerialCPFn(torch.autograd.Function):
                 mesh=ctx.mesh,
             )
         )
+
         return (
             None,
             dx,
