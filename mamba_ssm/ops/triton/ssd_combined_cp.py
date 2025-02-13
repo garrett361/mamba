@@ -302,7 +302,7 @@ def _mamba_chunk_scan_post_states_bwd(
     else:
         ddt_given = torch.empty_like(dt_in)
     if z is not None:
-        dz, dout, *rest = _chunk_scan_bwd_dz(
+        dz, dout, _, *rest = _chunk_scan_bwd_dz(
             x,
             z,
             out,
