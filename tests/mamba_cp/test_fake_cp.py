@@ -6,8 +6,6 @@ from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.ops.triton.ssd_combined import (
-    _chunk_cumsum_bwd,
-    _chunk_cumsum_fwd,
     _state_passing_fwd,
 )
 from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
@@ -134,35 +132,6 @@ def fwd(
         y = torch.cat([F.silu(z0) * x0, y], dim=-1)
     out = model.out_proj(y)
     return out
-
-
-class ChunkCumsumFn(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        dt,
-        A,
-        chunk_size,
-        dt_bias=None,
-        dt_softplus=False,
-        dt_limit=(0.0, float("inf")),
-    ):
-        dA_cumsum, dt = _chunk_cumsum_fwd(
-            dt,
-            A,
-            chunk_size,
-            dt_bias=dt_bias,
-            dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
-        )
-        ctx.save_for_backward(
-            dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx
-        )
-        return dA_cumsum, dt
-
-    @staticmethod
-    def backward(ctx, dout, dfinal_states):
-        _chunk_cumsum_bwd
 
 
 class TestLocalCP:
