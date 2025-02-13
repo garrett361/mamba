@@ -5,26 +5,16 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.ops.triton.ssd_combined import (
-    _state_passing_fwd,
-)
 from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_split
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
 except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
+    causal_conv1d_fn = None
 
-try:
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
-except ImportError:
-    causal_conv1d_varlen_states = None
 
-try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
-except ImportError:
-    selective_state_update = None
+# Breaking out various parts of the fwd for easier testing:
 
 
 def in_proj_split(inputs, model: Mamba2, seq_idx=None):
@@ -134,6 +124,25 @@ def fwd(
     return out
 
 
+class Mamba2Split(Mamba2):
+    def forward(
+        self,
+        u,
+        seqlen=None,
+        seq_idx=None,
+        cu_seqlens=None,
+        inference_params=None,
+        conv_state=None,
+    ):
+        must_be_nones = (seqlen, seq_idx, cu_seqlens, inference_params, conv_state)
+        if any(x is not None for x in must_be_nones):
+            raise NotImplementedError(
+                "All of (seqlen, seq_idx, cu_seqlens, inference_params) must be None."
+                f"received {must_be_nones}"
+            )
+        return fwd(u, self)
+
+
 class TestLocalCP:
     """
     Single-device mock ups of CP, and other related tests.
@@ -146,12 +155,36 @@ class TestLocalCP:
     n_chunks = seq_len // chunk_size
     d_model = 256
     d_state = 128
-    factory_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
-    model = Mamba2(
-        d_model=d_model, d_state=d_state, chunk_size=chunk_size, **factory_kwargs
-    )
+    ngroups = 1
+    expand = 2
+    headdim = 64
+    d_conv = 4
+    d_inner = expand * d_model
+    d_ssm = d_inner
+    dtype = torch.bfloat16
+    device = "cuda"
+    factory_kwargs = {"device": device, "dtype": dtype}
+    model_kwargs = {
+        "d_model": d_model,
+        "d_state": d_state,
+        "chunk_size": chunk_size,
+        "ngroups": ngroups,
+        "headdim": headdim,
+        "d_conv": d_conv,
+        "device": device,
+        "dtype": dtype,
+    }
 
-    def get_inputs(self, requires_grad: bool = False) -> torch.Tensor:
+    def get_model(self, seed: int = 42) -> Mamba2:
+        torch.manual_seed(seed)
+        return Mamba2(**self.model_kwargs)
+
+    def get_model_split(self, seed: int = 42) -> Mamba2Split:
+        torch.manual_seed(seed)
+        return Mamba2Split(**self.model_kwargs)
+
+    def get_inputs(self, requires_grad: bool = False, seed: int = 42) -> torch.Tensor:
+        torch.manual_seed(seed)
         return torch.randn(
             self.batch_size,
             self.seq_len,
@@ -164,7 +197,7 @@ class TestLocalCP:
         return torch.randn(
             self.batch_size,
             self.seq_len,
-            self.model.d_ssm + 2 * self.model.ngroups * self.model.d_state,
+            self.d_ssm + 2 * self.ngroups * self.d_state,
             **self.factory_kwargs,
             requires_grad=requires_grad,
         )
@@ -172,12 +205,12 @@ class TestLocalCP:
     def get_states_dA_chunk_cumum(
         self, requires_grad: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        n_heads = self.model.d_model * self.model.expand // self.model.headdim
+        n_heads = self.d_model * self.expand // self.headdim
         states = torch.randn(
             self.batch_size,
             self.n_chunks,
             n_heads,
-            self.model.headdim,
+            self.headdim,
             **self.factory_kwargs,
             requires_grad=requires_grad,
         )
@@ -191,28 +224,28 @@ class TestLocalCP:
         return states, dA_chunk_cumsum
 
     def test_fwd(self) -> None:
-        model = Mamba2(self.d_model, **self.factory_kwargs)
+        model = self.get_model()
+        model_split = self.get_model_split()
         inputs = self.get_inputs()
         outputs = model(inputs)
-        outputs_fwd = fwd(inputs, model)
-        torch.testing.assert_close(outputs, outputs_fwd)
+        outputs_split = model_split(inputs)
+        torch.testing.assert_close(outputs, outputs_split)
 
     def test_bwd(self) -> None:
-        model_copy = deepcopy(self.model)
-        torch.manual_seed(42)
+        model = self.get_model()
+        model_split = self.get_model_split()
         inputs = self.get_inputs(requires_grad=True)
-        torch.manual_seed(42)
-        inputs_copy = self.get_inputs(requires_grad=True)
-        self.model(inputs).sum().backward()
+        inputs_split = self.get_inputs(requires_grad=True)
+        model(inputs).sum().backward()
+        model_split(inputs_split).sum().backward()
 
-        fwd(inputs_copy, model_copy).sum().backward()
-        for p1, p2 in zip(self.model.parameters(), model_copy.parameters()):
+        for p1, p2 in zip(model.parameters(), model_split.parameters()):
             torch.testing.assert_close(p1, p2)
-        torch.testing.assert_close(inputs.grad, inputs_copy.grad)
+        torch.testing.assert_close(inputs.grad, inputs_split.grad)
 
     def test_conv(self) -> None:
         xBC = self.get_xBC()
-        outputs = conv(xBC, self.model)
+        outputs = conv(xBC, self.get_model())
         outputs
 
     def test_conv_with_state_fwd(self) -> None:
@@ -221,17 +254,17 @@ class TestLocalCP:
 
         # Shard and create the conv states
         xBC_cp = rearrange(xBC, "b (c l) d -> b l d c ", c=self.cp_dim)
-        xBC_cp_conv_states = xBC_cp[:, -(self.model.d_conv - 1) :]
+        xBC_cp_conv_states = xBC_cp[:, -(self.d_conv - 1) :]
         xBC_cp_conv_states = xBC_cp_conv_states.roll(1, dims=-1)
         # First conv state is trivial (could also make it None)
         xBC_cp_conv_states[..., 0] = 0.0
 
-        outputs = conv(xBC, self.model)
+        outputs = conv(xBC, self.get_model())
         outputs_cp_list: list[torch.Tensor] = []
         for cp_rank in range(self.cp_dim):
             cp_out = conv(
                 xBC_cp[..., cp_rank],
-                model=self.model,
+                model=self.get_model(),
                 conv_state=xBC_cp_conv_states[..., cp_rank],
             )
             outputs_cp_list.append(cp_out)
@@ -244,13 +277,14 @@ class TestLocalCP:
         torch.manual_seed(42)
         xBC_clone = self.get_xBC(requires_grad=True)
 
-        model_cp = deepcopy(self.model)
+        model = self.get_model()
+        model_cp = deepcopy(model)
 
         # Shard and create the conv states
         xBC_cp = rearrange(xBC_clone, "b (r l) d -> b l d r ", r=self.cp_dim)
-        xBC_cp_conv_states = xBC_cp[:, -(self.model.d_conv - 1) :]
+        xBC_cp_conv_states = xBC_cp[:, -(self.d_conv - 1) :]
 
-        outputs = conv(xBC, self.model)
+        outputs = conv(xBC, model)
         outputs.sum().backward()
 
         for cp_rank in range(self.cp_dim):
@@ -262,7 +296,7 @@ class TestLocalCP:
                 else xBC_cp_conv_states[..., cp_rank - 1],
             )
             cp_out.sum().backward()
-        for p1, p2 in zip(self.model.parameters(), model_cp.parameters()):
+        for p1, p2 in zip(model.parameters(), model_cp.parameters()):
             torch.testing.assert_close(p1, p2)
         tol = 5e-3
         torch.testing.assert_close(xBC.grad, xBC_clone.grad, atol=tol, rtol=tol)
