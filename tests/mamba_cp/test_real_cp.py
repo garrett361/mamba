@@ -225,18 +225,4 @@ class TestSerialCP(DTest):
             )
         except Exception as e:
             self.print_rank(f"Caught Exception: {e}")
-        #
-        # # All-gather and verify correctness
-        # input_cp_grads_all_gathered = torch.empty(
-        #     self.world_size,
-        #     *inputs_cp.grad.shape,
-        #     dtype=inputs_cp.grad.dtype,
-        #     device=inputs_cp.grad.device,
-        # )
-        # dist.all_gather_into_tensor(
-        #     input_cp_grads_all_gathered, inputs_cp.grad, mesh.get_group()
-        # )
-        # input_cp_grads_all_gathered = rearrange(
-        #     input_cp_grads_all_gathered, "r b l ... -> b (r l) ..."
-        # )
-        # torch.testing.assert_close(inputs.grad, input_cp_grads_all_gathered)
+            raise e

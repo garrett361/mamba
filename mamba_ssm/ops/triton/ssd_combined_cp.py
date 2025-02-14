@@ -960,15 +960,9 @@ class StatePassingSerialCP(_StatePassingImpl):
                     ]
                 )[0].wait()
             elif rank == recv_rank:
-                batch, _, nheads, headdim, dstate = states.shape
                 dfinal_states = torch.empty(
-                    batch,
-                    nheads,
-                    headdim * dstate,
-                    device=states.device,
-                    dtype=states.dtype,
+                    *states[:, 0].shape, dtype=dstates_dtype, device=states.device
                 )
-                # TODO: @goon - should use dist.recv; see above.
                 dist.batch_isend_irecv(
                     [dist.P2POp(dist.irecv, dfinal_states, send_rank, mesh.get_group())]
                 )[0].wait()
@@ -976,21 +970,21 @@ class StatePassingSerialCP(_StatePassingImpl):
             dist.barrier()
 
         # Final rank only:
-        # if rank == recv_rank:
-        dstates, ddA_chunk_cumsum, dinitial_states_passed, states = (
-            StatePassingNonCP.bwd(
-                chunk_size=chunk_size,
-                states=states,
-                dA_cumsum=dA_cumsum,
-                dstates=dstates,
-                initial_states=initial_states,
-                dfinal_states=dfinal_states,
-                seq_idx=seq_idx,
-                dstates_dtype=dstates_dtype,
-                states_dtype=states_dtype,
-                mesh=mesh,
+        if rank == recv_rank:
+            dstates, ddA_chunk_cumsum, dinitial_states_passed, states = (
+                StatePassingNonCP.bwd(
+                    chunk_size=chunk_size,
+                    states=states,
+                    dA_cumsum=dA_cumsum,
+                    dstates=dstates,
+                    initial_states=initial_states,
+                    dfinal_states=dfinal_states,
+                    seq_idx=seq_idx,
+                    dstates_dtype=dstates_dtype,
+                    states_dtype=states_dtype,
+                    mesh=mesh,
+                )
             )
-        )
         # None of the ranks had any actual initial_states as proper inputs to
         # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from other
         # ranks) and so its derivative is None.
