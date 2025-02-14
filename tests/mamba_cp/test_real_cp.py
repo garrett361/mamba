@@ -7,13 +7,13 @@ from test_fake_cp import in_proj_split
 
 from dtest import DTest
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba2_cp import RingCommsFn
+from mamba_ssm.modules.mamba2_cp import causal_passing_comms
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_serial_cp,
 )
 
 
-class TestCausalRingCommsFn(DTest):
+class TestCausalPassingFn(DTest):
     def test_fwd(self):
         torch.manual_seed(42)
         dim = 16
@@ -23,11 +23,12 @@ class TestCausalRingCommsFn(DTest):
             device=self.device,
             dtype=torch.bfloat16,
         )
-        group = dist.group.WORLD
-        t_recv = RingCommsFn.apply(t_send[self.rank], group)
-        self.print_rank(f"{t_recv=}")
-
-        torch.testing.assert_close(t_recv, t_send[(self.rank - 1) % self.world_size])
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        t_recv = causal_passing_comms(t_send[self.rank], mesh)
+        if self.rank == 0:
+            torch.testing.assert_close(t_recv, torch.zeros_like(t_recv))
+        else:
+            torch.testing.assert_close(t_recv, t_send[(self.rank - 1)])
 
     def test_bwd(self):
         torch.manual_seed(42)
@@ -39,16 +40,18 @@ class TestCausalRingCommsFn(DTest):
             dtype=torch.bfloat16,
             requires_grad=True,
         )
-        group = dist.group.WORLD
-        t_recv = RingCommsFn.apply(t_send[self.rank], group)
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        t_recv = causal_passing_comms(t_send[self.rank], mesh)
         t_recv.pow(2).div(2).sum().backward()
 
-        grad = t_send.grad[self.rank]
-        torch.testing.assert_close(grad, t_send[self.rank])
-
-        other_idxs = torch.arange(self.world_size, device=self.device) != self.rank
-        zero_grads = t_send.grad[other_idxs]
-        torch.testing.assert_close(zero_grads, torch.zeros_like(zero_grads))
+        if self.rank == self.world_size - 1:
+            assert t_send.grad is None
+        else:
+            grad = t_send.grad[self.rank]
+            torch.testing.assert_close(grad, t_send[self.rank])
+            other_idxs = torch.arange(self.world_size, device=self.device) != self.rank
+            zero_grads = t_send.grad[other_idxs]
+            torch.testing.assert_close(zero_grads, torch.zeros_like(zero_grads))
 
 
 class TestSerialCP(DTest):

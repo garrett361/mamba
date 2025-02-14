@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 from einops import rearrange
 import torch.distributed as dist
 
@@ -33,39 +34,73 @@ def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
     return out
 
 
-class RingCommsFn(torch.autograd.Function):
+class CausalPassingFn(torch.autograd.Function):
+    """
+    Causally pass tensors from one rank to the next, with the ordering defined by the mesh.
+    The first rank receives zeros.
+    """
+
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup):
-        group_size = group.size()
-        group_rank = group.rank()
-        send_to = (group_rank + 1) % group_size
-        recv_from = (group_rank - 1) % group_size
-        ctx.group = group
-        ctx.send_to = send_to
-        ctx.recv_from = recv_from
-        ctx.shape = tensor.shape
-        ctx.dtype = tensor.dtype
+    def forward(
+        ctx, tensor: torch.Tensor, mesh: dist.device_mesh.DeviceMesh
+    ) -> torch.Tensor:
+        if mesh.ndim != 1:
+            raise ValueError("Only supports 1D DeviceMesh instances.")
+        mesh_size = mesh.size()
+        mesh_rank = mesh.get_local_rank()
+        send_to: Optional[int] = mesh_rank + 1
+        if send_to == mesh_size:
+            send_to = None
+        recv_from: Optional[int] = mesh_rank - 1
+        if recv_from == -1:
+            recv_from = None
+
         ctx.device = tensor.device
+        ctx.dtype = tensor.dtype
+        ctx.mesh = mesh
+        ctx.recv_from = recv_from
+        ctx.send_to = send_to
+        ctx.shape = tensor.shape
         ops = []
-        recv_buffer = torch.empty_like(tensor)
-        ops.append(dist.P2POp(dist.isend, tensor, None, group, 0, send_to))
-        ops.append(dist.P2POp(dist.irecv, recv_buffer, None, group, 0, recv_from))
+        if send_to is not None:
+            ops.append(
+                dist.P2POp(dist.isend, tensor, None, mesh.get_group(), 0, send_to)
+            )
+        if recv_from is not None:
+            recv_buffer = torch.empty_like(tensor)
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_buffer, None, mesh.get_group(), 0, recv_from
+                )
+            )
+        else:
+            recv_buffer = torch.zeros_like(tensor)
         for op in dist.batch_isend_irecv(ops):
             op.wait()
         return recv_buffer
 
     @staticmethod
-    def backward(ctx, dtensor):
-        send_to = ctx.send_to
-        recv_from = ctx.recv_from
+    def backward(ctx, dtensor: torch.Tensor) -> tuple[Optional[torch.Tensor], None]:
         ops = []
-        recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
-        ops.append(dist.P2POp(dist.irecv, recv_buffer, None, ctx.group, 0, send_to))
-        ops.append(dist.P2POp(dist.isend, dtensor, None, ctx.group, 0, recv_from))
+        if ctx.send_to is not None:
+            recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_buffer, None, ctx.mesh.get_group(), 0, ctx.send_to
+                )
+            )
+        else:
+            recv_buffer = None
+        if ctx.recv_from is not None:
+            ops.append(
+                dist.P2POp(
+                    dist.isend, dtensor, None, ctx.mesh.get_group(), 0, ctx.recv_from
+                )
+            )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
         return recv_buffer, None
 
 
-def causal_ring_comms(tensor: torch.Tensor, group: dist.ProcessGroup):
-    return RingCommsFn.apply(tensor, group)
+def causal_passing_comms(tensor: torch.Tensor, group: dist.ProcessGroup):
+    return CausalPassingFn.apply(tensor, group)
