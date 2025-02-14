@@ -1,5 +1,6 @@
 from copy import deepcopy
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from einops import rearrange
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
@@ -7,7 +8,10 @@ from test_fake_cp import in_proj_split
 
 from dtest import DTest
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba2_cp import causal_passing_comms
+from mamba_ssm.modules.mamba2_cp import (
+    causal_passing_comms,
+    identity_fwd_all_reduce_bwd,
+)
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_serial_cp,
 )
@@ -52,6 +56,69 @@ class TestCausalPassingFn(DTest):
             other_idxs = torch.arange(self.world_size, device=self.device) != self.rank
             zero_grads = t_send.grad[other_idxs]
             torch.testing.assert_close(zero_grads, torch.zeros_like(zero_grads))
+
+
+class TestIdentityFwdAllGatherBwdFn(DTest):
+    def test_fwd(self):
+        dim = 16
+        torch.manual_seed(42)
+        weight = torch.randn(
+            dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        weight_copy = deepcopy(weight)
+
+        weight = nn.Parameter(weight)
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        weight_copy = nn.Parameter(weight_copy)
+
+        inputs = torch.randn(
+            self.world_size,
+            dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
+
+        output = inputs * weight
+        output_shard = inputs_shard * identity_fwd_all_reduce_bwd(weight_copy, mesh)
+
+        all_gathered_output_shards = torch.empty_like(inputs)
+        dist.all_gather_into_tensor(
+            all_gathered_output_shards, output_shard, group=mesh.get_group()
+        )
+        out = [torch.empty_like(output_shard) for _ in range(self.world_size)]
+        dist.all_gather(out, output_shard, group=mesh.get_group())
+
+        torch.testing.assert_close(all_gathered_output_shards, output)
+
+    def test_bwd(self):
+        dim = 16
+        torch.manual_seed(42)
+        weight = torch.randn(
+            dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        weight_copy = deepcopy(weight)
+
+        weight = nn.Parameter(weight)
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        weight_copy = nn.Parameter(weight_copy)
+
+        inputs = torch.randn(
+            self.world_size,
+            dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
+
+        (inputs * weight).sum().backward()
+        (inputs_shard * identity_fwd_all_reduce_bwd(weight_copy, mesh)).sum().backward()
+
+        torch.testing.assert_close(weight.grad, weight_copy.grad)
 
 
 class TestSerialCP(DTest):

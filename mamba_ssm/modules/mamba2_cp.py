@@ -2,6 +2,8 @@ import torch
 from typing import Optional
 from einops import rearrange
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
+
 
 from mamba_ssm.modules.mamba2 import Mamba2
 
@@ -102,5 +104,28 @@ class CausalPassingFn(torch.autograd.Function):
         return recv_buffer, None
 
 
-def causal_passing_comms(tensor: torch.Tensor, group: dist.ProcessGroup):
-    return CausalPassingFn.apply(tensor, group)
+causal_passing_comms = CausalPassingFn.apply
+
+
+class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
+    """
+    Wrapper for all-gathering grads onto unsharded tensors which are used in rank-sharded
+    operations.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, tensor: torch.Tensor, mesh: dist.device_mesh.DeviceMesh
+    ) -> torch.Tensor:
+        if mesh.ndim != 1:
+            raise ValueError("Only supports 1D DeviceMesh instances.")
+        ctx.mesh = mesh
+        return tensor
+
+    @staticmethod
+    def backward(ctx, dtensor: torch.Tensor) -> torch.Tensor:
+        dtensor = funcol.all_reduce(dtensor, reduceOp="sum", group=ctx.mesh.get_group())
+        return dtensor, None
+
+
+identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
