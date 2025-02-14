@@ -732,8 +732,6 @@ def _mamba_chunk_scan_combined_bwd_template(
         dinitial_states = rearrange(
             dinitial_states,
             "... p n -> (p n)",
-            p=states.shape[-2],
-            n=states.shape[-1],  # TODO: @goon - remove shape check
         )
 
     return _mamba_chunk_scan_post_dstates_bwd(
@@ -869,36 +867,18 @@ class StatePassingSerialCP(_StatePassingImpl):
                     out_dtype=out_dtype,
                 )
 
-                # TODO: @goon - should just use dist.send, but this gave:
-                # ncclInternalError: Internal check failed.
-                # Last error:
-                # ncclSocketInit: connecting to address  with family 59408 is neither AF_INET(2) nor AF_INET6(10)
-                #
-                # Probably some local dev env issue?
-
-                dist.batch_isend_irecv(
-                    [dist.P2POp(dist.isend, final_states, recv_rank, mesh.get_group())]
-                )[0].wait()
-                # dist.send(
-                #     final_states,
-                #     dst=recv_rank,
-                #     group=mesh.get_group(),
-                # )
+                dist.send(
+                    final_states,
+                    dst=recv_rank,
+                    group=mesh.get_group(),
+                )
             elif rank == recv_rank:
                 initial_states = torch.empty_like(states[:, 0])
-                # TODO: @goon - should use dist.recv; see above.
-                dist.batch_isend_irecv(
-                    [
-                        dist.P2POp(
-                            dist.irecv, initial_states, send_rank, mesh.get_group()
-                        )
-                    ]
-                )[0].wait()
-                # dist.recv(
-                #     initial_states,
-                #     src=send_rank,
-                #     group=mesh.get_group(),
-                # )
+                dist.recv(
+                    initial_states,
+                    src=send_rank,
+                    group=mesh.get_group(),
+                )
             dist.barrier()
 
         # Final rank only:
@@ -948,24 +928,23 @@ class StatePassingSerialCP(_StatePassingImpl):
                         mesh=mesh,
                     )
                 )
-                # TODO: @goon - use dist.send; see above.
-                dist.batch_isend_irecv(
-                    [
-                        dist.P2POp(
-                            dist.isend,
-                            dinitial_states_passed,
-                            recv_rank,
-                            mesh.get_group(),
-                        )
-                    ]
-                )[0].wait()
+                dist.send(
+                    dinitial_states_passed,
+                    dst=recv_rank,
+                    group=mesh.get_group(),
+                )
             elif rank == recv_rank:
                 dfinal_states = torch.empty(
                     *states[:, 0].shape, dtype=dstates_dtype, device=states.device
                 )
-                dist.batch_isend_irecv(
-                    [dist.P2POp(dist.irecv, dfinal_states, send_rank, mesh.get_group())]
-                )[0].wait()
+                # dist.batch_isend_irecv(
+                #     [dist.P2POp(dist.irecv, dfinal_states, send_rank, mesh.get_group())]
+                # )[0].wait()
+                dist.recv(
+                    dfinal_states,
+                    src=send_rank,
+                    group=mesh.get_group(),
+                )
 
             dist.barrier()
 
