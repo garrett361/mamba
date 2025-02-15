@@ -143,11 +143,7 @@ class Mamba2Split(Mamba2):
         return fwd(u, self)
 
 
-class TestLocalCP:
-    """
-    Single-device mock ups of CP, and other related tests.
-    """
-
+class _TestBase:
     batch_size = 2
     cp_dim = 4
     chunk_size = 4
@@ -223,6 +219,8 @@ class TestLocalCP:
         )
         return states, dA_chunk_cumsum
 
+
+class TestImpls(_TestBase):
     def test_fwd(self) -> None:
         model = self.get_model()
         model_split = self.get_model_split()
@@ -248,6 +246,12 @@ class TestLocalCP:
         xBC = self.get_xBC()
         outputs = conv(xBC, self.get_model())
         outputs
+
+
+class TestLocalCP(_TestBase):
+    """
+    Single-device mock ups of CP implementations, and other related tests.
+    """
 
     def test_conv_with_state_fwd(self) -> None:
         torch.manual_seed(42)
