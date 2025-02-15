@@ -137,7 +137,7 @@ class TestSerialCP(DTest):
 
     @property
     def factory_kwargs(self):
-        return {"dtype": torch.bfloat16, "device": self.device}
+        return {"dtype": torch.float32, "device": self.device}
 
     def get_model(self, seed: int = 42):
         torch.manual_seed(seed)
@@ -158,16 +158,19 @@ class TestSerialCP(DTest):
             requires_grad=requires_grad,
         )
 
-    def _get_non_seq_dim_kwargs(
-        self,
-        model,
-    ):
+    def get_scan_kwargs(self, inputs, model):
         """
-        Common scan kwargs which don't have a seq_len dim to shard.
+        Get all kwargs for the scan.
         """
         A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
+        _, _, z, xBC, dt = in_proj_split(inputs, model)
+        x, B, C = torch.split(
+            xBC,
+            [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
+            dim=-1,
+        )
 
-        non_seq_dim_kwargs = dict(
+        scan_kwargs = dict(
             A=A,
             chunk_size=model.chunk_size,
             D=rearrange(model.D, "(h p) -> h p", p=model.headdim)
@@ -175,21 +178,6 @@ class TestSerialCP(DTest):
             else model.D,
             dt_bias=model.dt_bias,
             dt_softplus=True,
-        )
-        return non_seq_dim_kwargs
-
-    def get_scan_kwargs(self, inputs, model):
-        """
-        Get all kwargs for the non-cp scan.
-        """
-        _, _, z, xBC, dt = in_proj_split(inputs, model)
-        x, B, C = torch.split(
-            xBC,
-            [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
-            dim=-1,
-        )
-
-        seq_dim_kwargs = dict(
             x=rearrange(x, "b l (h p) -> b l h p", p=model.headdim),
             dt=dt,
             B=rearrange(B, "b l (g n) -> b l g n", g=model.ngroups),
@@ -198,40 +186,7 @@ class TestSerialCP(DTest):
             if not model.rmsnorm
             else None,
         )
-        non_seq_dim_kwargs = self._get_non_seq_dim_kwargs(model)
-        return {**seq_dim_kwargs, **non_seq_dim_kwargs}
-
-    def get_cp_scan_kwargs(self, inputs, model):
-        """
-        Get all kwargs for the cp scan.
-        """
-        _, _, z, xBC, dt = in_proj_split(inputs, model)
-        x, B, C = torch.split(
-            xBC,
-            [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
-            dim=-1,
-        )
-
-        seq_dim_kwargs = dict(
-            x=rearrange(x, "b l (h p) -> b l h p", p=model.headdim),
-            dt=dt,
-            B=rearrange(B, "b l (g n) -> b l g n", g=model.ngroups),
-            C=rearrange(C, "b l (g n) -> b l g n", g=model.ngroups),
-            z=rearrange(z, "b l (h p) -> b l h p", p=model.headdim)
-            if not model.rmsnorm
-            else None,
-        )
-        cp_seq_dim_kwargs = {
-            k: rearrange(t, "b (r l) ... -> b r l ...", r=self.world_size)[
-                :, self.rank
-            ].contiguous()
-            if t is not None
-            else None
-            for k, t in seq_dim_kwargs.items()
-        }
-
-        non_seq_dim_kwargs = self._get_non_seq_dim_kwargs(model)
-        return {**cp_seq_dim_kwargs, **non_seq_dim_kwargs}
+        return scan_kwargs
 
     def test_fwd(self):
         torch.manual_seed(42)
@@ -244,7 +199,10 @@ class TestSerialCP(DTest):
         outputs = mamba_chunk_scan_combined(**kwargs)
 
         # And the CP output:
-        cp_kwargs = self.get_cp_scan_kwargs(inputs, model)
+        inputs_cp_shard = rearrange(
+            inputs, "b (r l) ... -> b r l ...", r=self.world_size
+        )[:, self.rank]
+        cp_kwargs = self.get_scan_kwargs(inputs_cp_shard, model)
         outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **cp_kwargs)
 
         # All-gather and verify correctness
@@ -260,7 +218,8 @@ class TestSerialCP(DTest):
         outputs_cp_all_gathered = rearrange(
             outputs_cp_all_gathered, "r b l ... -> b (r l) ..."
         )
-        torch.testing.assert_close(outputs, outputs_cp_all_gathered)
+        tol = 1e-3
+        torch.testing.assert_close(outputs, outputs_cp_all_gathered, atol=tol, rtol=tol)
 
     def test_bwd(self):
         torch.manual_seed(42)
@@ -270,15 +229,20 @@ class TestSerialCP(DTest):
         model = self.get_model()
 
         inputs_cp = self.get_inputs(requires_grad=True)
+        inputs_cp_shard = rearrange(
+            inputs_cp, "b (r l) ... -> b r l ...", r=self.world_size
+        )[:, self.rank]
         model_cp = deepcopy(model)
 
         # Backward on the correct global result
         kwargs = self.get_scan_kwargs(inputs, model)
-        mamba_chunk_scan_combined(**kwargs).sum().backward()
+        outputs = mamba_chunk_scan_combined(**kwargs)
+        outputs.sum().backward()
 
         # And on the CP output:
-        cp_kwargs = self.get_cp_scan_kwargs(inputs_cp, model_cp)
-        mamba_chunk_scan_combined_serial_cp(mesh=mesh, **cp_kwargs).sum().backward()
+        kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, model_cp)
+        outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **kwargs_cp)
+        outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
         inputs_grad_shard = rearrange(
@@ -288,11 +252,24 @@ class TestSerialCP(DTest):
             inputs_cp.grad, "b (r l) ... -> b r l ...", r=self.world_size
         )[:, self.rank]
 
-        tol = 1e-2
-        try:
+        tol = 1e-3
+        torch.testing.assert_close(
+            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+        )
+
+        # Parameter grads should match after all-reducing.
+        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+        grads_cp = {
+            n: deepcopy(p.grad)
+            for n, p in model_cp.named_parameters()
+            if p.grad is not None
+        }
+        for g in grads_cp.values():
+            dist.all_reduce(g)
+        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
+        assert set(grads) == set(grads_cp)
+        for n, g_cp in grads_cp.items():
+            g = grads[n]
             torch.testing.assert_close(
-                inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
             )
-        except Exception as e:
-            self.print_rank(f"Caught Exception: {e}")
-            raise e
