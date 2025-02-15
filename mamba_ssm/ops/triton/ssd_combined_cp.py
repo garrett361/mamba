@@ -41,9 +41,9 @@ class _StatePassingImpl(ABC):
     @abstractmethod
     def fwd(
         chunk_size,
-        states,  # (batch, nchunks, nheads, headdim, dstate)
+        states,  # (batch, nchunks, nheads, headdim, d_state)
         dA_cumsum,
-        initial_states=None,  # Optional[(batch, nheads, headdim, dstate)]
+        initial_states=None,  # Optional[(batch, nheads, headdim, d_state)]
         seq_idx=None,
         out_dtype=None,
         mesh: Optional[dist.device_mesh.DeviceMesh] = None,
@@ -52,9 +52,9 @@ class _StatePassingImpl(ABC):
         Returns a tuple of (states, final_states, initial_states). The initial_states may be those
         passed in directly, or initial_states communicated from other ranks.
         Shapes:
-        - states: (batch, nchunks, nheads, headdim, dstate)
-        - final_states: (batch, nheads, headdim, dstate)
-        - initial_states: (batch, nheads, headdim, dstate)
+        - states: (batch, nchunks, nheads, headdim, d_state)
+        - final_states: (batch, nheads, headdim, d_state)
+        - initial_states: (batch, nheads, headdim, d_state)
         """
         ...
 
@@ -77,10 +77,10 @@ class _StatePassingImpl(ABC):
         """
         Returns a tuple of (dstates, ddA_chunk_cumsum, dinitial_states, states).
         Shapes:
-        - dstates: (batch, nchunks, nheads, headdim, dstate)
+        - dstates: (batch, nchunks, nheads, headdim, d_state)
         - ddA_chunk_cumsum: (batch, nheads, nchunks, n_blocks),  n_blocks set by triton config
-        - dinitial_states: Optional[(batch, nchunks, nheads, headdim, dstate)]
-        - states:  Optional[(batch, nchunks, nheads, headdim, dstate)]
+        - dinitial_states: Optional[(batch, nchunks, nheads, headdim, d_state)]
+        - states:  Optional[(batch, nchunks, nheads, headdim, d_state)]
         """
         ...
 
@@ -108,13 +108,23 @@ class _StatePassingImpl(ABC):
                 return_varlen_states=False,
                 mesh: Optional[dist.device_mesh.DeviceMesh] = None,
             ):
+                # TODO: @goon - implement.
+                if seq_idx is not None:
+                    raise NotImplementedError
+                if return_varlen_states:
+                    raise NotImplementedError
+                if cu_seqlens is not None:
+                    raise NotImplementedError
+
                 if not return_varlen_states:
                     cu_seqlens = None
                 else:
                     assert (
                         cu_seqlens is not None
                     ), "cu_seqlens must be provided if return_varlen_states is True"
-                out, out_x, _, dA_cumsum, _, final_states, *rest = (
+                # Currently, rest is trivial, but it can contain varlen_states when that option is
+                # implemented. TODO: @goon - implement.
+                out, out_x, dA_cumsum, final_states, *rest = (
                     _mamba_chunk_scan_combined_fwd_template(
                         cls.fwd,
                         x,
@@ -138,7 +148,6 @@ class _StatePassingImpl(ABC):
                     out if z is None else out_x,
                     x,
                     dt,
-                    dA_cumsum,
                     A,
                     B,
                     C,
@@ -168,7 +177,7 @@ class _StatePassingImpl(ABC):
 
             @staticmethod
             def backward(ctx, dout, *args):
-                out, x, dt, _, A, B, C, D, z, dt_bias, initial_states, seq_idx = (
+                out, x, dt, A, B, C, D, z, dt_bias, initial_states, seq_idx = (
                     ctx.saved_tensors
                 )
                 assert (
@@ -244,13 +253,13 @@ class _StatePassingImpl(ABC):
                 x: (batch, seqlen, nheads, headdim)
                 dt: (batch, seqlen, nheads)
                 A: (nheads)
-                B: (batch, seqlen, ngroups, dstate)
-                C: (batch, seqlen, ngroups, dstate)
+                B: (batch, seqlen, ngroups, d_state)
+                C: (batch, seqlen, ngroups, d_state)
                 chunk_size: int
                 D: (nheads, headdim) or (nheads,)
                 z: (batch, seqlen, nheads, headdim)
                 dt_bias: (nheads,)
-                initial_states: (batch, nheads, headdim, dstate)
+                initial_states: (batch, nheads, headdim, d_state)
                 seq_idx: (batch, seqlen)
                 cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
                 dt_softplus: Whether to apply softplus to dt
@@ -297,9 +306,9 @@ def _mamba_chunk_scan_states_fwd(
     dt_limit=(0.0, float("inf")),
 ):
     batch, seqlen, nheads, headdim = x.shape
-    _, _, ngroups, dstate = B.shape
+    _, _, ngroups, d_state = B.shape
     assert nheads % ngroups == 0
-    assert B.shape == (batch, seqlen, ngroups, dstate)
+    assert B.shape == (batch, seqlen, ngroups, d_state)
     assert x.shape == (batch, seqlen, nheads, headdim)
     assert dt.shape == (batch, seqlen, nheads)
     assert A.shape == (nheads,)
@@ -325,7 +334,7 @@ def _mamba_chunk_scan_states_fwd(
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+        assert initial_states.shape == (batch, nheads, headdim, d_state)
     dA_cumsum, dt = _chunk_cumsum_fwd(
         dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
     )
@@ -406,7 +415,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         seq_idx=seq_idx,
     )
 
-    return out, out_x, dt, dA_cumsum, states, final_states
+    return out, out_x, dA_cumsum, final_states
 
 
 def _mamba_chunk_scan_states_bwd(
@@ -428,16 +437,16 @@ def _mamba_chunk_scan_states_bwd(
     if dout.stride(-1) != 1:
         dout = dout.contiguous()
     batch, seqlen, nheads, headdim = x.shape
-    _, _, ngroups, dstate = B.shape
+    _, _, ngroups, d_state = B.shape
     assert dout.shape == (batch, seqlen, nheads, headdim)
     assert dt.shape == (batch, seqlen, nheads)
     assert A.shape == (nheads,)
     assert nheads % ngroups == 0
-    assert B.shape == (batch, seqlen, ngroups, dstate)
+    assert B.shape == (batch, seqlen, ngroups, d_state)
     assert C.shape == B.shape
     assert out.shape == x.shape
     if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+        assert initial_states.shape == (batch, nheads, headdim, d_state)
     if seq_idx is not None:
         assert seq_idx.shape == (batch, seqlen)
     if dx is not None:
@@ -455,7 +464,7 @@ def _mamba_chunk_scan_states_bwd(
     )
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-    return states, dA_cumsum, dstate, dt_in, dt, CB
+    return states, dA_cumsum, dt_in, dt, CB
 
 
 def _mamba_chunk_scan_post_states_bwd(
@@ -498,7 +507,7 @@ def _mamba_chunk_scan_post_states_bwd(
     else:
         ddt_given = torch.empty_like(dt_in)
     if z is not None:
-        dz, dout, _, *rest = _chunk_scan_bwd_dz(
+        dz, dout, dD, *rest = _chunk_scan_bwd_dz(
             x,
             z,
             out,
@@ -513,6 +522,7 @@ def _mamba_chunk_scan_post_states_bwd(
     else:
         dz = None
         outz = out
+        dD = None
     dstates = _chunk_scan_bwd_dstates(
         C, dA_cumsum, dout, seq_idx=seq_idx, dtype=states.dtype
     )
@@ -525,6 +535,7 @@ def _mamba_chunk_scan_post_states_bwd(
         outz,
         dB_given,
         dC_given,
+        dD,
         ddt_given,
         dt_in,
     )
@@ -545,6 +556,7 @@ def _mamba_chunk_scan_post_dstates_bwd(
     outz,
     dB_given,
     dC_given,
+    dD,
     ddt_given,
     ddA_chunk_cumsum,
     dt_in,
@@ -561,26 +573,22 @@ def _mamba_chunk_scan_post_dstates_bwd(
     dz=None,
     recompute_output=False,
 ):
-    _, _, ngroups, dstate = B.shape
+    _, _, ngroups, d_state = B.shape
     dinitial_states = (
-        rearrange(dinitial_states, "... (p n) -> ... p n", n=dstate)
+        rearrange(dinitial_states, "... (p n) -> ... p n", n=d_state)
         if dinitial_states is not None
         else None
     )
     dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(
         x, dt, dA_cumsum, B, CB, dout, dstates, D=D, seq_idx=seq_idx, dx=dx
     )
-    # dB = _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=seq_idx, ngroups=ngroups)
     dB, ddA_next = _chunk_state_bwd_db(
         x, dt, dA_cumsum, dstates, seq_idx=seq_idx, B=B, ngroups=ngroups
     )
-    # dC = _chunk_scan_bwd_dC(states[:, :-1].to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
     dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(
         states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups
     )
-    # Computing ddA with the dcb kernel is much slower, so we're not using it for now
     dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
-    # dCB, ddA_tmp = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, CB=CB, ngroups=ngroups)
     dCB = dCB.to(CB.dtype)
     _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given)
     _bmm_chunk_bwd(B, rearrange(dCB, "... l s -> ... s l"), residual=dC, out=dC_given)
@@ -588,18 +596,8 @@ def _mamba_chunk_scan_post_dstates_bwd(
     # than dD_from_x = (dout_x * x).sum() where dout_x is in fp16/bf16
     if z is None:
         dD = dD_from_x
-    # Formula for ddA_cumsum, assuming out is the output of the forward pass before adding x * D.
-    # ddA_cumsum = torch.einsum("bclhp,bclhp->bhcl", out.float(), dout.float()) - ddt * dt
-    # However, this is numerically unstable: when we do the reverse cumsum on ddA_cumsum, there might
-    # be a lot of underflow.
-
-    # This is already done as part of bwd_dC kernel
-    # ddA_cumsum_prev = _chunk_scan_bwd_ddAcs_prev(states[:, :-1], C, dout, dA_cumsum, seq_idx=seq_idx)
     ddA_cumsum_prev[..., -1] += ddA_chunk_cumsum
     ddA_prev = ddA_cumsum_prev.flip([-1]).cumsum(dim=-1).flip([-1])
-    # This is already done as part of bwd_dB kernel
-    # ddA_next = _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=seq_idx)
-    # We don't need to pass in seq_idx because CB also zeros out entries where seq_idx[i] != seq_idx[j]
     ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
     ddA += ddA_next + ddA_prev
 
@@ -613,10 +611,6 @@ def _mamba_chunk_scan_post_dstates_bwd(
         dt_limit=dt_limit,
         ddt=ddt_given,
     )
-
-    # These 2 lines are just to test ddt and dA being computed by old code
-    # _, dA = selective_scan_bwd(dout, x, dt, A, B, C, D=D.float(), z=z)
-    # ddt_given.copy_(ddt)
 
     return_vals = (
         dx,
@@ -659,7 +653,7 @@ def _mamba_chunk_scan_combined_bwd_template(
     recompute_output=False,
     mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
-    states, dA_cumsum, _, dt_in, dt, CB = _mamba_chunk_scan_states_bwd(
+    states, dA_cumsum, dt_in, dt, CB = _mamba_chunk_scan_states_bwd(
         dout=dout,
         x=x,
         dt=dt,
@@ -694,6 +688,7 @@ def _mamba_chunk_scan_combined_bwd_template(
         outz,
         dB_given,
         dC_given,
+        dD,
         ddt_given,
         dt_in,
     ) = _mamba_chunk_scan_post_states_bwd(
@@ -749,6 +744,7 @@ def _mamba_chunk_scan_combined_bwd_template(
         outz,
         dB_given,
         dC_given,
+        dD,
         ddt_given,
         ddA_chunk_cumsum,
         dt_in,
@@ -811,7 +807,7 @@ class StatePassingNonCP(_StatePassingImpl):
         seq_idx: Optional[torch.Tensor] = None,
         mesh: Optional[dist.device_mesh.DeviceMesh] = None,
     ):
-        dstate = states.shape[-1]
+        d_state = states.shape[-1]
         dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
             rearrange(states, "... p n -> ... (p n)"),
             dA_cumsum[:, :, :, -1],
@@ -825,11 +821,11 @@ class StatePassingNonCP(_StatePassingImpl):
             states_dtype=states_dtype,
             chunk_size=chunk_size,
         )
-        states = rearrange(states, "... (p n) -> ... p n", n=dstate)
-        dstates = rearrange(dstates, "... (p n) -> ... p n", n=dstate)
+        states = rearrange(states, "... (p n) -> ... p n", n=d_state)
+        dstates = rearrange(dstates, "... (p n) -> ... p n", n=d_state)
         if dinitial_states is not None:
             dinitial_states = rearrange(
-                dinitial_states, "... (p n) -> ... p n", n=dstate
+                dinitial_states, "... (p n) -> ... p n", n=d_state
             )
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 
