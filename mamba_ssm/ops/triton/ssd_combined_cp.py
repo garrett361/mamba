@@ -8,7 +8,7 @@ inserted at this point.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
+from typing import Any, Optional, Type
 
 import torch
 import torch.distributed as dist
@@ -121,7 +121,7 @@ class _StatePassingImpl(ABC):
                     ), "cu_seqlens must be provided if return_varlen_states is True"
                 out, out_x, dt_out, dA_cumsum, states, final_states, *rest = (
                     _mamba_chunk_scan_combined_fwd_template(
-                        cls.fwd,
+                        cls,
                         x,
                         dt,
                         A,
@@ -191,8 +191,7 @@ class _StatePassingImpl(ABC):
                 dfinal_states = args[0] if ctx.return_final_states else None
                 dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
                     _mamba_chunk_scan_combined_bwd_template(
-                        cls.fwd,
-                        cls.bwd,
+                        cls,
                         dout,
                         x,
                         dt,
@@ -300,7 +299,7 @@ class _StatePassingImpl(ABC):
 
 
 def _mamba_chunk_scan_combined_fwd_template(
-    state_passing_impl_fwd: Callable,
+    state_passing_impl: Type[_StatePassingImpl],
     x,
     dt,
     A,
@@ -352,7 +351,7 @@ def _mamba_chunk_scan_combined_fwd_template(
     )
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
 
-    states, final_states, _ = state_passing_impl_fwd(
+    states, final_states, _ = state_passing_impl.fwd(
         chunk_size=chunk_size,
         states=states,
         dA_cumsum=dA_cumsum,
@@ -384,8 +383,7 @@ def _mamba_chunk_scan_combined_fwd_template(
 
 
 def _mamba_chunk_scan_combined_bwd_template(
-    state_passing_impl_fwd: Callable,
-    state_passing_impl_bwd: Callable,
+    state_passing_impl: Type[_StatePassingImpl],
     dout,
     x,
     dt,
@@ -459,7 +457,7 @@ def _mamba_chunk_scan_combined_bwd_template(
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
 
-    states, _, bwd_args = state_passing_impl_fwd(
+    states, _, bwd_args = state_passing_impl.fwd(
         chunk_size=chunk_size,
         states=states,
         dA_cumsum=dA_cumsum,
@@ -489,7 +487,7 @@ def _mamba_chunk_scan_combined_bwd_template(
         C, dA_cumsum, dout, seq_idx=seq_idx, dtype=states.dtype
     )
 
-    dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_impl_bwd(
+    dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_impl.bwd(
         chunk_size=chunk_size,
         states=states,
         dA_cumsum=dA_cumsum,
