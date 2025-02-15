@@ -1,10 +1,14 @@
 """
-Split the ssd_combined kernels at the state_passing step so that custom logic for CP can be
-inserted at this point.
+Utilities for creating context-parallel autograd functions from the triton kernel building blocks.
 
-`_mamba_chunk_scan_combined_fwd` is equivalent to the proper `_mamba_chunk_scan_fwd` and similar for
-`bwd`, which we verify through tests.
+Every kernel is embarassingly parallel in the sequence dimension, except for
+`_state_passing_{fwd,bwd}`. The `_mamba_chunk_scan_combined_{fwd,bwd}_template` functions below
+mirror their `_mamba_chunk_scan_combined_{fwd,bwd}` counterparts, but take a `_StatePassingImpl`
+implementation which defines the replacements for the original `_state_passing_{fwd,bwd}` kernels.
 
+After defining the `_StatePassingImpl.{fwd,bwd}` methods of an implementation, the
+`_StatePassingImpl.get_chunk_scan_autograd_fn` class method generates the corresponding
+`autograd.Function` using the templated functions above.
 """
 
 from abc import ABC, abstractmethod
