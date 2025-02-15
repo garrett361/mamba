@@ -240,7 +240,8 @@ class TestLocalCP:
         model_split(inputs_split).sum().backward()
 
         for p1, p2 in zip(model.parameters(), model_split.parameters()):
-            torch.testing.assert_close(p1, p2)
+            if p1.grad is not None:
+                torch.testing.assert_close(p1.grad, p2.grad)
         torch.testing.assert_close(inputs.grad, inputs_split.grad)
 
     def test_conv(self) -> None:
