@@ -8,7 +8,7 @@ inserted at this point.
 """
 
 from abc import ABC, abstractmethod
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -49,14 +49,14 @@ class _StatePassingImpl(ABC):
         seq_idx=None,
         out_dtype=None,
         mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Any]:
         """
-        Returns a tuple of (states, final_states, initial_states). The initial_states may be those
-        passed in directly, or initial_states communicated from other ranks.
+        Returns a tuple of (states, final_states, bwd_args), where bwd_args is anything that
+        _StatePassingImpl.bwd might require for its backwards pass.
+
         Shapes:
         - states: (batch, nchunks, nheads, headdim, d_state)
         - final_states: (batch, nheads, headdim, d_state)
-        - initial_states: (batch, nheads, headdim, d_state)
         """
         ...
 
@@ -73,11 +73,13 @@ class _StatePassingImpl(ABC):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        bwd_args: Optional[Any] = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
     ]:
         """
-        Returns a tuple of (dstates, ddA_chunk_cumsum, dinitial_states, states).
+        Returns a tuple of (dstates, ddA_chunk_cumsum, dinitial_states, states). bwd_args is
+        whatever may have been passed along by _StatePassingImpl.fwd.
         Shapes:
         - dstates: (batch, nchunks, nheads, headdim, d_state)
         - ddA_chunk_cumsum: (batch, nheads, nchunks, n_blocks),  n_blocks set by triton config
@@ -457,7 +459,7 @@ def _mamba_chunk_scan_combined_bwd_template(
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
 
-    states, _, initial_states = state_passing_impl_fwd(
+    states, _, bwd_args = state_passing_impl_fwd(
         chunk_size=chunk_size,
         states=states,
         dA_cumsum=dA_cumsum,
@@ -498,6 +500,7 @@ def _mamba_chunk_scan_combined_bwd_template(
         dfinal_states=dfinal_states,
         seq_idx=seq_idx,
         mesh=mesh,
+        bwd_args=bwd_args,
     )
 
     dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(
@@ -532,10 +535,6 @@ def _mamba_chunk_scan_combined_bwd_template(
         dt_limit=dt_limit,
         ddt=ddt_given,
     )
-
-    # These 2 lines are just to test ddt and dA being computed by old code
-    # _, dA = selective_scan_bwd(dout, x, dt, A, B, C, D=D.float(), z=z)
-    # ddt_given.copy_(ddt)
 
     return_vals = (
         dx,
@@ -580,7 +579,7 @@ class StatePassingNonCP(_StatePassingImpl):
             rearrange(t, "... (p n) -> ... p n", n=d_state)
             for t in [states, final_states]
         ]
-        return states, final_states, initial_states
+        return states, final_states, None
 
     @staticmethod
     def bwd(
@@ -594,6 +593,7 @@ class StatePassingNonCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        bwd_args: Optional[Any] = None,  # Intentionally unused
     ):
         d_state = states.shape[-1]
         dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
@@ -625,6 +625,10 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 
 
 class StatePassingSerialCP(_StatePassingImpl):
+    """
+    TODO: @goon - seq_idx probably not being treated correctly
+    """
+
     @staticmethod
     def fwd(
         chunk_size,
@@ -643,11 +647,11 @@ class StatePassingSerialCP(_StatePassingImpl):
         for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
             if rank == send_rank:
                 states, final_states, _ = StatePassingNonCP.fwd(
-                    chunk_size,
-                    states,
-                    dA_cumsum,
-                    initial_states,
-                    seq_idx,
+                    chunk_size=chunk_size,
+                    states=states,
+                    dA_cumsum=dA_cumsum,
+                    initial_states=initial_states,
+                    seq_idx=seq_idx,
                     out_dtype=out_dtype,
                 )
 
@@ -656,10 +660,11 @@ class StatePassingSerialCP(_StatePassingImpl):
                     dst=recv_rank,
                     group=mesh.get_group(),
                 )
+                recv_init_states = None
             elif rank == recv_rank:
-                initial_states = torch.empty_like(states[:, 0])
+                recv_init_states = torch.empty_like(states[:, 0])
                 dist.recv(
-                    initial_states,
+                    recv_init_states,
                     src=send_rank,
                     group=mesh.get_group(),
                 )
@@ -668,13 +673,14 @@ class StatePassingSerialCP(_StatePassingImpl):
         # Final rank only:
         if rank == recv_rank:
             states, final_states, _ = StatePassingNonCP.fwd(
-                chunk_size,
-                states,
-                dA_cumsum,
-                initial_states,
-                seq_idx,
+                chunk_size=chunk_size,
+                states=states,
+                dA_cumsum=dA_cumsum,
+                initial_states=recv_init_states,
+                seq_idx=seq_idx,
+                out_dtype=out_dtype,
             )
-        return states, final_states, initial_states
+        return states, final_states, recv_init_states
 
     @staticmethod
     def bwd(
@@ -688,23 +694,25 @@ class StatePassingSerialCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        bwd_args: Optional[Any] = None,
     ):
         """
-        Starting from the final rank to compute in _state_passing_serial_cp_fwd,
-        compute dinitial_states and pass these back as the dfinal_states of the preceding rank.
+        Starting from the final rank to compute in _state_passing_serial_cp_fwd, compute
+        dinitial_states and pass these back as the dfinal_states of the preceding rank.
         """
+        recv_init_states = bwd_args
         assert mesh is not None
         rank = mesh.get_rank()
         reversed_mesh = mesh.mesh.flip(0)
         for send_rank, recv_rank in zip(reversed_mesh[:-1], reversed_mesh[1:]):
             if rank == send_rank:
-                dstates, ddA_chunk_cumsum, dinitial_states_passed, states = (
+                dstates, ddA_chunk_cumsum, dinitial_states, states = (
                     StatePassingNonCP.bwd(
                         chunk_size=chunk_size,
                         states=states,
                         dA_cumsum=dA_cumsum,
                         dstates=dstates,
-                        initial_states=initial_states,
+                        initial_states=recv_init_states,
                         dfinal_states=dfinal_states,
                         seq_idx=seq_idx,
                         dstates_dtype=dstates_dtype,
@@ -713,19 +721,20 @@ class StatePassingSerialCP(_StatePassingImpl):
                     )
                 )
                 dist.send(
-                    dinitial_states_passed,
+                    dinitial_states,
                     dst=recv_rank,
                     group=mesh.get_group(),
                 )
+                # None of these ranks had any actual initial_states as proper inputs to
+                # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from
+                # other ranks) and so we need to overwrite dinitial_states = None after sending.
+                dinitial_states = None
             elif rank == recv_rank:
-                dfinal_states = torch.empty(
+                recv_dfinal_states = torch.empty(
                     *states[:, 0].shape, dtype=dstates_dtype, device=states.device
                 )
-                # dist.batch_isend_irecv(
-                #     [dist.P2POp(dist.irecv, dfinal_states, send_rank, mesh.get_group())]
-                # )[0].wait()
                 dist.recv(
-                    dfinal_states,
+                    recv_dfinal_states,
                     src=send_rank,
                     group=mesh.get_group(),
                 )
@@ -734,24 +743,18 @@ class StatePassingSerialCP(_StatePassingImpl):
 
         # Final rank only:
         if rank == recv_rank:
-            dstates, ddA_chunk_cumsum, dinitial_states_passed, states = (
-                StatePassingNonCP.bwd(
-                    chunk_size=chunk_size,
-                    states=states,
-                    dA_cumsum=dA_cumsum,
-                    dstates=dstates,
-                    initial_states=initial_states,
-                    dfinal_states=dfinal_states,
-                    seq_idx=seq_idx,
-                    dstates_dtype=dstates_dtype,
-                    states_dtype=states_dtype,
-                    mesh=mesh,
-                )
+            dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_cumsum=dA_cumsum,
+                dstates=dstates,
+                initial_states=initial_states,
+                dfinal_states=recv_dfinal_states,
+                seq_idx=seq_idx,
+                dstates_dtype=dstates_dtype,
+                states_dtype=states_dtype,
+                mesh=mesh,
             )
-        # None of the ranks had any actual initial_states as proper inputs to
-        # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from other
-        # ranks) and so its derivative is None.
-        dinitial_states = None
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 
 
