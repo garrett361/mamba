@@ -364,3 +364,40 @@ class TestMamba2CPSerial(_DTestModelBase):
 
         outputs_shard = self.get_cp_shard(outputs)
         torch.testing.assert_close(outputs_cp, outputs_shard)
+
+    def test_bwd(self):
+        torch.manual_seed(42)
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        mamba2 = self.get_mamba2()
+        mamba2_cp = self.get_mamba2_cp(mesh=mesh)
+
+        inputs = self.get_inputs(requires_grad=True)
+        inputs_cp = deepcopy(inputs)
+        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+
+        outputs = mamba2(inputs)
+        outputs.sum().backward()
+        outputs_cp = mamba2_cp(inputs_cp_shard)
+        outputs_cp.sum().backward()
+
+        inputs_grad_shard = self.get_cp_shard(inputs.grad)
+        inputs_cp_grad_shard = self.get_cp_shard(inputs_cp.grad)
+        torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
+
+        # Parameter grads should match after all-reducing.
+        grads = {n: p.grad for n, p in mamba2.named_parameters() if p.grad is not None}
+        grads_cp = {
+            n: deepcopy(p.grad)
+            for n, p in mamba2_cp.named_parameters()
+            if p.grad is not None
+        }
+        for g in grads_cp.values():
+            dist.all_reduce(g)
+        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
+        assert set(grads) == set(grads_cp)
+        tol = 1e-3
+        for n, g_cp in grads_cp.items():
+            g = grads[n]
+            torch.testing.assert_close(
+                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
+            )
