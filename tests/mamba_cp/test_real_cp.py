@@ -146,7 +146,7 @@ class _DTestModelBase(DTest):
     def factory_kwargs(self):
         return {"dtype": torch.float32, "device": self.device}
 
-    def get_model(self, seed: int = 42):
+    def get_mamba2(self, seed: int = 42) -> Mamba2:
         torch.manual_seed(seed)
         return Mamba2(
             d_model=self.d_model,
@@ -178,46 +178,64 @@ class TestConvCP(_DTestModelBase):
 
     def test_fwd(self):
         torch.manual_seed(42)
-        model = self.get_model()
+        mamba2 = self.get_mamba2()
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         xBC = self.get_xBC()
 
         xBC_cp = rearrange(xBC, "b (c l) d -> c b l d ", c=self.world_size)[self.rank]
 
-        outputs = conv(xBC, model)
-        outputs_cp = conv_cp(xBC_cp, model, mesh)
+        outputs = conv(xBC, mamba2)
+        outputs_cp = conv_cp(xBC_cp, mamba2, mesh)
+        torch.testing.assert_close(
+            outputs_cp, outputs.tensor_split(self.world_size, dim=1)[self.rank]
+        )
+
+    def test_bwd(self):
+        torch.manual_seed(42)
+        mamba2 = self.get_mamba2()
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        xBC = self.get_xBC(requires_grad=True)
+
+        xBC_cp = rearrange(xBC, "b (c l) d -> c b l d ", c=self.world_size)[self.rank]
+
+        outputs = conv(xBC, mamba2)
+        outputs_cp = conv_cp(xBC_cp, mamba2, mesh)
         torch.testing.assert_close(
             outputs_cp, outputs.tensor_split(self.world_size, dim=1)[self.rank]
         )
 
 
 class TestSerialCP(_DTestModelBase):
-    def get_scan_kwargs(self, inputs, model):
+    def get_scan_kwargs(self, inputs, mamba2):
         """
         Get all kwargs for the scan.
         """
-        A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
-        _, _, z, xBC, dt = in_proj_split(inputs, model)
+        A = -torch.exp(mamba2.A_log.float())  # (nheads) or (d_inner, d_state)
+        _, _, z, xBC, dt = in_proj_split(inputs, mamba2)
         x, B, C = torch.split(
             xBC,
-            [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
+            [
+                mamba2.d_ssm,
+                mamba2.ngroups * mamba2.d_state,
+                mamba2.ngroups * mamba2.d_state,
+            ],
             dim=-1,
         )
 
         scan_kwargs = dict(
             A=A,
-            chunk_size=model.chunk_size,
-            D=rearrange(model.D, "(h p) -> h p", p=model.headdim)
-            if model.D_has_hdim
-            else model.D,
-            dt_bias=model.dt_bias,
+            chunk_size=mamba2.chunk_size,
+            D=rearrange(mamba2.D, "(h p) -> h p", p=mamba2.headdim)
+            if mamba2.D_has_hdim
+            else mamba2.D,
+            dt_bias=mamba2.dt_bias,
             dt_softplus=True,
-            x=rearrange(x, "b l (h p) -> b l h p", p=model.headdim),
+            x=rearrange(x, "b l (h p) -> b l h p", p=mamba2.headdim),
             dt=dt,
-            B=rearrange(B, "b l (g n) -> b l g n", g=model.ngroups),
-            C=rearrange(C, "b l (g n) -> b l g n", g=model.ngroups),
-            z=rearrange(z, "b l (h p) -> b l h p", p=model.headdim)
-            if not model.rmsnorm
+            B=rearrange(B, "b l (g n) -> b l g n", g=mamba2.ngroups),
+            C=rearrange(C, "b l (g n) -> b l g n", g=mamba2.ngroups),
+            z=rearrange(z, "b l (h p) -> b l h p", p=mamba2.headdim)
+            if not mamba2.rmsnorm
             else None,
         )
         return scan_kwargs
@@ -226,17 +244,17 @@ class TestSerialCP(_DTestModelBase):
         torch.manual_seed(42)
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         inputs = self.get_inputs()
-        model = self.get_model()
+        mamba2 = self.get_mamba2()
 
         # The correct global outputs:
-        kwargs = self.get_scan_kwargs(inputs, model)
+        kwargs = self.get_scan_kwargs(inputs, mamba2)
         outputs = mamba_chunk_scan_combined(**kwargs)
 
         # And the CP output:
         inputs_cp_shard = rearrange(
             inputs, "b (r l) ... -> b r l ...", r=self.world_size
         )[:, self.rank]
-        cp_kwargs = self.get_scan_kwargs(inputs_cp_shard, model)
+        cp_kwargs = self.get_scan_kwargs(inputs_cp_shard, mamba2)
         outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **cp_kwargs)
 
         # All-gather and verify correctness
@@ -260,21 +278,21 @@ class TestSerialCP(_DTestModelBase):
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
 
         inputs = self.get_inputs(requires_grad=True)
-        model = self.get_model()
+        mamba2 = self.get_mamba2()
 
         inputs_cp = self.get_inputs(requires_grad=True)
         inputs_cp_shard = rearrange(
             inputs_cp, "b (r l) ... -> b r l ...", r=self.world_size
         )[:, self.rank]
-        model_cp = deepcopy(model)
+        mamba2_cp = deepcopy(mamba2)
 
         # Backward on the correct global result
-        kwargs = self.get_scan_kwargs(inputs, model)
+        kwargs = self.get_scan_kwargs(inputs, mamba2)
         outputs = mamba_chunk_scan_combined(**kwargs)
         outputs.sum().backward()
 
         # And on the CP output:
-        kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, model_cp)
+        kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, mamba2_cp)
         outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **kwargs_cp)
         outputs_cp.sum().backward()
 
@@ -292,10 +310,10 @@ class TestSerialCP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+        grads = {n: p.grad for n, p in mamba2.named_parameters() if p.grad is not None}
         grads_cp = {
             n: deepcopy(p.grad)
-            for n, p in model_cp.named_parameters()
+            for n, p in mamba2_cp.named_parameters()
             if p.grad is not None
         }
         for g in grads_cp.values():

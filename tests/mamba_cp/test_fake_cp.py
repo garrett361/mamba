@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.mamba2_cp import conv
 from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_non_cp
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
@@ -17,79 +18,60 @@ except ImportError:
 # Breaking out various parts of the fwd for easier testing:
 
 
-def in_proj_split(inputs, model: Mamba2, seq_idx=None):
+def in_proj_split(inputs, mamba2: Mamba2, seq_idx=None):
     batch, seqlen, dim = inputs.shape
-    zxbcdt = model.in_proj(inputs)
+    zxbcdt = mamba2.in_proj(inputs)
     d_mlp = (
         zxbcdt.shape[-1]
-        - 2 * model.d_ssm
-        - 2 * model.ngroups * model.d_state
-        - model.nheads
+        - 2 * mamba2.d_ssm
+        - 2 * mamba2.ngroups * mamba2.d_state
+        - mamba2.nheads
     ) // 2
     z0, x0, z, xBC, dt = torch.split(
         zxbcdt,
         [
             d_mlp,
             d_mlp,
-            model.d_ssm,
-            model.d_ssm + 2 * model.ngroups * model.d_state,
-            model.nheads,
+            mamba2.d_ssm,
+            mamba2.d_ssm + 2 * mamba2.ngroups * mamba2.d_state,
+            mamba2.nheads,
         ],
         dim=-1,
     )
     return z0, x0, z, xBC, dt
 
 
-def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
-    """
-    Perform causal_conv1d_fn correcting for any previous conv_state, if any.
-    """
-    assert seq_idx is None, "seq_idx not currently supported"
-    out = causal_conv1d_fn(
-        xBC.transpose(1, 2),
-        rearrange(model.conv1d.weight, "d 1 w -> d w"),
-        bias=model.conv1d.bias,
-        activation=model.activation,
-        seq_idx=seq_idx,
-    ).transpose(1, 2)
-    if conv_state is not None:
-        conv_state_seq_len = conv_state.shape[1]
-        assert conv_state_seq_len == model.d_conv - 1
-        conv_state_inputs = torch.cat([conv_state, xBC[:, :conv_state_seq_len]], dim=1)
-        cont_state_out = conv(conv_state_inputs, model, None, seq_idx)[
-            :, -conv_state_seq_len:
-        ]
-        out[:, :conv_state_seq_len] = cont_state_out
-    return out
-
-
 def scan(
     xBC: torch.Tensor,
     dt: torch.Tensor,
     z: torch.Tensor,
-    model: Mamba2,
+    mamba2: Mamba2,
     seq_idx=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     x, B, C = torch.split(
         xBC,
-        [model.d_ssm, model.ngroups * model.d_state, model.ngroups * model.d_state],
+        [
+            mamba2.d_ssm,
+            mamba2.ngroups * mamba2.d_state,
+            mamba2.ngroups * mamba2.d_state,
+        ],
         dim=-1,
     )
-    A = -torch.exp(model.A_log.float())  # (nheads) or (d_inner, d_state)
+    A = -torch.exp(mamba2.A_log.float())  # (nheads) or (d_inner, d_state)
     y, final_state = mamba_chunk_scan_combined_non_cp(
-        rearrange(x, "b l (h p) -> b l h p", p=model.headdim),
+        rearrange(x, "b l (h p) -> b l h p", p=mamba2.headdim),
         dt,
         A,
-        rearrange(B, "b l (g n) -> b l g n", g=model.ngroups),
-        rearrange(C, "b l (g n) -> b l g n", g=model.ngroups),
-        chunk_size=model.chunk_size,
-        D=rearrange(model.D, "(h p) -> h p", p=model.headdim)
-        if model.D_has_hdim
-        else model.D,
-        z=rearrange(z, "b l (h p) -> b l h p", p=model.headdim)
-        if not model.rmsnorm
+        rearrange(B, "b l (g n) -> b l g n", g=mamba2.ngroups),
+        rearrange(C, "b l (g n) -> b l g n", g=mamba2.ngroups),
+        chunk_size=mamba2.chunk_size,
+        D=rearrange(mamba2.D, "(h p) -> h p", p=mamba2.headdim)
+        if mamba2.D_has_hdim
+        else mamba2.D,
+        z=rearrange(z, "b l (h p) -> b l h p", p=mamba2.headdim)
+        if not mamba2.rmsnorm
         else None,
-        dt_bias=model.dt_bias,
+        dt_bias=mamba2.dt_bias,
         dt_softplus=True,
         seq_idx=seq_idx,
         cu_seqlens=None,
@@ -101,26 +83,26 @@ def scan(
 
 
 def fwd(
-    inputs: torch.Tensor, model: Mamba2, conv_state=None, seq_idx=None
+    inputs: torch.Tensor, mamba2: Mamba2, conv_state=None, seq_idx=None
 ) -> torch.Tensor:
-    z0, x0, z, xBC, dt = in_proj_split(inputs, model)
+    z0, x0, z, xBC, dt = in_proj_split(inputs, mamba2)
 
-    xBC = conv(xBC, model)
-    y, final_state = scan(xBC, dt, z, model)
+    xBC = conv(xBC, mamba2)
+    y, final_state = scan(xBC, dt, z, mamba2)
 
-    if model.rmsnorm:
-        y = model.norm(y, z)
+    if mamba2.rmsnorm:
+        y = mamba2.norm(y, z)
 
     d_nonssm = (
         sum(t.shape[-1] for t in (z0, x0, z, xBC, dt))
-        - 2 * model.d_model * model.expand
-        - 2 * model.ngroups * model.d_state
-        - model.nheads
+        - 2 * mamba2.d_model * mamba2.expand
+        - 2 * mamba2.ngroups * mamba2.d_state
+        - mamba2.nheads
     ) // 2
     assert d_nonssm >= 0
     if d_nonssm > 0:
         y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-    out = model.out_proj(y)
+    out = mamba2.out_proj(y)
     return out
 
 
@@ -171,11 +153,11 @@ class _TestBase:
         "dtype": dtype,
     }
 
-    def get_model(self, seed: int = 42) -> Mamba2:
+    def get_mamba2(self, seed: int = 42) -> Mamba2:
         torch.manual_seed(seed)
         return Mamba2(**self.model_kwargs)
 
-    def get_model_split(self, seed: int = 42) -> Mamba2Split:
+    def get_mamba2_split(self, seed: int = 42) -> Mamba2Split:
         torch.manual_seed(seed)
         return Mamba2Split(**self.model_kwargs)
 
@@ -222,29 +204,29 @@ class _TestBase:
 
 class TestImpls(_TestBase):
     def test_fwd(self) -> None:
-        model = self.get_model()
-        model_split = self.get_model_split()
+        mamba2 = self.get_mamba2()
+        model_split = self.get_mamba2_split()
         inputs = self.get_inputs()
-        outputs = model(inputs)
+        outputs = mamba2(inputs)
         outputs_split = model_split(inputs)
         torch.testing.assert_close(outputs, outputs_split)
 
     def test_bwd(self) -> None:
-        model = self.get_model()
-        model_split = self.get_model_split()
+        mamba2 = self.get_mamba2()
+        mamba2_split = self.get_mamba2_split()
         inputs = self.get_inputs(requires_grad=True)
         inputs_split = self.get_inputs(requires_grad=True)
-        model(inputs).sum().backward()
-        model_split(inputs_split).sum().backward()
+        mamba2(inputs).sum().backward()
+        mamba2_split(inputs_split).sum().backward()
 
-        for p1, p2 in zip(model.parameters(), model_split.parameters()):
+        for p1, p2 in zip(mamba2.parameters(), mamba2_split.parameters()):
             if p1.grad is not None:
                 torch.testing.assert_close(p1.grad, p2.grad)
         torch.testing.assert_close(inputs.grad, inputs_split.grad)
 
     def test_conv(self) -> None:
         xBC = self.get_xBC()
-        outputs = conv(xBC, self.get_model())
+        outputs = conv(xBC, self.get_mamba2())
         outputs
 
 
@@ -264,12 +246,12 @@ class TestLocalCP(_TestBase):
         # First conv state is trivial (could also make it None)
         xBC_cp_conv_states[..., 0] = 0.0
 
-        outputs = conv(xBC, self.get_model())
+        outputs = conv(xBC, self.get_mamba2())
         outputs_cp_list: list[torch.Tensor] = []
         for cp_rank in range(self.cp_dim):
             cp_out = conv(
                 xBC_cp[..., cp_rank],
-                model=self.get_model(),
+                mamba2=self.get_mamba2(),
                 conv_state=xBC_cp_conv_states[..., cp_rank],
             )
             outputs_cp_list.append(cp_out)
@@ -282,26 +264,26 @@ class TestLocalCP(_TestBase):
         torch.manual_seed(42)
         xBC_clone = self.get_xBC(requires_grad=True)
 
-        model = self.get_model()
-        model_cp = deepcopy(model)
+        mamba2 = self.get_mamba2()
+        mamba2_cp = deepcopy(mamba2)
 
         # Shard and create the conv states
         xBC_cp = rearrange(xBC_clone, "b (r l) d -> b l d r ", r=self.cp_dim)
         xBC_cp_conv_states = xBC_cp[:, -(self.d_conv - 1) :]
 
-        outputs = conv(xBC, model)
+        outputs = conv(xBC, mamba2)
         outputs.sum().backward()
 
         for cp_rank in range(self.cp_dim):
             cp_out = conv(
                 xBC_cp[..., cp_rank],
-                model=model_cp,
+                mamba2=mamba2_cp,
                 conv_state=None
                 if not cp_rank
                 else xBC_cp_conv_states[..., cp_rank - 1],
             )
             cp_out.sum().backward()
-        for p1, p2 in zip(model.parameters(), model_cp.parameters()):
+        for p1, p2 in zip(mamba2.parameters(), mamba2_cp.parameters()):
             torch.testing.assert_close(p1, p2)
         tol = 5e-3
         torch.testing.assert_close(xBC.grad, xBC_clone.grad, atol=tol, rtol=tol)

@@ -3,9 +3,8 @@ from typing import Optional
 from einops import rearrange
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-
-
 from mamba_ssm.modules.mamba2 import Mamba2
+
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -101,7 +100,7 @@ class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
         return tensor
 
     @staticmethod
-    def backward(ctx, dtensor: torch.Tensor) -> torch.Tensor:
+    def backward(ctx, dtensor: torch.Tensor) -> tuple[torch.Tensor, None]:
         dtensor = funcol.all_reduce(dtensor, reduceOp="sum", group=ctx.mesh.get_group())
         return dtensor, None
 
@@ -109,7 +108,7 @@ class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
 identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
 
 
-def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
+def conv(xBC, mamba2: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
     """
     Perform causal_conv1d_fn correcting for any previous conv_state, if any.
     """
@@ -117,16 +116,16 @@ def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
         raise NotImplementedError
     out = causal_conv1d_fn(
         xBC.transpose(1, 2),
-        rearrange(model.conv1d.weight, "d 1 w -> d w"),
-        bias=model.conv1d.bias,
-        activation=model.activation,
+        rearrange(mamba2.conv1d.weight, "d 1 w -> d w"),
+        bias=mamba2.conv1d.bias,
+        activation=mamba2.activation,
         seq_idx=seq_idx,
     ).transpose(1, 2)
     if conv_state is not None:
         conv_state_seq_len = conv_state.shape[1]
-        assert conv_state_seq_len == model.d_conv - 1
+        assert conv_state_seq_len == mamba2.d_conv - 1
         conv_state_inputs = torch.cat([conv_state, xBC[:, :conv_state_seq_len]], dim=1)
-        cont_state_out = conv(conv_state_inputs, model, None, seq_idx)[
+        cont_state_out = conv(conv_state_inputs, mamba2, None, seq_idx)[
             :, -conv_state_seq_len:
         ]
         out[:, :conv_state_seq_len] = cont_state_out
@@ -135,10 +134,10 @@ def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
 
 def conv_cp(
     xBC,
-    model: Mamba2,
+    mamba2: Mamba2,
     mesh: dist.device_mesh.DeviceMesh,
     seq_idx=None,
 ) -> torch.Tensor:
-    conv_state_send = xBC[:, -(model.d_conv - 1) :]
+    conv_state_send = xBC[:, -(mamba2.d_conv - 1) :]
     conv_state_recv = causal_passing_comms(conv_state_send, mesh)
-    return conv(xBC, model, conv_state_recv, seq_idx)
+    return conv(xBC, mamba2, conv_state_recv, seq_idx)
