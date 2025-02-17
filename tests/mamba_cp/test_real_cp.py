@@ -1,19 +1,22 @@
 from copy import deepcopy
+from typing import Optional
+
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 from einops import rearrange
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-from test_fake_cp import in_proj_split
 
 from dtest import DTest
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
+    Mamba2CP,
     causal_passing_comms,
     conv,
     conv_cp,
     identity_fwd_all_reduce_bwd,
+    in_proj_split,
 )
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_serial_cp,
 )
@@ -155,6 +158,18 @@ class _DTestModelBase(DTest):
             **self.factory_kwargs,
         )
 
+    def get_mamba2_cp(
+        self, mesh: dist.device_mesh.DeviceMesh, seed: int = 42
+    ) -> Mamba2:
+        torch.manual_seed(seed)
+        return Mamba2CP(
+            mesh=mesh,
+            d_model=self.d_model,
+            d_state=self.d_state,
+            chunk_size=self.chunk_size,
+            **self.factory_kwargs,
+        )
+
     def get_inputs(self, requires_grad: bool = False, seed: int = 42) -> torch.Tensor:
         torch.manual_seed(seed)
         return torch.randn(
@@ -164,6 +179,15 @@ class _DTestModelBase(DTest):
             **self.factory_kwargs,
             requires_grad=requires_grad,
         )
+
+    def get_cp_shard(
+        self, tensor: torch.Tensor, n_shards: Optional[int] = None
+    ) -> torch.Tensor:
+        n_shards = n_shards or self.world_size
+        shard = rearrange(tensor, "b (r l) ... -> b r l ...", r=self.world_size)[
+            :, self.rank
+        ]
+        return shard
 
 
 class TestConvCP(_DTestModelBase):
@@ -182,7 +206,7 @@ class TestConvCP(_DTestModelBase):
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         xBC = self.get_xBC()
 
-        xBC_cp = rearrange(xBC, "b (c l) d -> c b l d ", c=self.world_size)[self.rank]
+        xBC_cp = self.get_cp_shard(xBC)
 
         outputs = conv(xBC, mamba2)
         outputs_cp = conv_cp(xBC_cp, mamba2, mesh)
@@ -199,22 +223,14 @@ class TestConvCP(_DTestModelBase):
         xBC = self.get_xBC(requires_grad=True)
         xBC_cp = deepcopy(xBC)
 
-        xBC_cp_shard = rearrange(xBC_cp, "b (c l) d -> c b l d ", c=self.world_size)[
-            self.rank
-        ]
-
+        xBC_cp_shard = self.get_cp_shard(xBC_cp)
         outputs = conv(xBC, mamba2)
         outputs.sum().backward()
         outputs_cp = conv_cp(xBC_cp_shard, mamba2_cp, mesh)
         outputs_cp.sum().backward()
 
-        xBC_grad_shard = rearrange(
-            xBC.grad, "b (c l) d -> c b l d ", c=self.world_size
-        )[self.rank]
-        xBC_cp_grad_shard = rearrange(
-            xBC_cp.grad, "b (c l) d -> c b l d ", c=self.world_size
-        )[self.rank]
-
+        xBC_grad_shard = self.get_cp_shard(xBC.grad)
+        xBC_cp_grad_shard = self.get_cp_shard(xBC_cp.grad)
         torch.testing.assert_close(xBC_grad_shard, xBC_cp_grad_shard)
 
 
@@ -264,9 +280,7 @@ class TestSerialCP(_DTestModelBase):
         outputs = mamba_chunk_scan_combined(**kwargs)
 
         # And the CP output:
-        inputs_cp_shard = rearrange(
-            inputs, "b (r l) ... -> b r l ...", r=self.world_size
-        )[:, self.rank]
+        inputs_cp_shard = self.get_cp_shard(inputs)
         cp_kwargs = self.get_scan_kwargs(inputs_cp_shard, mamba2)
         outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **cp_kwargs)
 
@@ -294,9 +308,7 @@ class TestSerialCP(_DTestModelBase):
         mamba2 = self.get_mamba2()
 
         inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = rearrange(
-            inputs_cp, "b (r l) ... -> b r l ...", r=self.world_size
-        )[:, self.rank]
+        inputs_cp_shard = self.get_cp_shard(inputs_cp)
         mamba2_cp = deepcopy(mamba2)
 
         # Backward on the correct global result
@@ -310,12 +322,8 @@ class TestSerialCP(_DTestModelBase):
         outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
-        inputs_grad_shard = rearrange(
-            inputs.grad, "b (r l) ... -> b r l ...", r=self.world_size
-        )[:, self.rank]
-        inputs_cp_grad_shard = rearrange(
-            inputs_cp.grad, "b (r l) ... -> b r l ...", r=self.world_size
-        )[:, self.rank]
+        inputs_grad_shard = self.get_cp_shard(inputs.grad)
+        inputs_cp_grad_shard = self.get_cp_shard(inputs_cp.grad)
 
         tol = 1e-3
         torch.testing.assert_close(
@@ -338,3 +346,21 @@ class TestSerialCP(_DTestModelBase):
             torch.testing.assert_close(
                 g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
             )
+
+
+class TestMamba2CPSerial(_DTestModelBase):
+    def test_fwd(self):
+        torch.manual_seed(42)
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        mamba2 = self.get_mamba2()
+        mamba2_cp = self.get_mamba2_cp(mesh=mesh)
+
+        inputs = self.get_inputs()
+        inputs_cp = deepcopy(inputs)
+        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+
+        outputs = mamba2(inputs)
+        outputs_cp = mamba2_cp(inputs_cp_shard)
+
+        outputs_shard = self.get_cp_shard(outputs)
+        torch.testing.assert_close(outputs_cp, outputs_shard)

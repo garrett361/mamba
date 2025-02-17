@@ -1,12 +1,10 @@
 from copy import deepcopy
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba2_cp import conv
-from mamba_ssm.ops.triton.ssd_combined_cp import mamba_chunk_scan_combined_non_cp
+from mamba_ssm.modules.mamba2_cp import conv, _Mamba2Ref
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
 try:
@@ -16,113 +14,6 @@ except ImportError:
 
 
 # Breaking out various parts of the fwd for easier testing:
-
-
-def in_proj_split(inputs, mamba2: Mamba2, seq_idx=None):
-    batch, seqlen, dim = inputs.shape
-    zxbcdt = mamba2.in_proj(inputs)
-    d_mlp = (
-        zxbcdt.shape[-1]
-        - 2 * mamba2.d_ssm
-        - 2 * mamba2.ngroups * mamba2.d_state
-        - mamba2.nheads
-    ) // 2
-    z0, x0, z, xBC, dt = torch.split(
-        zxbcdt,
-        [
-            d_mlp,
-            d_mlp,
-            mamba2.d_ssm,
-            mamba2.d_ssm + 2 * mamba2.ngroups * mamba2.d_state,
-            mamba2.nheads,
-        ],
-        dim=-1,
-    )
-    return z0, x0, z, xBC, dt
-
-
-def scan(
-    xBC: torch.Tensor,
-    dt: torch.Tensor,
-    z: torch.Tensor,
-    mamba2: Mamba2,
-    seq_idx=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    x, B, C = torch.split(
-        xBC,
-        [
-            mamba2.d_ssm,
-            mamba2.ngroups * mamba2.d_state,
-            mamba2.ngroups * mamba2.d_state,
-        ],
-        dim=-1,
-    )
-    A = -torch.exp(mamba2.A_log.float())  # (nheads) or (d_inner, d_state)
-    y, final_state = mamba_chunk_scan_combined_non_cp(
-        rearrange(x, "b l (h p) -> b l h p", p=mamba2.headdim),
-        dt,
-        A,
-        rearrange(B, "b l (g n) -> b l g n", g=mamba2.ngroups),
-        rearrange(C, "b l (g n) -> b l g n", g=mamba2.ngroups),
-        chunk_size=mamba2.chunk_size,
-        D=rearrange(mamba2.D, "(h p) -> h p", p=mamba2.headdim)
-        if mamba2.D_has_hdim
-        else mamba2.D,
-        z=rearrange(z, "b l (h p) -> b l h p", p=mamba2.headdim)
-        if not mamba2.rmsnorm
-        else None,
-        dt_bias=mamba2.dt_bias,
-        dt_softplus=True,
-        seq_idx=seq_idx,
-        cu_seqlens=None,
-        return_final_states=True,
-        return_varlen_states=False,
-    )
-    y = rearrange(y, "b l h p -> b l (h p)")
-    return y, final_state
-
-
-def fwd(
-    inputs: torch.Tensor, mamba2: Mamba2, conv_state=None, seq_idx=None
-) -> torch.Tensor:
-    z0, x0, z, xBC, dt = in_proj_split(inputs, mamba2)
-
-    xBC = conv(xBC, mamba2)
-    y, final_state = scan(xBC, dt, z, mamba2)
-
-    if mamba2.rmsnorm:
-        y = mamba2.norm(y, z)
-
-    d_nonssm = (
-        sum(t.shape[-1] for t in (z0, x0, z, xBC, dt))
-        - 2 * mamba2.d_model * mamba2.expand
-        - 2 * mamba2.ngroups * mamba2.d_state
-        - mamba2.nheads
-    ) // 2
-    assert d_nonssm >= 0
-    if d_nonssm > 0:
-        y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-    out = mamba2.out_proj(y)
-    return out
-
-
-class Mamba2Split(Mamba2):
-    def forward(
-        self,
-        u,
-        seqlen=None,
-        seq_idx=None,
-        cu_seqlens=None,
-        inference_params=None,
-        conv_state=None,
-    ):
-        must_be_nones = (seqlen, seq_idx, cu_seqlens, inference_params, conv_state)
-        if any(x is not None for x in must_be_nones):
-            raise NotImplementedError(
-                "All of (seqlen, seq_idx, cu_seqlens, inference_params) must be None."
-                f"received {must_be_nones}"
-            )
-        return fwd(u, self)
 
 
 class _TestBase:
@@ -157,9 +48,9 @@ class _TestBase:
         torch.manual_seed(seed)
         return Mamba2(**self.model_kwargs)
 
-    def get_mamba2_split(self, seed: int = 42) -> Mamba2Split:
+    def get_mamba2_ref(self, seed: int = 42) -> _Mamba2Ref:
         torch.manual_seed(seed)
-        return Mamba2Split(**self.model_kwargs)
+        return _Mamba2Ref(**self.model_kwargs)
 
     def get_inputs(self, requires_grad: bool = False, seed: int = 42) -> torch.Tensor:
         torch.manual_seed(seed)
@@ -202,32 +93,27 @@ class _TestBase:
         return states, dA_chunk_cumsum
 
 
-class TestImpls(_TestBase):
+class Test_Mamba2Ref(_TestBase):
     def test_fwd(self) -> None:
         mamba2 = self.get_mamba2()
-        model_split = self.get_mamba2_split()
+        mamba2_ref = self.get_mamba2_ref()
         inputs = self.get_inputs()
         outputs = mamba2(inputs)
-        outputs_split = model_split(inputs)
-        torch.testing.assert_close(outputs, outputs_split)
+        outputs_copy = mamba2_ref(inputs)
+        torch.testing.assert_close(outputs, outputs_copy)
 
     def test_bwd(self) -> None:
         mamba2 = self.get_mamba2()
-        mamba2_split = self.get_mamba2_split()
+        mamba2_copy = self.get_mamba2_ref()
         inputs = self.get_inputs(requires_grad=True)
-        inputs_split = deepcopy(inputs)
+        inputs_copy = deepcopy(inputs)
         mamba2(inputs).sum().backward()
-        mamba2_split(inputs_split).sum().backward()
+        mamba2_copy(inputs_copy).sum().backward()
 
-        for p1, p2 in zip(mamba2.parameters(), mamba2_split.parameters()):
+        for p1, p2 in zip(mamba2.parameters(), mamba2_copy.parameters()):
             if p1.grad is not None:
                 torch.testing.assert_close(p1.grad, p2.grad)
-        torch.testing.assert_close(inputs.grad, inputs_split.grad)
-
-    def test_conv(self) -> None:
-        xBC = self.get_xBC()
-        outputs = conv(xBC, self.get_mamba2())
-        outputs
+        torch.testing.assert_close(inputs.grad, inputs_copy.grad)
 
 
 class TestLocalCP(_TestBase):
