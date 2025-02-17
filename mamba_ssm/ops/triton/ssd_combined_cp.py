@@ -658,7 +658,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 )
 
                 dist.send(
-                    final_states,
+                    final_states.contiguous(),
                     dst=recv_rank,
                     group=mesh.get_group(),
                 )
@@ -723,7 +723,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                     )
                 )
                 dist.send(
-                    dinitial_states,
+                    dinitial_states.contiguous(),
                     dst=recv_rank,
                     group=mesh.get_group(),
                 )
