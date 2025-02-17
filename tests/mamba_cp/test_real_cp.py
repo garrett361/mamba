@@ -10,6 +10,8 @@ from dtest import DTest
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
     causal_passing_comms,
+    conv,
+    conv_cp,
     identity_fwd_all_reduce_bwd,
 )
 from mamba_ssm.ops.triton.ssd_combined_cp import (
@@ -121,11 +123,16 @@ class TestIdentityFwdAllGatherBwdFn(DTest):
         torch.testing.assert_close(weight.grad, weight_copy.grad)
 
 
-class TestSerialCP(DTest):
+class _DTestModelBase(DTest):
     batch_size = 2
     chunk_size = 4
     d_model = 256
     d_state = 128
+    ngroups = 1
+    expand = 2
+    d_conv = 4
+    d_inner = expand * d_model
+    d_ssm = d_inner
 
     @property
     def seq_len(self) -> int:
@@ -158,6 +165,33 @@ class TestSerialCP(DTest):
             requires_grad=requires_grad,
         )
 
+
+class TestConvCP(_DTestModelBase):
+    def get_xBC(self, requires_grad: bool = False) -> torch.Tensor:
+        return torch.randn(
+            self.batch_size,
+            self.seq_len,
+            self.d_ssm + 2 * self.ngroups * self.d_state,
+            **self.factory_kwargs,
+            requires_grad=requires_grad,
+        )
+
+    def test_fwd(self):
+        torch.manual_seed(42)
+        model = self.get_model()
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        xBC = self.get_xBC()
+
+        xBC_cp = rearrange(xBC, "b (c l) d -> c b l d ", c=self.world_size)[self.rank]
+
+        outputs = conv(xBC, model)
+        outputs_cp = conv_cp(xBC_cp, model, mesh)
+        torch.testing.assert_close(
+            outputs_cp, outputs.tensor_split(self.world_size, dim=1)[self.rank]
+        )
+
+
+class TestSerialCP(_DTestModelBase):
     def get_scan_kwargs(self, inputs, model):
         """
         Get all kwargs for the scan.

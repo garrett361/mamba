@@ -13,29 +13,6 @@ except ImportError:
     causal_conv1d_fn = None, None
 
 
-def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
-    """
-    Perform causal_conv1d_fn correcting for any previous conv_state, if any.
-    """
-    assert seq_idx is None, "seq_idx not currently supported"
-    out = causal_conv1d_fn(
-        xBC.transpose(1, 2),
-        rearrange(model.conv1d.weight, "d 1 w -> d w"),
-        bias=model.conv1d.bias,
-        activation=model.activation,
-        seq_idx=seq_idx,
-    ).transpose(1, 2)
-    if conv_state is not None:
-        conv_state_seq_len = conv_state.shape[1]
-        assert conv_state_seq_len == model.d_conv - 1
-        conv_state_inputs = torch.cat([conv_state, xBC[:, :conv_state_seq_len]], dim=1)
-        cont_state_out = conv(conv_state_inputs, model, None, seq_idx)[
-            :, -conv_state_seq_len:
-        ]
-        out[:, :conv_state_seq_len] = cont_state_out
-    return out
-
-
 class CausalPassingFn(torch.autograd.Function):
     """
     Causally pass tensors from one rank to the next, with the ordering defined by the mesh.
@@ -64,6 +41,7 @@ class CausalPassingFn(torch.autograd.Function):
         ctx.send_to = send_to
         ctx.shape = tensor.shape
         ops = []
+        tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
             ops.append(
                 dist.P2POp(dist.isend, tensor, None, mesh.get_group(), 0, send_to)
@@ -129,3 +107,38 @@ class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
 
 
 identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
+
+
+def conv(xBC, model: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
+    """
+    Perform causal_conv1d_fn correcting for any previous conv_state, if any.
+    """
+    if seq_idx is not None:
+        raise NotImplementedError
+    out = causal_conv1d_fn(
+        xBC.transpose(1, 2),
+        rearrange(model.conv1d.weight, "d 1 w -> d w"),
+        bias=model.conv1d.bias,
+        activation=model.activation,
+        seq_idx=seq_idx,
+    ).transpose(1, 2)
+    if conv_state is not None:
+        conv_state_seq_len = conv_state.shape[1]
+        assert conv_state_seq_len == model.d_conv - 1
+        conv_state_inputs = torch.cat([conv_state, xBC[:, :conv_state_seq_len]], dim=1)
+        cont_state_out = conv(conv_state_inputs, model, None, seq_idx)[
+            :, -conv_state_seq_len:
+        ]
+        out[:, :conv_state_seq_len] = cont_state_out
+    return out
+
+
+def conv_cp(
+    xBC,
+    model: Mamba2,
+    mesh: dist.device_mesh.DeviceMesh,
+    seq_idx=None,
+) -> torch.Tensor:
+    conv_state_send = xBC[:, -(model.d_conv - 1) :]
+    conv_state_recv = causal_passing_comms(conv_state_send, mesh)
+    return conv(xBC, model, conv_state_recv, seq_idx)
