@@ -193,16 +193,29 @@ class TestConvCP(_DTestModelBase):
     def test_bwd(self):
         torch.manual_seed(42)
         mamba2 = self.get_mamba2()
+        mamba2_cp = deepcopy(mamba2)
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        xBC = self.get_xBC(requires_grad=True)
 
-        xBC_cp = rearrange(xBC, "b (c l) d -> c b l d ", c=self.world_size)[self.rank]
+        xBC = self.get_xBC(requires_grad=True)
+        xBC_cp = deepcopy(xBC)
+
+        xBC_cp_shard = rearrange(xBC_cp, "b (c l) d -> c b l d ", c=self.world_size)[
+            self.rank
+        ]
 
         outputs = conv(xBC, mamba2)
-        outputs_cp = conv_cp(xBC_cp, mamba2, mesh)
-        torch.testing.assert_close(
-            outputs_cp, outputs.tensor_split(self.world_size, dim=1)[self.rank]
-        )
+        outputs.sum().backward()
+        outputs_cp = conv_cp(xBC_cp_shard, mamba2_cp, mesh)
+        outputs_cp.sum().backward()
+
+        xBC_grad_shard = rearrange(
+            xBC.grad, "b (c l) d -> c b l d ", c=self.world_size
+        )[self.rank]
+        xBC_cp_grad_shard = rearrange(
+            xBC_cp.grad, "b (c l) d -> c b l d ", c=self.world_size
+        )[self.rank]
+
+        torch.testing.assert_close(xBC_grad_shard, xBC_cp_grad_shard)
 
 
 class TestSerialCP(_DTestModelBase):
@@ -280,7 +293,7 @@ class TestSerialCP(_DTestModelBase):
         inputs = self.get_inputs(requires_grad=True)
         mamba2 = self.get_mamba2()
 
-        inputs_cp = self.get_inputs(requires_grad=True)
+        inputs_cp = deepcopy(inputs)
         inputs_cp_shard = rearrange(
             inputs_cp, "b (r l) ... -> b r l ...", r=self.world_size
         )[:, self.rank]

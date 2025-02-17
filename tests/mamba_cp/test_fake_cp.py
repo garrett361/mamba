@@ -215,7 +215,7 @@ class TestImpls(_TestBase):
         mamba2 = self.get_mamba2()
         mamba2_split = self.get_mamba2_split()
         inputs = self.get_inputs(requires_grad=True)
-        inputs_split = self.get_inputs(requires_grad=True)
+        inputs_split = deepcopy(inputs)
         mamba2(inputs).sum().backward()
         mamba2_split(inputs_split).sum().backward()
 

@@ -60,6 +60,7 @@ class CausalPassingFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dtensor: torch.Tensor) -> tuple[Optional[torch.Tensor], None]:
+        dtensor = dtensor.contiguous()  # Crucial for correctness
         ops = []
         if ctx.send_to is not None:
             recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
