@@ -144,6 +144,7 @@ class _DTestModelBase(DTest):
     embed_dim = d_model
     head_dim = 64
     num_heads = d_model // head_dim
+    dtype = torch.float32
 
     @property
     def seq_len(self) -> int:
@@ -155,7 +156,7 @@ class _DTestModelBase(DTest):
 
     @property
     def factory_kwargs(self):
-        return {"dtype": torch.float32, "device": self.device}
+        return {"dtype": self.dtype, "device": self.device}
 
     def get_mamba2(self, seed: int = 42) -> Mamba2:
         torch.manual_seed(seed)
@@ -178,30 +179,43 @@ class _DTestModelBase(DTest):
             **self.factory_kwargs,
         )
 
-    def get_mha(self, seed: int = 42) -> MHA:
+    def get_mha(self, seed: int = 42, dtype: torch.dtype = torch.bfloat16) -> MHA:
         torch.manual_seed(seed)
         return MHA(
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
-            **self.factory_kwargs,
+            device=self.device,
+            dtype=dtype,
         )
 
-    def get_mha_cp(self, mesh: dist.device_mesh.DeviceMesh, seed: int = 42) -> MHA:
+    def get_mha_cp(
+        self,
+        mesh: dist.device_mesh.DeviceMesh,
+        seed: int = 42,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> MHA:
         torch.manual_seed(seed)
         return MHACP(
             mesh=mesh,
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
-            **self.factory_kwargs,
+            device=self.device,
+            dtype=dtype,
         )
 
-    def get_inputs(self, requires_grad: bool = False, seed: int = 42) -> torch.Tensor:
+    def get_inputs(
+        self,
+        requires_grad: bool = False,
+        seed: int = 42,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
         torch.manual_seed(seed)
         return torch.randn(
             self.batch_size,
             self.seq_len,
             self.d_model,
-            **self.factory_kwargs,
+            device=self.device,
+            dtype=dtype or self.dtype,
             requires_grad=requires_grad,
         )
 
@@ -435,7 +449,8 @@ class TestMHACP(_DTestModelBase):
         mha = self.get_mha()
         mha_cp = self.get_mha_cp(mesh=mesh)
 
-        inputs = self.get_inputs()
+        # Requires bfloat16
+        inputs = self.get_inputs(dtype=torch.bfloat16)
         inputs_cp = deepcopy(inputs)
         inputs_cp_shard = self.get_cp_shard(inputs_cp)
 
@@ -443,7 +458,8 @@ class TestMHACP(_DTestModelBase):
         outputs_cp = mha_cp(inputs_cp_shard)
 
         outputs_shard = self.get_cp_shard(outputs)
-        torch.testing.assert_close(outputs_cp, outputs_shard)
+        tol = 1e-2
+        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
         torch.manual_seed(42)
@@ -451,7 +467,8 @@ class TestMHACP(_DTestModelBase):
         mha = self.get_mha()
         mha_cp = self.get_mha_cp(mesh=mesh)
 
-        inputs = self.get_inputs(requires_grad=True)
+        # Requires bfloat16
+        inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
         inputs_cp = deepcopy(inputs)
         inputs_cp_shard = self.get_cp_shard(inputs_cp)
 
@@ -462,7 +479,11 @@ class TestMHACP(_DTestModelBase):
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_cp.grad)
-        torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
+        tol = 1e-2
+        dist.barrier()
+        torch.testing.assert_close(
+            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+        )
 
         # Parameter grads should match after all-reducing.
         grads = {n: p.grad for n, p in mha.named_parameters() if p.grad is not None}
@@ -473,9 +494,9 @@ class TestMHACP(_DTestModelBase):
         }
         for g in grads_cp.values():
             dist.all_reduce(g)
-        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
+        dist.barrier()
         assert set(grads) == set(grads_cp)
-        tol = 1e-3
+        tol = 1e-1
         for n, g_cp in grads_cp.items():
             g = grads[n]
             torch.testing.assert_close(

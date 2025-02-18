@@ -343,12 +343,12 @@ class MHACP(MHA):
         )
 
         context = self.ring_flash_attn_func(
-            self.mesh.get_group(),
             q,
             k,
             v,
-            is_causal=self.causal,
-            scale=self.softmax_scale,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+            group=self.mesh.get_group(),
         )
 
         context = rearrange(context, "... h d -> ... (h d)")
