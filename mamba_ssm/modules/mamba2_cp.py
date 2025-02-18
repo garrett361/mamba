@@ -299,7 +299,12 @@ class Mamba2CP(Mamba2):
 
 class MHACP(MHA):
     def __init__(self, mesh: dist.device_mesh.DeviceMesh, *args, **kwargs) -> None:
+        if mesh.ndim != 1:
+            raise ValueError("Only supports 1D DeviceMesh instances.")
         self.mesh = mesh
+        from ring_flash_attn import ring_flash_attn_func
+
+        self.ring_flash_attn_func = ring_flash_attn_func
         super().__init__(*args, **kwargs)
         if self.d_conv:
             raise NotImplementedError
@@ -337,13 +342,14 @@ class MHACP(MHA):
             v, dim=2, repeats=self.num_heads // self.num_heads_kv
         )
 
-        context = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
+        context = self.ring_flash_attn_func(
+            self.mesh.get_group(),
+            q,
+            k,
+            v,
             is_causal=self.causal,
             scale=self.softmax_scale,
-        ).transpose(1, 2)
+        )
 
         context = rearrange(context, "... h d -> ... (h d)")
         if self.mlp_dim > 0:
