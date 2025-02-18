@@ -6,6 +6,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from mamba_ssm.modules.mamba2 import Mamba2
 
+from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_non_cp,
     mamba_chunk_scan_combined_serial_cp,
@@ -293,4 +294,59 @@ class Mamba2CP(Mamba2):
         if d_nonssm > 0:
             y = torch.cat([F.silu(z0) * x0, y], dim=-1)
         out = self.out_proj(y)
+        return out
+
+
+class MHACP(MHA):
+    def __init__(self, mesh: dist.device_mesh.DeviceMesh, *args, **kwargs) -> None:
+        self.mesh = mesh
+        super().__init__(*args, **kwargs)
+        if self.d_conv:
+            raise NotImplementedError
+
+    def forward(self, x, inference_params=None):
+        if inference_params is not None:
+            raise NotImplementedError
+
+        seqlen_offset = 0
+        rotary_max_seqlen = None
+        qkv = self.in_proj(x)
+
+        if self.mlp_dim > 0:
+            qkv, x_mlp = qkv.split([qkv.shape[-1] - self.mlp_dim, self.mlp_dim], dim=-1)
+            x_mlp_up, x_mlp_gate = x_mlp.chunk(2, dim=-1)
+            x_mlp = x_mlp_up * F.silu(x_mlp_gate)
+
+        q, kv = qkv.split(
+            [self.num_heads * self.head_dim, self.num_heads_kv * 2 * self.head_dim],
+            dim=-1,
+        )
+        q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+        kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+
+        if self.rotary_emb_dim > 0:
+            q, kv = self.rotary_emb(
+                q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
+            )
+
+        k, v = kv.unbind(dim=-3)
+        k = torch.repeat_interleave(
+            k, dim=2, repeats=self.num_heads // self.num_heads_kv
+        )
+        v = torch.repeat_interleave(
+            v, dim=2, repeats=self.num_heads // self.num_heads_kv
+        )
+
+        context = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            is_causal=self.causal,
+            scale=self.softmax_scale,
+        ).transpose(1, 2)
+
+        context = rearrange(context, "... h d -> ... (h d)")
+        if self.mlp_dim > 0:
+            context = torch.cat([context, x_mlp], dim=-1)
+        out = self.out_proj(context)
         return out
