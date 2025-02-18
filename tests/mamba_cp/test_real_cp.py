@@ -5,6 +5,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from einops import rearrange
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
 from dtest import DTest
 from mamba_ssm.modules.mamba2 import Mamba2
@@ -401,3 +404,81 @@ class TestMamba2CPSerial(_DTestModelBase):
             torch.testing.assert_close(
                 g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
             )
+
+
+class TestFSDP1(_DTestModelBase):
+    def test_fwd(self):
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model_cp = nn.Sequential(*[self.get_mamba2_cp(mesh=mesh) for _ in range(3)])
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+
+        inputs = self.get_inputs()
+        inputs_cp = deepcopy(inputs)
+        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+
+        outputs = model(inputs)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_shard)
+
+        outputs_shard = self.get_cp_shard(outputs)
+        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
+
+    def test_bwd(self):
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model_cp = nn.Sequential(*[self.get_mamba2_cp(mesh=mesh) for _ in range(3)])
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+        # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
+        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
+        # 2) Scale up the loss by a factor of the DP world size
+        # Note that 2) is also automatically handled if the loss function scales by the world size,
+        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
+        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
+        #
+        # We just use the mean for the loss below.
+
+        inputs = self.get_inputs(requires_grad=True)
+        inputs_cp_fsdp = deepcopy(inputs)
+        inputs_cp_shard = self.get_cp_shard(inputs_cp_fsdp)
+
+        outputs = model(inputs)
+        outputs.mean().backward()
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_shard)
+        outputs_cp_fsdp.mean().backward()
+
+        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+            dist.barrier()
+            grads = {
+                n: deepcopy(p.grad)
+                for n, p in model.named_parameters()
+                if p.grad is not None
+            }
+            grads_cp_fsdp = {
+                n: deepcopy(p.grad)
+                for n, p in model_cp_fsdp.named_parameters()
+                if p.grad is not None
+            }
+            tol = 1e-3
+            for n, g_cp_fsdp in grads_cp_fsdp.items():
+                g = grads[n]
+                torch.testing.assert_close(
+                    g,
+                    g_cp_fsdp,
+                    atol=tol,
+                    rtol=tol,
+                    msg=f"Failed on {n}: {(g - g_cp_fsdp).abs().mean()=}, {(g - g_cp_fsdp).abs().max()=}",
+                )
