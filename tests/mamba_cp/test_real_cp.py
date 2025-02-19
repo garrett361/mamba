@@ -1,6 +1,8 @@
 from copy import deepcopy
 from typing import Optional
 
+from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mha import MHA
 import torch
 import torch.distributed as dist
@@ -145,6 +147,30 @@ class _DTestModelBase(DTest):
     head_dim = 64
     num_heads = d_model // head_dim
     dtype = torch.float32
+    ssm_cfg = {"layer": "Mamba2"}
+    vocab_size = 1024
+    n_layer = 1
+    attn_layer_idx = [
+       10 #n_layer-1
+    ]
+    attn_cfg = {
+        "causal": True,
+        "d_conv": 0,
+        "head_dim": head_dim,
+        "num_heads": num_heads,
+        "out_proj_bias": False,
+        "qkv_proj_bias": False,
+        "rotary_emb_dim": head_dim // 2,
+    }
+    cfg = MambaConfig(
+        d_model=d_model,
+        n_layer=n_layer,
+        vocab_size=vocab_size,
+        ssm_cfg=ssm_cfg,
+        attn_layer_idx=attn_layer_idx,
+        attn_cfg=attn_cfg,
+        tie_embeddings=False,
+    )
 
     @property
     def seq_len(self) -> int:
@@ -168,11 +194,11 @@ class _DTestModelBase(DTest):
         )
 
     def get_mamba2_cp(
-        self, mesh: dist.device_mesh.DeviceMesh, seed: int = 42
+        self, cp_mesh: dist.device_mesh.DeviceMesh, seed: int = 42
     ) -> Mamba2:
         torch.manual_seed(seed)
         return Mamba2CP(
-            mesh=mesh,
+            cp_mesh=cp_mesh,
             d_model=self.d_model,
             d_state=self.d_state,
             chunk_size=self.chunk_size,
@@ -190,17 +216,48 @@ class _DTestModelBase(DTest):
 
     def get_mha_cp(
         self,
-        mesh: dist.device_mesh.DeviceMesh,
+        cp_mesh: dist.device_mesh.DeviceMesh,
         seed: int = 42,
         dtype: torch.dtype = torch.bfloat16,
     ) -> MHA:
         torch.manual_seed(seed)
         return MHACP(
-            mesh=mesh,
+            cp_mesh=cp_mesh,
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             device=self.device,
             dtype=dtype,
+        )
+
+    def get_model(self, seed: int = 42, dtype: torch.dtype = torch.bfloat16) -> MHA:
+        torch.manual_seed(seed)
+        return MambaLMHeadModel(
+            config=self.cfg, device=self.device, dtype=dtype
+        )
+
+    def get_model_cp(
+        self,
+        cp_mesh: dist.device_mesh.DeviceMesh,
+        seed: int = 42,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> MHA:
+        torch.manual_seed(seed)
+        return MambaLMHeadModel(
+            config=self.cfg, cp_mesh=cp_mesh, device=self.device, dtype=dtype
+        )
+
+    def get_input_toks(
+        self,
+        seed: int = 42,
+    ) -> torch.Tensor:
+        torch.manual_seed(seed)
+        return torch.randint(
+            self.vocab_size,
+            size=(
+                self.batch_size,
+                self.seq_len,
+            ),
+            device=self.device,
         )
 
     def get_inputs(
@@ -242,13 +299,13 @@ class TestConvCP(_DTestModelBase):
     def test_fwd(self):
         torch.manual_seed(42)
         mamba2 = self.get_mamba2()
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         xBC = self.get_xBC()
 
         xBC_cp = self.get_cp_shard(xBC)
 
         outputs = conv(xBC, mamba2)
-        outputs_cp = conv_cp(xBC_cp, mamba2, mesh)
+        outputs_cp = conv_cp(xBC_cp, mamba2, cp_mesh)
         torch.testing.assert_close(
             outputs_cp, outputs.tensor_split(self.world_size, dim=1)[self.rank]
         )
@@ -257,19 +314,19 @@ class TestConvCP(_DTestModelBase):
         torch.manual_seed(42)
         mamba2 = self.get_mamba2()
         mamba2_cp = deepcopy(mamba2)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
 
         xBC = self.get_xBC(requires_grad=True)
-        xBC_cp = deepcopy(xBC)
+        xBC_copy = deepcopy(xBC)
 
-        xBC_cp_shard = self.get_cp_shard(xBC_cp)
+        xBC_cp = self.get_cp_shard(xBC_copy)
         outputs = conv(xBC, mamba2)
         outputs.sum().backward()
-        outputs_cp = conv_cp(xBC_cp_shard, mamba2_cp, mesh)
+        outputs_cp = conv_cp(xBC_cp, mamba2_cp, cp_mesh)
         outputs_cp.sum().backward()
 
         xBC_grad_shard = self.get_cp_shard(xBC.grad)
-        xBC_cp_grad_shard = self.get_cp_shard(xBC_cp.grad)
+        xBC_cp_grad_shard = self.get_cp_shard(xBC_copy.grad)
         torch.testing.assert_close(xBC_grad_shard, xBC_cp_grad_shard)
 
 
@@ -310,7 +367,7 @@ class TestSerialCP(_DTestModelBase):
 
     def test_fwd(self):
         torch.manual_seed(42)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         inputs = self.get_inputs()
         mamba2 = self.get_mamba2()
 
@@ -321,7 +378,7 @@ class TestSerialCP(_DTestModelBase):
         # And the CP output:
         inputs_cp_shard = self.get_cp_shard(inputs)
         cp_kwargs = self.get_scan_kwargs(inputs_cp_shard, mamba2)
-        outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **cp_kwargs)
+        outputs_cp = mamba_chunk_scan_combined_serial_cp(cp_mesh=cp_mesh, **cp_kwargs)
 
         # All-gather and verify correctness
         outputs_cp_all_gathered = torch.empty(
@@ -331,7 +388,7 @@ class TestSerialCP(_DTestModelBase):
             device=outputs_cp.device,
         )
         dist.all_gather_into_tensor(
-            outputs_cp_all_gathered, outputs_cp, mesh.get_group()
+            outputs_cp_all_gathered, outputs_cp, cp_mesh.get_group()
         )
         outputs_cp_all_gathered = rearrange(
             outputs_cp_all_gathered, "r b l ... -> b (r l) ..."
@@ -341,13 +398,13 @@ class TestSerialCP(_DTestModelBase):
 
     def test_bwd(self):
         torch.manual_seed(42)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
 
         inputs = self.get_inputs(requires_grad=True)
         mamba2 = self.get_mamba2()
 
-        inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp = self.get_cp_shard(inputs_copy)
         mamba2_cp = deepcopy(mamba2)
 
         # Backward on the correct global result
@@ -356,13 +413,13 @@ class TestSerialCP(_DTestModelBase):
         outputs.sum().backward()
 
         # And on the CP output:
-        kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, mamba2_cp)
-        outputs_cp = mamba_chunk_scan_combined_serial_cp(mesh=mesh, **kwargs_cp)
+        kwargs_cp = self.get_scan_kwargs(inputs_cp, mamba2_cp)
+        outputs_cp = mamba_chunk_scan_combined_serial_cp(cp_mesh=cp_mesh, **kwargs_cp)
         outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
-        inputs_cp_grad_shard = self.get_cp_shard(inputs_cp.grad)
+        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
 
         tol = 1e-3
         torch.testing.assert_close(
@@ -390,37 +447,36 @@ class TestSerialCP(_DTestModelBase):
 class TestMamba2CPSerial(_DTestModelBase):
     def test_fwd(self):
         torch.manual_seed(42)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(mesh=mesh)
+        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh)
 
         inputs = self.get_inputs()
-        inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+        inputs_cp = self.get_cp_shard(inputs)
 
         outputs = mamba2(inputs)
-        outputs_cp = mamba2_cp(inputs_cp_shard)
+        outputs_cp = mamba2_cp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
         torch.testing.assert_close(outputs_cp, outputs_shard)
 
     def test_bwd(self):
         torch.manual_seed(42)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(mesh=mesh)
+        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh)
 
         inputs = self.get_inputs(requires_grad=True)
-        inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp = self.get_cp_shard(inputs_copy)
 
         outputs = mamba2(inputs)
         outputs.sum().backward()
-        outputs_cp = mamba2_cp(inputs_cp_shard)
+        outputs_cp = mamba2_cp(inputs_cp)
         outputs_cp.sum().backward()
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
-        inputs_cp_grad_shard = self.get_cp_shard(inputs_cp.grad)
+        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
         torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
 
         # Parameter grads should match after all-reducing.
@@ -445,17 +501,16 @@ class TestMamba2CPSerial(_DTestModelBase):
 class TestMHACP(_DTestModelBase):
     def test_fwd(self):
         torch.manual_seed(42)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(mesh=mesh)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh)
 
         # Requires bfloat16
         inputs = self.get_inputs(dtype=torch.bfloat16)
-        inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+        inputs_cp = self.get_cp_shard(inputs)
 
         outputs = mha(inputs)
-        outputs_cp = mha_cp(inputs_cp_shard)
+        outputs_cp = mha_cp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
         tol = 1e-2
@@ -463,22 +518,22 @@ class TestMHACP(_DTestModelBase):
 
     def test_bwd(self):
         torch.manual_seed(42)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(mesh=mesh)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh)
 
         # Requires bfloat16
         inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
-        inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp = self.get_cp_shard(inputs_copy)
 
         outputs = mha(inputs)
         outputs.sum().backward()
-        outputs_cp = mha_cp(inputs_cp_shard)
+        outputs_cp = mha_cp(inputs_cp)
         outputs_cp.sum().backward()
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
-        inputs_cp_grad_shard = self.get_cp_shard(inputs_cp.grad)
+        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
         tol = 1e-2
         dist.barrier()
         torch.testing.assert_close(
@@ -506,12 +561,14 @@ class TestMHACP(_DTestModelBase):
 
 class TestFSDP1MambaCPSerial(_DTestModelBase):
     def test_fwd(self):
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
-        model_cp = nn.Sequential(*[self.get_mamba2_cp(mesh=mesh) for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[self.get_mamba2_cp(cp_mesh=cp_mesh) for _ in range(3)]
+        )
         model_cp_fsdp = FSDP(
             model_cp,
-            process_group=mesh.get_group(),
+            process_group=cp_mesh.get_group(),
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             use_orig_params=True,
@@ -519,22 +576,23 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
         )
 
         inputs = self.get_inputs()
-        inputs_cp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp)
+        inputs_cp = self.get_cp_shard(inputs)
 
         outputs = model(inputs)
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_shard)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
         torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
 
     def test_bwd(self):
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
-        model_cp = nn.Sequential(*[self.get_mamba2_cp(mesh=mesh) for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[self.get_mamba2_cp(cp_mesh=cp_mesh) for _ in range(3)]
+        )
         model_cp_fsdp = FSDP(
             model_cp,
-            process_group=mesh.get_group(),
+            process_group=cp_mesh.get_group(),
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             use_orig_params=True,
@@ -550,12 +608,12 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
         # We just use the mean for the loss below.
 
         inputs = self.get_inputs(requires_grad=True)
-        inputs_cp_fsdp = deepcopy(inputs)
-        inputs_cp_shard = self.get_cp_shard(inputs_cp_fsdp)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
 
         outputs = model(inputs)
         outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_shard)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
         outputs_cp_fsdp.mean().backward()
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
@@ -580,3 +638,56 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
                     rtol=tol,
                     msg=f"Failed on {n}: {(g - g_cp_fsdp).abs().mean()=}, {(g - g_cp_fsdp).abs().max()=}",
                 )
+
+
+class TestModel(_DTestModelBase):
+    def test_fwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model =self.get_model()
+        model_cp =self.get_model_cp(cp_mesh)
+        if not self.rank:
+            print(f"{model=}")
+            print(f"{model_cp=}")
+
+        inputs = self.get_input_toks()
+        inputs_cp = self.get_cp_shard(inputs)
+
+        outputs = model(inputs).logits
+        outputs_cp = model_cp(inputs_cp).logits
+
+        outputs_shard = self.get_cp_shard(outputs)
+        # Requires a fairly high tolerance.
+        tol = 1e-1
+        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
+
+    def test_bwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model =self.get_model()
+        model_cp =self.get_model_cp(cp_mesh)
+
+        inputs = self.get_input_toks()
+        inputs_copy = deepcopy(inputs)
+        inputs_cp = self.get_cp_shard(inputs_copy)
+
+        outputs = model(inputs).logits
+        outputs.sum().backward()
+        outputs_cp = model_cp(inputs_cp).logits
+        outputs_cp.sum().backward()
+
+        # Parameter grads should match after all-reducing.
+        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+        grads_cp = {
+            n: deepcopy(p.grad)
+            for n, p in model_cp.named_parameters()
+            if p.grad is not None
+        }
+        for g in grads_cp.values():
+            dist.all_reduce(g)
+        dist.barrier()
+        assert set(grads) == set(grads_cp)
+        tol = 1e-1
+        for n, g_cp in grads_cp.items():
+            g = grads[n]
+            torch.testing.assert_close(
+                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
+            )

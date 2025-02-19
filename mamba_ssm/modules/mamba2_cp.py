@@ -146,11 +146,11 @@ def conv(xBC, mamba2: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
 def conv_cp(
     xBC,
     mamba2: Mamba2,
-    mesh: dist.device_mesh.DeviceMesh,
+    cp_mesh: dist.device_mesh.DeviceMesh,
     seq_idx=None,
 ) -> torch.Tensor:
     conv_state_send = xBC[:, -(mamba2.d_conv - 1) :]
-    conv_state_recv = causal_passing_comms(conv_state_send, mesh)
+    conv_state_recv = causal_passing_comms(conv_state_send, cp_mesh)
     return conv(xBC, mamba2, conv_state_recv, seq_idx)
 
 
@@ -184,7 +184,7 @@ def scan(
     z: torch.Tensor,
     mamba2: Mamba2,
     seq_idx=None,
-    mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+    cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     x, B, C = torch.split(
         xBC,
@@ -215,7 +215,7 @@ def scan(
         cu_seqlens=None,
         return_final_states=True,
         return_varlen_states=False,
-        mesh=mesh,
+        cp_mesh=cp_mesh,
     )
     y = rearrange(y, "b l h p -> b l (h p)")
     return y, final_state
@@ -237,7 +237,7 @@ class _Mamba2Ref(Mamba2):
 
         xBC = conv(xBC, self, seq_idx)
         y, _ = scan(
-            mamba_chunk_scan_combined_non_cp, xBC, dt, z, self, seq_idx, mesh=None
+            mamba_chunk_scan_combined_non_cp, xBC, dt, z, self, seq_idx, cp_mesh=None
         )
 
         if self.rmsnorm:
@@ -257,20 +257,22 @@ class _Mamba2Ref(Mamba2):
 
 
 class Mamba2CP(Mamba2):
-    def __init__(self, mesh: dist.device_mesh.DeviceMesh, *args, **kwargs) -> None:
-        self.mesh = mesh
+    def __init__(self, *args, cp_mesh: dist.device_mesh.DeviceMesh, **kwargs) -> None:
+        self.cp_mesh = cp_mesh
         super().__init__(*args, **kwargs)
 
-    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None):
+    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
         if seqlen is not None:
             raise NotImplementedError
         if seq_idx is not None:
             raise NotImplementedError
         if cu_seqlens is not None:
             raise NotImplementedError
+        if inference_params is not None:
+            raise NotImplementedError
         z0, x0, z, xBC, dt = in_proj_split(u, self)
 
-        xBC = conv_cp(xBC, self, self.mesh, seq_idx)
+        xBC = conv_cp(xBC, self, self.cp_mesh, seq_idx)
         y, _ = scan(
             mamba_chunk_scan_combined_serial_cp,
             xBC,
@@ -278,7 +280,7 @@ class Mamba2CP(Mamba2):
             z,
             self,
             seq_idx,
-            mesh=self.mesh,
+            cp_mesh=self.cp_mesh,
         )
 
         if self.rmsnorm:
@@ -298,10 +300,10 @@ class Mamba2CP(Mamba2):
 
 
 class MHACP(MHA):
-    def __init__(self, mesh: dist.device_mesh.DeviceMesh, *args, **kwargs) -> None:
-        if mesh.ndim != 1:
+    def __init__(self, *args, cp_mesh: dist.device_mesh.DeviceMesh, **kwargs) -> None:
+        if cp_mesh.ndim != 1:
             raise ValueError("Only supports 1D DeviceMesh instances.")
-        self.mesh = mesh
+        self.cp_mesh = cp_mesh
         from ring_flash_attn import ring_flash_attn_func
 
         self.ring_flash_attn_func = ring_flash_attn_func
@@ -348,7 +350,7 @@ class MHACP(MHA):
             v,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
-            group=self.mesh.get_group(),
+            group=self.cp_mesh.get_group(),
         )
 
         context = rearrange(context, "... h d -> ... (h d)")

@@ -52,7 +52,7 @@ class _StatePassingImpl(ABC):
         initial_states=None,  # Optional[(batch, nheads, headdim, d_state)]
         seq_idx=None,
         out_dtype=None,
-        mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Any]:
         """
         Returns a tuple of (states, final_states, bwd_args), where bwd_args is anything that
@@ -76,7 +76,7 @@ class _StatePassingImpl(ABC):
         initial_states: Optional[torch.Tensor] = None,
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
-        mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
         bwd_args: Optional[Any] = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
@@ -114,7 +114,7 @@ class _StatePassingImpl(ABC):
                 dt_limit=(0.0, float("inf")),
                 return_final_states=False,
                 return_varlen_states=False,
-                mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+                cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
             ):
                 ctx.dt_dtype = dt.dtype
                 if not return_varlen_states:
@@ -140,7 +140,7 @@ class _StatePassingImpl(ABC):
                         cu_seqlens=cu_seqlens,
                         dt_softplus=dt_softplus,
                         dt_limit=dt_limit,
-                        mesh=mesh,
+                        cp_mesh=cp_mesh,
                     )
                 )
                 ctx.save_for_backward(
@@ -162,7 +162,7 @@ class _StatePassingImpl(ABC):
                 ctx.dt_limit = dt_limit
                 ctx.return_final_states = return_final_states
                 ctx.return_varlen_states = return_varlen_states
-                ctx.mesh = mesh
+                ctx.cp_mesh = cp_mesh
                 if not return_varlen_states:
                     return out if not return_final_states else (out, final_states)
                 else:
@@ -212,7 +212,7 @@ class _StatePassingImpl(ABC):
                         seq_idx=seq_idx,
                         dt_softplus=ctx.dt_softplus,
                         dt_limit=ctx.dt_limit,
-                        mesh=ctx.mesh,
+                        cp_mesh=ctx.cp_mesh,
                     )
                 )
                 return (
@@ -254,7 +254,7 @@ class _StatePassingImpl(ABC):
             dt_limit=(0.0, float("inf")),
             return_final_states=False,
             return_varlen_states=False,
-            mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+            cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
         ):
             """
             Argument:
@@ -271,7 +271,7 @@ class _StatePassingImpl(ABC):
                 seq_idx: (batch, seqlen)
                 cu_seqlens: (num_sequences + 1) or None, only used if return_varlen_states is True
                 dt_softplus: Whether to apply softplus to dt
-                mesh: Optional[DeviceMesh]
+                cp_mesh: Optional[DeviceMesh]
             Return:
                 out: (batch, seqlen, nheads, headdim)
             """
@@ -292,7 +292,7 @@ class _StatePassingImpl(ABC):
                 dt_limit,
                 return_final_states,
                 return_varlen_states,
-                mesh,
+                cp_mesh,
             )
 
         return fn
@@ -318,7 +318,7 @@ def _mamba_chunk_scan_combined_fwd_template(
     cu_seqlens=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
-    mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+    cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
@@ -362,7 +362,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         initial_states=initial_states,
         seq_idx=seq_idx,
         out_dtype=C.dtype,
-        mesh=mesh,
+        cp_mesh=cp_mesh,
     )
 
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
@@ -410,7 +410,7 @@ def _mamba_chunk_scan_combined_bwd_template(
     dC=None,
     dz=None,
     recompute_output=False,
-    mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+    cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
     if dout.stride(-1) != 1:
         dout = dout.contiguous()
@@ -468,7 +468,7 @@ def _mamba_chunk_scan_combined_bwd_template(
         initial_states=initial_states,
         seq_idx=seq_idx,
         out_dtype=None,
-        mesh=mesh,
+        cp_mesh=cp_mesh,
     )
 
     if z is not None:
@@ -501,7 +501,7 @@ def _mamba_chunk_scan_combined_bwd_template(
         initial_states=initial_states,
         dfinal_states=dfinal_states,
         seq_idx=seq_idx,
-        mesh=mesh,
+        cp_mesh=cp_mesh,
         bwd_args=bwd_args,
     )
 
@@ -564,7 +564,7 @@ class StatePassingNonCP(_StatePassingImpl):
         initial_states=None,
         seq_idx=None,
         out_dtype=None,
-        mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Intentionally unused
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Intentionally unused
     ):
         d_state = states.shape[-1]
         states, final_states = _state_passing_fwd(
@@ -594,7 +594,7 @@ class StatePassingNonCP(_StatePassingImpl):
         initial_states: Optional[torch.Tensor] = None,
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
-        mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
         bwd_args: Optional[Any] = None,  # Intentionally unused
     ):
         d_state = states.shape[-1]
@@ -639,14 +639,14 @@ class StatePassingSerialCP(_StatePassingImpl):
         initial_states=None,
         seq_idx=None,
         out_dtype=None,
-        mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
         """
         Serially compute the final state on each rank and pass as initial_states to the next.
         """
-        assert mesh is not None
-        rank = mesh.get_rank()
-        for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
+        assert cp_mesh is not None
+        rank = cp_mesh.get_rank()
+        for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
             if rank == send_rank:
                 states, final_states, _ = StatePassingNonCP.fwd(
                     chunk_size=chunk_size,
@@ -660,7 +660,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 dist.send(
                     final_states.contiguous(),
                     dst=recv_rank,
-                    group=mesh.get_group(),
+                    group=cp_mesh.get_group(),
                 )
                 recv_init_states = None
             elif rank == recv_rank:
@@ -668,7 +668,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 dist.recv(
                     recv_init_states,
                     src=send_rank,
-                    group=mesh.get_group(),
+                    group=cp_mesh.get_group(),
                 )
             dist.barrier()
 
@@ -695,7 +695,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         initial_states: Optional[torch.Tensor] = None,
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
-        mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
         bwd_args: Optional[Any] = None,
     ):
         """
@@ -703,9 +703,9 @@ class StatePassingSerialCP(_StatePassingImpl):
         dinitial_states and pass these back as the dfinal_states of the preceding rank.
         """
         recv_init_states = bwd_args
-        assert mesh is not None
-        rank = mesh.get_rank()
-        reversed_mesh = mesh.mesh.flip(0)
+        assert cp_mesh is not None
+        rank = cp_mesh.get_rank()
+        reversed_mesh = cp_mesh.mesh.flip(0)
         for send_rank, recv_rank in zip(reversed_mesh[:-1], reversed_mesh[1:]):
             if rank == send_rank:
                 dstates, ddA_chunk_cumsum, dinitial_states, states = (
@@ -719,13 +719,13 @@ class StatePassingSerialCP(_StatePassingImpl):
                         seq_idx=seq_idx,
                         dstates_dtype=dstates_dtype,
                         states_dtype=states_dtype,
-                        mesh=mesh,
+                        cp_mesh=cp_mesh,
                     )
                 )
                 dist.send(
                     dinitial_states.contiguous(),
                     dst=recv_rank,
-                    group=mesh.get_group(),
+                    group=cp_mesh.get_group(),
                 )
                 # None of these ranks had any actual initial_states as proper inputs to
                 # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from
@@ -738,7 +738,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 dist.recv(
                     recv_dfinal_states,
                     src=send_rank,
-                    group=mesh.get_group(),
+                    group=cp_mesh.get_group(),
                 )
 
             dist.barrier()
@@ -755,7 +755,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 seq_idx=seq_idx,
                 dstates_dtype=dstates_dtype,
                 states_dtype=states_dtype,
-                mesh=mesh,
+                cp_mesh=cp_mesh,
             )
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 

@@ -5,6 +5,8 @@ from functools import partial
 import json
 import os
 import copy
+from typing import Optional
+from torch.distributed.device_mesh import DeviceMesh
 
 from collections import namedtuple
 
@@ -12,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.modules.mamba2_cp import MHACP, Mamba2CP
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
@@ -37,6 +40,7 @@ def create_block(
     residual_in_fp32=False,
     fused_add_norm=False,
     layer_idx=None,
+    cp_mesh: Optional[DeviceMesh]=None,
     device=None,
     dtype=None,
 ):
@@ -47,20 +51,30 @@ def create_block(
     if attn_cfg is None:
         attn_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
+    mixer_cls_kwargs = dict(layer_idx=layer_idx, **factory_kwargs)
     if layer_idx not in attn_layer_idx:
         # Create a copy of the config to modify
         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
         if ssm_layer not in ["Mamba1", "Mamba2"]:
-            raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2")
-        mixer_cls = partial(
-            Mamba2 if ssm_layer == "Mamba2" else Mamba,
-            layer_idx=layer_idx,
-            **ssm_cfg,
-            **factory_kwargs
-        )
+            raise ValueError(
+                f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2"
+            )
+        if cp_mesh is not None and ssm_layer == "Mamba1":
+            raise NotImplementedError("Context parallel not implemented for Mamba1")
+        if ssm_layer == "Mamba2":
+            ssm_cls = Mamba2 if cp_mesh is None else Mamba2CP
+        else:
+            ssm_cls = Mamba
+        mixer_cls_kwargs = {**mixer_cls_kwargs, **ssm_cfg}
+        if cp_mesh is not None:
+            mixer_cls_kwargs["cp_mesh"] = cp_mesh
+        mixer_cls = partial(ssm_cls, **mixer_cls_kwargs)
     else:
-        mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, **factory_kwargs)
+        mixer_cls_kwargs = {**mixer_cls_kwargs, **attn_cfg}
+        if cp_mesh is not None:
+            mixer_cls_kwargs["cp_mesh"] = cp_mesh
+        mixer_cls = partial(MHA if cp_mesh is None else MHACP, **mixer_cls_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -130,6 +144,7 @@ class MixerModel(nn.Module):
         initializer_cfg=None,
         fused_add_norm=False,
         residual_in_fp32=False,
+        cp_mesh: Optional[DeviceMesh]=None,
         device=None,
         dtype=None,
     ) -> None:
@@ -162,6 +177,7 @@ class MixerModel(nn.Module):
                     residual_in_fp32=residual_in_fp32,
                     fused_add_norm=fused_add_norm,
                     layer_idx=i,
+                    cp_mesh=cp_mesh,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -220,6 +236,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         initializer_cfg=None,
         device=None,
         dtype=None,
+        cp_mesh: Optional[DeviceMesh]=None,
     ) -> None:
         self.config = config
         d_model = config.d_model
@@ -250,6 +267,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             initializer_cfg=initializer_cfg,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
+            cp_mesh=cp_mesh,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
