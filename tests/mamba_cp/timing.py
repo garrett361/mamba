@@ -1,18 +1,83 @@
 import argparse
 import datetime
 import os
+from functools import partial
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import Mamba2CP
+
+non_reentrant_wrapper = partial(
+    checkpoint_wrapper,
+    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+)
+
+
+def apply_fsdp_checkpointing(model, block: nn.Module = Block, p=1):
+    """
+    Apply selective activation checkpointing.
+
+    Selectivity is defined as a percentage p, which means we apply ac
+    on p of the total blocks. p is a floating number in the range of
+    [0, 1].
+
+    Some examples:
+    p = 0: no ac for all blocks. same as `fsdp_activation_checkpointing=False`
+    p = 1: apply ac on every block. i.e. "full ac".
+    p = 1/2: [ac, no-ac, ac, no-ac, ...]
+    p = 1/3: [no-ac, ac, no-ac,   no-ac, ac, no-ac,   ...]
+    p = 2/3: [ac, no-ac, ac,    ac, no-ac, ac,    ...]
+    Since blocks are homogeneous, we make ac blocks evenly spaced among
+    all blocks.
+
+    Implementation:
+    For a given ac ratio p, we should essentially apply ac on every "1/p"
+    blocks. The first ac block can be as early as the 0th block, or as
+    late as the "1/p"th block, and we pick the middle one: (0.5p)th block.
+    Therefore, we are essentially to apply ac on:
+    (0.5/p)th block, (1.5/p)th block, (2.5/p)th block, etc., and of course,
+    with these values rounding to integers.
+    Since ac is applied recursively, we can simply use the following math
+    in the code to apply ac on corresponding blocks.
+    """
+    block_idx = 0
+    cut_off = 1 / 2
+    # when passing p as a fraction number (e.g. 1/3), it will be interpreted
+    # as a string in argv, thus we need eval("1/3") here for fractions.
+    p = eval(p) if isinstance(p, str) else p
+
+    def selective_checkpointing(submodule):
+        nonlocal block_idx
+        nonlocal cut_off
+
+        if isinstance(submodule, block):
+            block_idx += 1
+            if block_idx * p >= cut_off:
+                cut_off += 1
+                return True
+        return False
+
+    apply_activation_checkpointing(
+        model,
+        checkpoint_wrapper_fn=non_reentrant_wrapper,
+        check_fn=selective_checkpointing,
+    )
+
 
 bamba_9dot8b_defaults = {
     "d_model": 4096,
@@ -67,6 +132,7 @@ if __name__ == "__main__":
         timeout=datetime.timedelta(seconds=30),
     )
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
+
     model = MambaLMHeadModel(config=config, cp_mesh=mesh if args.cp else None)
     model_fsdp = FSDP(
         model,
@@ -81,6 +147,9 @@ if __name__ == "__main__":
             buffer_dtype=dtype,
         ),
     )
+    apply_fsdp_checkpointing(model)
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-7)
+
     if not rank:
         print(f"{model_fsdp=}")
 
@@ -90,20 +159,23 @@ if __name__ == "__main__":
         device=device,
     )
 
-    for _ in range(args.warmups):
+    def train_one_step():
         outputs = model_fsdp(inputs)
-        outputs.logits.mean().backward()
-        model_fsdp.zero_grad()
+        loss = F.cross_entropy(
+            outputs.logits.view(-1, outputs.logits.shape[-1]), inputs.view(-1)
+        )
+        loss.backward()
+        optim.step()
+        optim.zero_grad()
+
+    for _ in range(args.warmups):
+        train_one_step()
 
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(args.iters):
-        outputs = model_fsdp(inputs)
-        F.cross_entropy(
-            outputs.logits.view(-1, outputs.logits.shape[-1]), inputs.view(-1)
-        )
-        model_fsdp.zero_grad()
+        train_one_step()
     dist.barrier()
     stop.record()
     torch.cuda.synchronize()
