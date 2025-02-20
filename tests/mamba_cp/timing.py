@@ -105,8 +105,8 @@ if __name__ == "__main__":
         )
         model_fsdp.zero_grad()
     dist.barrier()
-    torch.cuda.synchronize()
     stop.record()
+    torch.cuda.synchronize()
     secs = start.elapsed_time(stop) / 1e3
 
     total_toks = args.batch_size * args.seq_len * world_size * args.iters
