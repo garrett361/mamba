@@ -134,7 +134,7 @@ if __name__ == "__main__":
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
 
     model = MambaLMHeadModel(config=config, cp_mesh=mesh if args.cp else None)
-    model_fsdp = FSDP(
+    model = FSDP(
         model,
         process_group=mesh.get_group(),
         auto_wrap_policy=ModuleWrapPolicy([Mamba2, Mamba2CP]),
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     optim = torch.optim.AdamW(model.parameters(), lr=1e-7)
 
     if not rank:
-        print(f"{model_fsdp=}")
+        print(f"{model=}")
 
     inputs = torch.randint(
         config.vocab_size,
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     )
 
     def train_one_step():
-        outputs = model_fsdp(inputs)
+        outputs = model(inputs)
         loss = F.cross_entropy(
             outputs.logits.view(-1, outputs.logits.shape[-1]), inputs.view(-1)
         )
