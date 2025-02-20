@@ -662,8 +662,8 @@ class TestModel(_DTestModelBase):
 
     def test_bwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model =self.get_model()
-        model_cp =self.get_model_cp(cp_mesh)
+        model = self.get_model()
+        model_cp = self.get_model_cp(cp_mesh)
 
         inputs = self.get_input_toks()
         inputs_copy = deepcopy(inputs)
