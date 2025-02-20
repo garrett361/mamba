@@ -187,3 +187,5 @@ if __name__ == "__main__":
         print(f"Total tokens: {total_toks}")
         print(f"Total Secs: {secs}")
         print(f"Tok/sec {toks_per_sec}")
+
+    dist.destroy_process_group()
