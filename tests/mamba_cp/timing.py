@@ -145,8 +145,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
-        backend="nccl",
-        timeout=datetime.timedelta(seconds=30),
+        backend="nccl", timeout=datetime.timedelta(seconds=30), device_id=device
     )
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
 
@@ -155,7 +154,7 @@ if __name__ == "__main__":
         model,
         process_group=mesh.get_group(),
         auto_wrap_policy=ModuleWrapPolicy([Mamba2, Mamba2CP]),
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sharding_strategy=ShardingStrategy.HYBRID_SHARD,
         use_orig_params=True,
         device_id=device,
         mixed_precision=MixedPrecision(
