@@ -646,9 +646,9 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank and initial_states is not None:
+        if rank == cp_mesh.mesh[0] and initial_states is not None:
             raise ValueError(
-                "CP implementation expects initial_states to be None on rank != 0"
+                "CP implementation expects initial_states to be None on the first rank."
             )
         recv_init_states = None
         for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
@@ -686,7 +686,8 @@ class StatePassingSerialCP(_StatePassingImpl):
                 seq_idx=seq_idx,
                 out_dtype=out_dtype,
             )
-        return states, final_states, recv_init_states
+        bwd_args = recv_init_states
+        return states, final_states, bwd_args
 
     @staticmethod
     def bwd(
@@ -706,20 +707,25 @@ class StatePassingSerialCP(_StatePassingImpl):
         Starting from the final rank to compute in _state_passing_serial_cp_fwd, compute
         dinitial_states and pass these back as the dfinal_states of the preceding rank.
         """
-        recv_init_states = bwd_args
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
+        if rank and initial_states is not None:
+            raise ValueError(
+                "CP implementation expects dfinal_states to be None all ranks"
+            )
+        recv_init_states = bwd_args
         reversed_mesh = cp_mesh.mesh.flip(0)
+        recv_dfinal_states = None
         for send_rank, recv_rank in zip(reversed_mesh[:-1], reversed_mesh[1:]):
             if rank == send_rank:
-                dstates, ddA_chunk_cumsum, dinitial_states, states = (
+                dstates, ddA_chunk_cumsum, send_dinitial_states, states = (
                     StatePassingNonCP.bwd(
                         chunk_size=chunk_size,
                         states=states,
                         dA_cumsum=dA_cumsum,
                         dstates=dstates,
                         initial_states=recv_init_states,
-                        dfinal_states=dfinal_states,
+                        dfinal_states=recv_dfinal_states,
                         seq_idx=seq_idx,
                         dstates_dtype=dstates_dtype,
                         states_dtype=states_dtype,
@@ -727,14 +733,10 @@ class StatePassingSerialCP(_StatePassingImpl):
                     )
                 )
                 dist.send(
-                    dinitial_states.contiguous(),
+                    send_dinitial_states.contiguous(),
                     dst=recv_rank,
                     group=cp_mesh.get_group(),
                 )
-                # None of these ranks had any actual initial_states as proper inputs to
-                # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from
-                # other ranks) and so we need to overwrite dinitial_states = None after sending.
-                dinitial_states = None
             elif rank == recv_rank:
                 recv_dfinal_states = torch.empty(
                     *states[:, 0].shape, dtype=dstates_dtype, device=states.device
@@ -749,18 +751,22 @@ class StatePassingSerialCP(_StatePassingImpl):
 
         # Final rank only:
         if rank == recv_rank:
-            dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
+            dstates, ddA_chunk_cumsum, _, states = StatePassingNonCP.bwd(
                 chunk_size=chunk_size,
                 states=states,
                 dA_cumsum=dA_cumsum,
                 dstates=dstates,
-                initial_states=initial_states,
+                initial_states=initial_states,  # Gets the original initial_states, if any
                 dfinal_states=recv_dfinal_states,
                 seq_idx=seq_idx,
                 dstates_dtype=dstates_dtype,
                 states_dtype=states_dtype,
                 cp_mesh=cp_mesh,
             )
+        # None of these ranks had any actual initial_states as proper inputs to
+        # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from
+        # other ranks) and so we need to overwrite dinitial_states = None after sending.
+        dinitial_states = None
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 
 
