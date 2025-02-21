@@ -122,7 +122,12 @@ if __name__ == "__main__":
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
     final_states = torch.randn(1, 4096, device=device, dtype=torch.bfloat16)
     recv_init_states = torch.empty_like(final_states)
+    if not rank:
+        print(f"{mesh=}")
     for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
+        if not rank:
+            print(f"{send_rank=}, {recv_rank=}")
+        print(f"{mesh=}")
         if rank == send_rank:
             dist.send(
                 final_states.contiguous(),
