@@ -151,7 +151,7 @@ class _DTestModelBase(DTest):
     vocab_size = 1024
     n_layer = 1
     attn_layer_idx = [
-       10 #n_layer-1
+        10  # n_layer-1
     ]
     attn_cfg = {
         "causal": True,
@@ -231,9 +231,7 @@ class _DTestModelBase(DTest):
 
     def get_model(self, seed: int = 42, dtype: torch.dtype = torch.bfloat16) -> MHA:
         torch.manual_seed(seed)
-        return MambaLMHeadModel(
-            config=self.cfg, device=self.device, dtype=dtype
-        )
+        return MambaLMHeadModel(config=self.cfg, device=self.device, dtype=dtype)
 
     def get_model_cp(
         self,
@@ -643,8 +641,8 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
 class TestModel(_DTestModelBase):
     def test_fwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model =self.get_model()
-        model_cp =self.get_model_cp(cp_mesh)
+        model = self.get_model()
+        model_cp = self.get_model_cp(cp_mesh)
         if not self.rank:
             print(f"{model=}")
             print(f"{model_cp=}")
