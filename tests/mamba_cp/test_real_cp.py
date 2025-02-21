@@ -437,9 +437,11 @@ class TestSerialCP(_DTestModelBase):
         assert set(grads) == set(grads_cp)
         for n, g_cp in grads_cp.items():
             g = grads[n]
-            torch.testing.assert_close(
-                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
-            )
+            try:
+                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
+            except Exception as e:
+                print(f"Failed on {n}")
+                raise e
 
 
 class TestMamba2CPSerial(_DTestModelBase):
@@ -491,9 +493,11 @@ class TestMamba2CPSerial(_DTestModelBase):
         tol = 1e-3
         for n, g_cp in grads_cp.items():
             g = grads[n]
-            torch.testing.assert_close(
-                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
-            )
+            try:
+                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
+            except Exception as e:
+                print(f"Failed on {n}")
+                raise e
 
 
 class TestMHACP(_DTestModelBase):
@@ -552,9 +556,11 @@ class TestMHACP(_DTestModelBase):
         tol = 1e-1
         for n, g_cp in grads_cp.items():
             g = grads[n]
-            torch.testing.assert_close(
-                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
-            )
+            try:
+                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
+            except Exception as e:
+                print(f"Failed on {n}")
+                raise e
 
 
 class TestFSDP1MambaCPSerial(_DTestModelBase):
@@ -629,13 +635,11 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
             tol = 1e-3
             for n, g_cp_fsdp in grads_cp_fsdp.items():
                 g = grads[n]
-                torch.testing.assert_close(
-                    g,
-                    g_cp_fsdp,
-                    atol=tol,
-                    rtol=tol,
-                    msg=f"Failed on {n}: {(g - g_cp_fsdp).abs().mean()=}, {(g - g_cp_fsdp).abs().max()=}",
-                )
+                try:
+                    torch.testing.assert_close(g, g_cp_fsdp, atol=tol, rtol=tol)
+                except Exception as e:
+                    print(f"Failed on {n}")
+                    raise e
 
 
 class TestModel(_DTestModelBase):
