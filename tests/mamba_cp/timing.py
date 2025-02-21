@@ -166,7 +166,7 @@ if __name__ == "__main__":
     )
     if not args.no_ac:
         apply_fsdp_checkpointing(model)
-    optim = torch.optim.AdamW(model.parameters(), lr=1e-7)
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-7, foreach=False)
 
     inputs = torch.randint(
         config.vocab_size,
