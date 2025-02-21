@@ -153,7 +153,9 @@ if __name__ == "__main__":
     model = FSDP(
         model,
         auto_wrap_policy=ModuleWrapPolicy([Mamba2, Mamba2CP]),
-        sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+        sharding_strategy=ShardingStrategy.HYBRID_SHARD
+        if world_size > 8
+        else ShardingStrategy.FULL_SHARD,
         use_orig_params=True,
         device_id=device,
         mixed_precision=MixedPrecision(
