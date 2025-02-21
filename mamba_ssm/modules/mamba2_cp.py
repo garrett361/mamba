@@ -275,7 +275,7 @@ class Mamba2CP(Mamba2):
         z0, x0, z, xBC, dt = in_proj_split(u, self)
 
         xBC = conv_cp(xBC, self, self.cp_mesh, seq_idx)
-        y, _ = scan(
+        y = scan(
             mamba_chunk_scan_combined_serial_cp,
             xBC,
             dt,
