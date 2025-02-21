@@ -48,7 +48,7 @@ class _StatePassingImpl(ABC):
     def fwd(
         chunk_size,
         states,  # (batch, nchunks, nheads, headdim, d_state)
-        dA_cumsum,
+        dA_chunk_cumsum,  # (batch, nheads, nchunks)
         initial_states=None,  # Optional[(batch, nheads, headdim, d_state)]
         seq_idx=None,
         out_dtype=None,
@@ -69,7 +69,7 @@ class _StatePassingImpl(ABC):
     def bwd(
         chunk_size: int,
         states: torch.Tensor,
-        dA_cumsum: torch.Tensor,
+        dA_chunk_cumsum: torch.Tensor,
         dstates: torch.Tensor,
         dstates_dtype: torch.dtype,
         states_dtype: torch.dtype,
@@ -356,7 +356,7 @@ def _mamba_chunk_scan_combined_fwd_template(
     states, final_states, _ = state_passing_impl.fwd(
         chunk_size=chunk_size,
         states=states,
-        dA_cumsum=dA_cumsum,
+        dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
         initial_states=initial_states,
         seq_idx=seq_idx,
         out_dtype=C.dtype,
@@ -462,7 +462,7 @@ def _mamba_chunk_scan_combined_bwd_template(
     states, _, bwd_args = state_passing_impl.fwd(
         chunk_size=chunk_size,
         states=states,
-        dA_cumsum=dA_cumsum,
+        dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
         initial_states=initial_states,
         seq_idx=seq_idx,
         out_dtype=None,
@@ -492,7 +492,7 @@ def _mamba_chunk_scan_combined_bwd_template(
     dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_impl.bwd(
         chunk_size=chunk_size,
         states=states,
-        dA_cumsum=dA_cumsum,
+        dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
         dstates=dstates,
         dstates_dtype=x.dtype,
         states_dtype=x.dtype,
@@ -558,7 +558,7 @@ class StatePassingNonCP(_StatePassingImpl):
     def fwd(
         chunk_size,
         states,
-        dA_cumsum,
+        dA_chunk_cumsum,
         initial_states=None,
         seq_idx=None,
         out_dtype=None,
@@ -567,7 +567,7 @@ class StatePassingNonCP(_StatePassingImpl):
         d_state = states.shape[-1]
         states, final_states = _state_passing_fwd(
             rearrange(states, "... p n -> ... (p n)"),
-            dA_cumsum[:, :, :, -1],
+            dA_chunk_cumsum,
             initial_states=rearrange(initial_states, "... p n -> ... (p n)")
             if initial_states is not None
             else None,
@@ -585,7 +585,7 @@ class StatePassingNonCP(_StatePassingImpl):
     def bwd(
         chunk_size: int,
         states: torch.Tensor,
-        dA_cumsum: torch.Tensor,
+        dA_chunk_cumsum: torch.Tensor,
         dstates: torch.Tensor,
         dstates_dtype: torch.dtype,
         states_dtype: torch.dtype,
@@ -598,7 +598,7 @@ class StatePassingNonCP(_StatePassingImpl):
         d_state = states.shape[-1]
         dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
             rearrange(states, "... p n -> ... (p n)"),
-            dA_cumsum[:, :, :, -1],
+            dA_chunk_cumsum,
             rearrange(dstates, "... p n -> ... (p n)"),
             dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)")
             if dfinal_states is not None
@@ -645,7 +645,7 @@ class StatePassingSerialCP(_StatePassingImpl):
     def fwd(
         chunk_size,
         states,
-        dA_cumsum,
+        dA_chunk_cumsum,
         initial_states=None,
         seq_idx=None,
         out_dtype=None,
@@ -666,7 +666,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 states, final_states, _ = StatePassingNonCP.fwd(
                     chunk_size=chunk_size,
                     states=states,
-                    dA_cumsum=dA_cumsum,
+                    dA_chunk_cumsum=dA_chunk_cumsum,
                     initial_states=recv_init_states,
                     seq_idx=seq_idx,
                     out_dtype=out_dtype,
@@ -691,7 +691,7 @@ class StatePassingSerialCP(_StatePassingImpl):
             states, final_states, _ = StatePassingNonCP.fwd(
                 chunk_size=chunk_size,
                 states=states,
-                dA_cumsum=dA_cumsum,
+                dA_chunk_cumsum=dA_chunk_cumsum,
                 initial_states=recv_init_states,
                 seq_idx=seq_idx,
                 out_dtype=out_dtype,
@@ -703,7 +703,7 @@ class StatePassingSerialCP(_StatePassingImpl):
     def bwd(
         chunk_size: int,
         states: torch.Tensor,
-        dA_cumsum: torch.Tensor,
+        dA_chunk_cumsum: torch.Tensor,
         dstates: torch.Tensor,
         dstates_dtype: torch.dtype,
         states_dtype: torch.dtype,
@@ -732,7 +732,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                     StatePassingNonCP.bwd(
                         chunk_size=chunk_size,
                         states=states,
-                        dA_cumsum=dA_cumsum,
+                        dA_chunk_cumsum=dA_chunk_cumsum,
                         dstates=dstates,
                         initial_states=recv_init_states,
                         dfinal_states=recv_dfinal_states,
@@ -764,7 +764,7 @@ class StatePassingSerialCP(_StatePassingImpl):
             dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
                 chunk_size=chunk_size,
                 states=states,
-                dA_cumsum=dA_cumsum,
+                dA_chunk_cumsum=dA_chunk_cumsum,
                 dstates=dstates,
                 initial_states=initial_states,  # Gets the original initial_states, if any
                 dfinal_states=recv_dfinal_states,
