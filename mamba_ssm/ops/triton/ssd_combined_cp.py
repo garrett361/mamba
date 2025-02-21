@@ -749,9 +749,9 @@ class StatePassingSerialCP(_StatePassingImpl):
 
             dist.barrier()
 
-        # Final rank only:
         if rank == recv_rank:
-            dstates, ddA_chunk_cumsum, _, states = StatePassingNonCP.bwd(
+            # First rank only:
+            dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
                 chunk_size=chunk_size,
                 states=states,
                 dA_cumsum=dA_cumsum,
@@ -763,10 +763,10 @@ class StatePassingSerialCP(_StatePassingImpl):
                 states_dtype=states_dtype,
                 cp_mesh=cp_mesh,
             )
-        # None of these ranks had any actual initial_states as proper inputs to
-        # MambaChunkScanCombinedSerialCPFn (they only received initial_states passed from
-        # other ranks) and so we need to overwrite dinitial_states = None after sending.
-        dinitial_states = None
+        else:
+            # Only the first rank potentially had non-trivial initial_states as proper inputs, so
+            # all other ranks get dinitial_state = None.
+            dinitial_states = None
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 
 
