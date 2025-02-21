@@ -686,6 +686,8 @@ class TestModel(_DTestModelBase):
         tol = 1e-1
         for n, g_cp in grads_cp.items():
             g = grads[n]
-            torch.testing.assert_close(
-                g, g_cp, atol=tol, rtol=tol, msg=f"Failed on {n}"
-            )
+            try:
+                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
+            except Exception as e:
+                print(f"Failed on {n}")
+                raise e
