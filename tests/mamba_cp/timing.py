@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 from functools import partial
+from typing import Type
 
 import torch
 import torch.distributed as dist
@@ -28,7 +29,18 @@ non_reentrant_wrapper = partial(
 )
 
 
-def apply_fsdp_checkpointing(model, block: nn.Module = Block, p=1):
+def get_mem_dict():
+    mem_dict = {}
+    for k, v in torch.cuda.memory_stats().items():
+        if all(s in k for s in (".all.", "bytes")) and any(
+            s in k for s in ("current", "peak")
+        ):
+            mem_dict[k.replace("bytes", "gib")] = v / 2**30
+
+    return mem_dict
+
+
+def apply_fsdp_checkpointing(model, block: Type[nn.Module] = Block, p=1):
     """
     Apply selective activation checkpointing.
 
@@ -107,6 +119,8 @@ bamba_9dot8b_defaults = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cp", action="store_true")
+    parser.add_argument("--mamba_only", action="store_true")
+    parser.add_argument("--no_ac", action="store_true")
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seq_len", type=int, default=512)
@@ -114,7 +128,10 @@ if __name__ == "__main__":
     parser.add_argument("--n_layer", type=int, default=bamba_9dot8b_defaults["n_layer"])
     args = parser.parse_args()
 
-    config = MambaConfig(**{**bamba_9dot8b_defaults, **{"n_layer": args.n_layer}})
+    cli_args = {"n_layer": args.n_layer}
+    if args.mamba_only:
+        cli_args["attn_layer_idx"] = []
+    config = MambaConfig(**{**bamba_9dot8b_defaults, **cli_args})
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -147,11 +164,9 @@ if __name__ == "__main__":
             buffer_dtype=dtype,
         ),
     )
-    apply_fsdp_checkpointing(model)
+    if not args.no_ac:
+        apply_fsdp_checkpointing(model)
     optim = torch.optim.AdamW(model.parameters(), lr=1e-7)
-
-    if not rank:
-        print(f"{model=}")
 
     inputs = torch.randint(
         config.vocab_size,
@@ -183,9 +198,13 @@ if __name__ == "__main__":
 
     total_toks = args.batch_size * args.seq_len * world_size * args.iters
     toks_per_sec = total_toks / secs
+    toks_per_sec_per_gpu = toks_per_sec / world_size
     if not rank:
         print(f"Total tokens: {total_toks}")
         print(f"Total Secs: {secs}")
         print(f"Tok/sec {toks_per_sec}")
+        print(f"Tok/sec/gpu {toks_per_sec_per_gpu}")
+
+        print(f"{get_mem_dict()}")
 
     dist.destroy_process_group()
