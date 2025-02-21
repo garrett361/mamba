@@ -107,6 +107,16 @@ bamba_9dot8b_defaults = {
 }
 
 
+def send(tensor: torch.Tensor, dst: int, group: dist.ProcessGroup):
+    # Hack replacement for dist.send, which is giving errors.
+    dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)])[0].wait()
+
+
+def recv(tensor: torch.Tensor, src: int, group: dist.ProcessGroup):
+    # Hack replacement for dist.recv, which is giving errors.
+    dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src, group)])[0].wait()
+
+
 if __name__ == "__main__":
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -118,23 +128,27 @@ if __name__ == "__main__":
     dist.init_process_group(
         backend="nccl", timeout=datetime.timedelta(seconds=30), device_id=device
     )
+    mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
+    if not rank:
+        print(f"{mesh=}", flush=True)
+    dist.barrier()
     try:
-        mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
-        final_states = torch.randn(1, 4096, device=device, dtype=torch.bfloat16)
+        final_states = torch.randn(1, 8, device=device, dtype=torch.bfloat16)
         recv_init_states = torch.empty_like(final_states)
-        if not rank:
-            print(f"{mesh=}", flush=True)
         for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
             if not rank:
                 print(f"{send_rank=}, {recv_rank=}", flush=True)
             if rank == send_rank:
-                dist.send(
+                print(f"[{rank=}]: send {final_states=} to {recv_rank=}", flush=True)
+
+                send(
                     final_states.contiguous(),
                     dst=recv_rank,
                     group=mesh.get_group(),
                 )
             elif rank == recv_rank:
-                dist.recv(
+                print(f"[{rank=}]: recv from {send_rank=}", flush=True)
+                recv(
                     recv_init_states,
                     src=send_rank,
                     group=mesh.get_group(),
@@ -143,4 +157,5 @@ if __name__ == "__main__":
     finally:
         print(f"[{rank=}]: {final_states=}")
 
+    dist.barrier()
     dist.destroy_process_group()
