@@ -122,10 +122,10 @@ if __name__ == "__main__":
     final_states = torch.randn(1, 4096, device=device, dtype=torch.bfloat16)
     recv_init_states = torch.empty_like(final_states)
     if not rank:
-        print(f"{mesh=}")
+        print(f"{mesh=}", flush=True)
     for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
         if not rank:
-            print(f"{send_rank=}, {recv_rank=}")
+            print(f"{send_rank=}, {recv_rank=}", flush=True)
         if rank == send_rank:
             dist.send(
                 final_states.contiguous(),
