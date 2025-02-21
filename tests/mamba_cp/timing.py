@@ -142,7 +142,7 @@ if __name__ == "__main__":
         print(f"{config=}")
 
     dtype = torch.bfloat16
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
