@@ -120,9 +120,9 @@ class _StatePassingImpl(ABC):
                 if not return_varlen_states:
                     cu_seqlens = None
                 else:
-                    assert (
-                        cu_seqlens is not None
-                    ), "cu_seqlens must be provided if return_varlen_states is True"
+                    assert cu_seqlens is not None, (
+                        "cu_seqlens must be provided if return_varlen_states is True"
+                    )
                 out, out_x, dt_out, dA_cumsum, states, final_states, *rest = (
                     _mamba_chunk_scan_combined_fwd_template(
                         cls,
@@ -189,9 +189,9 @@ class _StatePassingImpl(ABC):
                     initial_states,
                     seq_idx,
                 ) = ctx.saved_tensors
-                assert (
-                    not ctx.return_varlen_states
-                ), "return_varlen_states is not supported in backward"
+                assert not ctx.return_varlen_states, (
+                    "return_varlen_states is not supported in backward"
+                )
                 dfinal_states = args[0] if ctx.return_final_states else None
                 dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
                     _mamba_chunk_scan_combined_bwd_template(
@@ -372,9 +372,9 @@ def _mamba_chunk_scan_combined_fwd_template(
     if cu_seqlens is None:
         return out, out_x, dt, dA_cumsum, states, final_states
     else:
-        assert (
-            batch == 1
-        ), "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        assert batch == 1, (
+            "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        )
         varlen_states = chunk_state_varlen(
             B.squeeze(0),
             x.squeeze(0),
@@ -646,6 +646,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
+        recv_init_states = None
         for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
             if rank == send_rank:
                 states, final_states, _ = StatePassingNonCP.fwd(
@@ -662,7 +663,6 @@ class StatePassingSerialCP(_StatePassingImpl):
                     dst=recv_rank,
                     group=cp_mesh.get_group(),
                 )
-                recv_init_states = None
             elif rank == recv_rank:
                 recv_init_states = torch.empty_like(states[:, 0])
                 dist.recv(
