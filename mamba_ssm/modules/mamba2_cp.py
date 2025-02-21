@@ -49,16 +49,12 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
-            ops.append(
-                dist.P2POp(dist.isend, tensor, None, mesh.get_group(), 0, send_to)
-            )
+            # TODO: @goon - we might need to use the group_dst arg for more complex sharding
+            # situations?
+            ops.append(dist.P2POp(dist.isend, tensor, send_to, mesh.get_group()))
         if recv_from is not None:
             recv_buffer = torch.empty_like(tensor)
-            ops.append(
-                dist.P2POp(
-                    dist.irecv, recv_buffer, None, mesh.get_group(), 0, recv_from
-                )
-            )
+            ops.append(dist.P2POp(dist.irecv, recv_buffer, recv_from, mesh.get_group()))
         else:
             recv_buffer = torch.zeros_like(tensor)
         for op in dist.batch_isend_irecv(ops):
@@ -72,17 +68,13 @@ class CausalPassingFn(torch.autograd.Function):
         if ctx.send_to is not None:
             recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
             ops.append(
-                dist.P2POp(
-                    dist.irecv, recv_buffer, None, ctx.mesh.get_group(), 0, ctx.send_to
-                )
+                dist.P2POp(dist.irecv, recv_buffer, ctx.send_to, ctx.mesh.get_group())
             )
         else:
             recv_buffer = None
         if ctx.recv_from is not None:
             ops.append(
-                dist.P2POp(
-                    dist.isend, dtensor, None, ctx.mesh.get_group(), 0, ctx.recv_from
-                )
+                dist.P2POp(dist.isend, dtensor, ctx.recv_from, ctx.mesh.get_group())
             )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
