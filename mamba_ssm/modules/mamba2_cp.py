@@ -196,7 +196,7 @@ def scan(
         dim=-1,
     )
     A = -torch.exp(mamba2.A_log.float())  # (nheads) or (d_inner, d_state)
-    y, final_state = chunk_scan_combined_impl(
+    y = chunk_scan_combined_impl(
         rearrange(x, "b l (h p) -> b l h p", p=mamba2.headdim),
         dt,
         A,
@@ -213,12 +213,12 @@ def scan(
         dt_softplus=True,
         seq_idx=seq_idx,
         cu_seqlens=None,
-        return_final_states=True,
+        return_final_states=False,
         return_varlen_states=False,
         cp_mesh=cp_mesh,
     )
     y = rearrange(y, "b l h p -> b l (h p)")
-    return y, final_state
+    return y
 
 
 class _Mamba2Ref(Mamba2):
@@ -236,7 +236,7 @@ class _Mamba2Ref(Mamba2):
         z0, x0, z, xBC, dt = in_proj_split(u, self)
 
         xBC = conv(xBC, self, seq_idx)
-        y, _ = scan(
+        y = scan(
             mamba_chunk_scan_combined_non_cp, xBC, dt, z, self, seq_idx, cp_mesh=None
         )
 
@@ -261,7 +261,9 @@ class Mamba2CP(Mamba2):
         self.cp_mesh = cp_mesh
         super().__init__(*args, **kwargs)
 
-    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
+    def forward(
+        self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None
+    ):
         if seqlen is not None:
             raise NotImplementedError
         if seq_idx is not None:
