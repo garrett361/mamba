@@ -646,6 +646,10 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
+        if rank and initial_states is not None:
+            raise ValueError(
+                "CP implementation expects initial_states to be None on rank != 0"
+            )
         recv_init_states = None
         for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
             if rank == send_rank:
@@ -653,7 +657,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                     chunk_size=chunk_size,
                     states=states,
                     dA_cumsum=dA_cumsum,
-                    initial_states=initial_states,
+                    initial_states=recv_init_states,
                     seq_idx=seq_idx,
                     out_dtype=out_dtype,
                 )
