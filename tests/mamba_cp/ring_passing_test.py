@@ -118,28 +118,29 @@ if __name__ == "__main__":
     dist.init_process_group(
         backend="nccl", timeout=datetime.timedelta(seconds=30), device_id=device
     )
-    mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
-    final_states = torch.randn(1, 4096, device=device, dtype=torch.bfloat16)
-    recv_init_states = torch.empty_like(final_states)
-    if not rank:
-        print(f"{mesh=}", flush=True)
-    for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
+    try:
+        mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
+        final_states = torch.randn(1, 4096, device=device, dtype=torch.bfloat16)
+        recv_init_states = torch.empty_like(final_states)
         if not rank:
-            print(f"{send_rank=}, {recv_rank=}", flush=True)
-        if rank == send_rank:
-            dist.send(
-                final_states.contiguous(),
-                dst=recv_rank,
-                group=mesh.get_group(),
-            )
-        elif rank == recv_rank:
-            dist.recv(
-                recv_init_states,
-                src=send_rank,
-                group=mesh.get_group(),
-            )
-        dist.barrier()
-
-    print(f"[{rank=}]: {final_states=}")
+            print(f"{mesh=}", flush=True)
+        for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
+            if not rank:
+                print(f"{send_rank=}, {recv_rank=}", flush=True)
+            if rank == send_rank:
+                dist.send(
+                    final_states.contiguous(),
+                    dst=recv_rank,
+                    group=mesh.get_group(),
+                )
+            elif rank == recv_rank:
+                dist.recv(
+                    recv_init_states,
+                    src=send_rank,
+                    group=mesh.get_group(),
+                )
+            dist.barrier()
+    finally:
+        print(f"[{rank=}]: {final_states=}")
 
     dist.destroy_process_group()
