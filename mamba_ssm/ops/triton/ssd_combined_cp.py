@@ -646,9 +646,9 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank == cp_mesh.mesh[0] and initial_states is not None:
+        if rank != cp_mesh.mesh[0] and initial_states is not None:
             raise ValueError(
-                "CP implementation expects initial_states to be None on the first rank."
+                "initial_states can only be non-trival on the first CP rank."
             )
         recv_init_states = None
         for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
@@ -709,9 +709,9 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank and initial_states is not None:
+        if rank != cp_mesh.mesh[0] and initial_states is not None:
             raise ValueError(
-                "CP implementation expects dfinal_states to be None all ranks"
+                "initial_states can only be non-trival on the first CP rank."
             )
         recv_init_states = bwd_args
         reversed_mesh = cp_mesh.mesh.flip(0)
