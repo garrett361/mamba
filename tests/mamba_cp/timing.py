@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import functools
 import os
 from functools import partial
 from typing import Type
@@ -15,18 +16,27 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.block import Block
-from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba2_cp import Mamba2CP
 
 non_reentrant_wrapper = partial(
     checkpoint_wrapper,
     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
 )
+
+
+def get_wrapper(block):
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            block,
+        },
+    )
+
+    return auto_wrap_policy
 
 
 def get_mem_dict():
@@ -153,9 +163,10 @@ if __name__ == "__main__":
     model = MambaLMHeadModel(config=config, cp_mesh=mesh if args.cp else None)
     # I don't see why HYBRID_SHARD wouldn't be fine itself, but I'm OOM-ing with HYBRID_SHARD on
     # 8 GPUs.
+
     model = FSDP(
         model,
-        auto_wrap_policy=ModuleWrapPolicy([Mamba2, Mamba2CP]),
+        auto_wrap_policy=get_wrapper(Block),
         sharding_strategy=ShardingStrategy.HYBRID_SHARD
         if args.hsdp
         else ShardingStrategy.FULL_SHARD,
