@@ -626,6 +626,16 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 #### Start CP Impls ####
 
 
+def send(tensor: torch.Tensor, dst: int, group: dist.ProcessGroup):
+    # Hack replacement for dist.send, which is giving errors.
+    dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)])[0].wait()
+
+
+def recv(tensor: torch.Tensor, src: int, group: dist.ProcessGroup):
+    # Hack replacement for dist.recv, which is giving errors.
+    dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src, group)])[0].wait()
+
+
 class StatePassingSerialCP(_StatePassingImpl):
     """
     TODO: @goon - seq_idx probably not being treated correctly
@@ -662,14 +672,14 @@ class StatePassingSerialCP(_StatePassingImpl):
                     out_dtype=out_dtype,
                 )
 
-                dist.send(
+                send(
                     final_states.contiguous(),
                     dst=recv_rank,
                     group=cp_mesh.get_group(),
                 )
             elif rank == recv_rank:
                 recv_init_states = torch.empty_like(states[:, 0])
-                dist.recv(
+                recv(
                     recv_init_states,
                     src=send_rank,
                     group=cp_mesh.get_group(),
@@ -732,7 +742,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                         cp_mesh=cp_mesh,
                     )
                 )
-                dist.send(
+                send(
                     send_dinitial_states.contiguous(),
                     dst=recv_rank,
                     group=cp_mesh.get_group(),
@@ -741,7 +751,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 recv_dfinal_states = torch.empty(
                     *states[:, 0].shape, dtype=dstates_dtype, device=states.device
                 )
-                dist.recv(
+                recv(
                     recv_dfinal_states,
                     src=send_rank,
                     group=cp_mesh.get_group(),
