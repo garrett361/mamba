@@ -152,7 +152,6 @@ if __name__ == "__main__":
     model = MambaLMHeadModel(config=config, cp_mesh=mesh if args.cp else None)
     model = FSDP(
         model,
-        process_group=mesh.get_group(),
         auto_wrap_policy=ModuleWrapPolicy([Mamba2, Mamba2CP]),
         sharding_strategy=ShardingStrategy.HYBRID_SHARD,
         use_orig_params=True,
