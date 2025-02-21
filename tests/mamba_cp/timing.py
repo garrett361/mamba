@@ -120,6 +120,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cp", action="store_true")
     parser.add_argument("--mamba_only", action="store_true")
+    parser.add_argument("--hsdp", action="store_true")
     parser.add_argument("--no_ac", action="store_true")
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -150,11 +151,13 @@ if __name__ == "__main__":
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
 
     model = MambaLMHeadModel(config=config, cp_mesh=mesh if args.cp else None)
+    # I don't see why HYBRID_SHARD wouldn't be fine itself, but I'm OOM-ing with HYBRID_SHARD on
+    # 8 GPUs.
     model = FSDP(
         model,
         auto_wrap_policy=ModuleWrapPolicy([Mamba2, Mamba2CP]),
         sharding_strategy=ShardingStrategy.HYBRID_SHARD
-        if world_size > 8
+        if args.hsdp
         else ShardingStrategy.FULL_SHARD,
         use_orig_params=True,
         device_id=device,
