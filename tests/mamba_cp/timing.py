@@ -146,7 +146,7 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
-        backend="nccl", timeout=datetime.timedelta(seconds=30), device_id=device
+        backend="nccl", timeout=datetime.timedelta(seconds=60), device_id=device
     )
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
 
