@@ -123,7 +123,7 @@ class _StatePassingImpl(ABC):
                     assert cu_seqlens is not None, (
                         "cu_seqlens must be provided if return_varlen_states is True"
                     )
-                out, out_x, dt_out, dA_cumsum, states, final_states, *rest = (
+                out, out_x, _, _, _, final_states, *rest = (
                     _mamba_chunk_scan_combined_fwd_template(
                         cls,
                         x,
