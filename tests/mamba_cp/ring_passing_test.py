@@ -126,7 +126,6 @@ if __name__ == "__main__":
     for send_rank, recv_rank in zip(mesh.mesh[:-1], mesh.mesh[1:]):
         if not rank:
             print(f"{send_rank=}, {recv_rank=}")
-        print(f"{mesh=}")
         if rank == send_rank:
             dist.send(
                 final_states.contiguous(),
