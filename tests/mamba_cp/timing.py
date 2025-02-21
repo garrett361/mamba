@@ -168,6 +168,7 @@ if __name__ == "__main__":
         ),
     )
     if not args.no_ac:
+        print("Applying AC!")
         apply_fsdp_checkpointing(model)
     optim = torch.optim.AdamW(model.parameters(), lr=1e-7, foreach=False)
 
