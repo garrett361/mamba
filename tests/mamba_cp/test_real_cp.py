@@ -739,7 +739,7 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
             dist.barrier()
             tol = 1e-3
             _test_model_model_cp_grads_close(
-                model, model_cp_fsdp, atol=tol, rtol=tol, allreduce=False
+                model, model_cp_fsdp, atol=tol, rtol=tol, all_reduce=False
             )
 
 
@@ -812,7 +812,7 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
             dist.barrier()
             tol = 1e-3
             _test_model_model_cp_grads_close(
-                model, model_cp_fsdp, atol=tol, rtol=tol, allreduce=False
+                model, model_cp_fsdp, atol=tol, rtol=tol, all_reduce=False
             )
 
 
