@@ -68,13 +68,17 @@ class _StatePassingImpl(ABC):
     @abstractmethod
     def bwd(
         chunk_size: int,
-        states: torch.Tensor,
-        dA_chunk_cumsum: torch.Tensor,
-        dstates: torch.Tensor,
+        states: torch.Tensor,  # (batch, nchunks, nheads, headdim, d_state)
+        dA_chunk_cumsum: torch.Tensor,  # (batch, nheads, nchunks)
+        dstates: torch.Tensor,  # (batch, nchunks, nheads, headdim, d_state)
         dstates_dtype: torch.dtype,
         states_dtype: torch.dtype,
-        initial_states: Optional[torch.Tensor] = None,
-        dfinal_states: Optional[torch.Tensor] = None,
+        initial_states: Optional[
+            torch.Tensor
+        ] = None,  # Optional[(batch, nheads, headdim, d_state)]
+        dfinal_states: Optional[
+            torch.Tensor
+        ] = None,  # Optional[(batch, nheads, headdim, d_state)]
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
         bwd_args: Optional[Any] = None,
@@ -723,6 +727,10 @@ class StatePassingSerialCP(_StatePassingImpl):
             raise ValueError(
                 "initial_states can only be non-trival on the first CP rank."
             )
+        if rank != cp_mesh.mesh[-1] and dfinal_states is not None:
+            raise ValueError(
+                "dfinal_states can only be non-trival on the final CP rank."
+            )
         recv_init_states = bwd_args
         reversed_mesh = cp_mesh.mesh.flip(0)
         recv_dfinal_states = None
@@ -799,7 +807,11 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
         """
-        Serially compute the final state on each rank and pass as initial_states to the next.
+        1. Every rank completes its _state_passing_fwd with initial_sates = None.
+        2. final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+        3. The above data can be passed through _state_passing_fwd again to get the corrected
+           initial_states that each rank should have started with.
+        4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
@@ -857,12 +869,12 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         ).contiguous()
 
         # Build the initial states that each rank should have started with.
-        # TODO: @goon - remove unnecessary compute
+        # TODO: @goon - remove unnecessary compute and/or write a more focused kernel for this step.
         initial_states_corrected, _, _ = StatePassingNonCP.fwd(
             chunk_size=cp_mesh.size(),
             states=final_states_partial_allgather,
             dA_chunk_cumsum=dA_chunk_sum_allgather,
-            initial_states=None,
+            initial_states=initial_states,
             seq_idx=seq_idx,
             out_dtype=out_dtype,
         )
@@ -879,7 +891,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             out_dtype=out_dtype,
         )
 
-        bwd_args = None
+        bwd_args = (initial_states_corrected_this_rank, dA_chunk_sum_allgather)
         # TODO: @goon -  return correct final states
         return states, final_states, bwd_args
 
@@ -898,8 +910,12 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         bwd_args: Optional[Any] = None,
     ):
         """
-        Starting from the final rank to compute in _state_passing_serial_cp_fwd, compute
-        dinitial_states and pass these back as the dfinal_states of the preceding rank.
+        1. Every rank completes its _state_passing_bwd with dfinal_states = None (except maybe on
+            the final cp rank) and with the corrected initial_states from the forward.
+        2. Allgather dfinal_states and use these to compute what the proper dfinal_states should
+        have been on each rank
+        3. Every rank recomputes its _state_passing_bwd with the proper {dfinal,initial}_states
+        values.
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
@@ -907,59 +923,79 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             raise ValueError(
                 "initial_states can only be non-trival on the first CP rank."
             )
-        recv_init_states = bwd_args
-        reversed_mesh = cp_mesh.mesh.flip(0)
-        recv_dfinal_states = None
-        for send_rank, recv_rank in zip(reversed_mesh[:-1], reversed_mesh[1:]):
-            if rank == send_rank:
-                dstates, ddA_chunk_cumsum, send_dinitial_states, states = (
-                    StatePassingNonCP.bwd(
-                        chunk_size=chunk_size,
-                        states=states,
-                        dA_chunk_cumsum=dA_chunk_cumsum,
-                        dstates=dstates,
-                        initial_states=recv_init_states,
-                        dfinal_states=recv_dfinal_states,
-                        seq_idx=seq_idx,
-                        dstates_dtype=dstates_dtype,
-                        states_dtype=states_dtype,
-                        cp_mesh=cp_mesh,
-                    )
-                )
-                send(
-                    send_dinitial_states.contiguous(),
-                    dst=recv_rank,
-                    group=cp_mesh.get_group(),
-                )
-            elif rank == recv_rank:
-                recv_dfinal_states = torch.empty(
-                    *states[:, 0].shape, dtype=dstates_dtype, device=states.device
-                )
-                recv(
-                    recv_dfinal_states,
-                    src=send_rank,
-                    group=cp_mesh.get_group(),
-                )
-
-            dist.barrier()
-
-        if rank == recv_rank:
-            # First rank only:
-            dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
-                chunk_size=chunk_size,
-                states=states,
-                dA_chunk_cumsum=dA_chunk_cumsum,
-                dstates=dstates,
-                initial_states=initial_states,  # Gets the original initial_states, if any
-                dfinal_states=recv_dfinal_states,
-                seq_idx=seq_idx,
-                dstates_dtype=dstates_dtype,
-                states_dtype=states_dtype,
-                cp_mesh=cp_mesh,
+        if rank != cp_mesh.mesh[-1] and dfinal_states is not None:
+            raise ValueError(
+                "dfinal_states can only be non-trival on the final CP rank."
             )
-        else:
-            # Only the first rank potentially had non-trivial initial_states as proper inputs, so
-            # all other ranks get dinitial_state = None.
+
+        assert bwd_args is not None
+        initial_states_corrected_this_rank, dA_chunk_sum_allgather = bwd_args
+
+        _, _, dinitial_states_partial, _ = StatePassingNonCP.bwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            dstates=dstates,
+            initial_states=initial_states_corrected_this_rank,
+            dfinal_states=dfinal_states,
+            seq_idx=seq_idx,
+            dstates_dtype=dstates_dtype,
+            states_dtype=states_dtype,
+            cp_mesh=cp_mesh,
+        )
+
+        dinitial_states_partial_allgather = torch.empty(
+            cp_mesh.size(),
+            *dinitial_states_partial.shape,
+            device=dinitial_states_partial.device,
+            dtype=dinitial_states_partial.dtype,
+        )
+        dist.all_gather_into_tensor(
+            dinitial_states_partial_allgather,
+            dinitial_states_partial.contiguous(),
+            group=cp_mesh.get_group(),
+            async_op=False,
+        )
+        dinitial_states_partial_allgather = rearrange(
+            dinitial_states_partial_allgather, "r b ... -> b r ... "
+        ).contiguous()
+
+        # TODO: @goon - remove unnecessary compute and/or write a more focused kernel for this step.
+        dfinal_states_corrected, _, _, _ = StatePassingNonCP.bwd(
+            chunk_size=chunk_size,
+            states=torch.empty_like(
+                dinitial_states_partial_allgather
+            ),  # Not used, but can't be None
+            dA_chunk_cumsum=dA_chunk_sum_allgather,
+            dstates=dinitial_states_partial_allgather,
+            initial_states=initial_states_corrected_this_rank,
+            dfinal_states=dfinal_states,
+            seq_idx=seq_idx,
+            dstates_dtype=dstates_dtype,
+            states_dtype=states_dtype,
+            cp_mesh=cp_mesh,
+        )
+        dfinal_states_corrected_this_rank = dfinal_states_corrected[
+            :, cp_mesh.get_rank()
+        ]
+
+        dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            dstates=dstates,
+            initial_states=initial_states_corrected_this_rank,
+            dfinal_states=dfinal_states_corrected_this_rank,
+            seq_idx=seq_idx,
+            dstates_dtype=dstates_dtype,
+            states_dtype=states_dtype,
+            cp_mesh=cp_mesh,
+        )
+
+        # Only the first rank potentially had non-trivial initial_states as proper inputs, so
+        # all other ranks get dinitial_state = None. The first rank also has None derivatives if
+        # its initial_states arg was trivial.
+        if rank != cp_mesh.mesh[0] or initial_states is None:
             dinitial_states = None
         return dstates, ddA_chunk_cumsum, dinitial_states, states
 

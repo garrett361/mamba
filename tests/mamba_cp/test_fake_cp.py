@@ -392,15 +392,15 @@ class TestLocalCP(_TestBase):
             dinitstates_cp_list.append(dinitstates_cp)
 
         # Simulate all-gathering the dinitstates and summed dA_chunk_cumsum_cp per rank.
-        dinitstates_cp = torch.stack(dinitstates_cp_list, dim=1)
+        dinitstates_allgather = torch.stack(dinitstates_cp_list, dim=1)
         # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
         dA_chunk_sum_allgather = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2)
 
         # Run another backwards to turn the dinitstates into the correct dfinal_states for each rank
         dfinal_states_cp, *_ = _state_passing_bwd(
-            torch.empty_like(dinitstates_cp),  # Not used, but can't be None
+            torch.empty_like(dinitstates_allgather),  # Not used, but can't be None
             dA_chunk_sum_allgather,
-            dinitstates_cp,
+            dinitstates_allgather,
             dfinal_states=None,
             has_initial_states=True,
             dstates_dtype=states.dtype,

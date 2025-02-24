@@ -477,7 +477,7 @@ class TestAllGatherCP(_DTestModelBase):
             outputs_cp_all_gathered, "r b l ... -> b (r l) ..."
         )
         tol = 1e-3
-        # torch.testing.assert_close(outputs, outputs_cp_all_gathered, atol=tol, rtol=tol)
+        torch.testing.assert_close(outputs, outputs_cp_all_gathered, atol=tol, rtol=tol)
 
     def test_bwd(self):
         torch.manual_seed(42)
@@ -497,7 +497,9 @@ class TestAllGatherCP(_DTestModelBase):
 
         # And on the CP output:
         kwargs_cp = self.get_scan_kwargs(inputs_cp, mamba2_cp)
-        outputs_cp = mamba_chunk_scan_combined_serial_cp(cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = mamba_chunk_scan_combined_allgather_cp(
+            cp_mesh=cp_mesh, **kwargs_cp
+        )
         outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
