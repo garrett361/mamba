@@ -30,6 +30,36 @@ from mamba_ssm.ops.triton.ssd_combined_cp import (
 )
 
 
+def _test_model_model_cp_grads_close(
+    model: nn.Module,
+    model2: nn.Module,
+    atol: Optional[float] = None,
+    rtol: Optional[float] = None,
+    all_reduce: bool = True,
+) -> None:
+    grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    grads_cp = {
+        n: deepcopy(p.grad) for n, p in model.named_parameters() if p.grad is not None
+    }
+    if all_reduce:
+        for g in grads_cp.values():
+            dist.all_reduce(g)
+    dist.barrier()
+    assert set(grads) == set(grads_cp)
+    fails = {}
+    for n, g_cp in grads_cp.items():
+        g = grads[n]
+        try:
+            torch.testing.assert_close(g, g_cp, atol=atol, rtol=rtol)
+        except Exception as e:
+            fails[n] = e
+    if fails:
+        for n, err in fails.items():
+            print(f"FAILED on parameter {n}")
+            print(err)
+        raise RuntimeError
+
+
 class TestCausalPassingFn(DTest):
     def test_fwd(self):
         torch.manual_seed(42)
@@ -436,23 +466,7 @@ class TestSerialCP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in mamba2.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in mamba2_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
-        assert set(grads) == set(grads_cp)
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(mamba2, mamba2_cp, atol=tol, rtol=tol)
 
 
 class TestAllGatherCP(_DTestModelBase):
@@ -520,23 +534,7 @@ class TestAllGatherCP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in mamba2.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in mamba2_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
-        assert set(grads) == set(grads_cp)
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(mamba2, mamba2_cp, atol=tol, rtol=tol)
 
 
 class TestMamba2CPSerial(_DTestModelBase):
@@ -577,24 +575,8 @@ class TestMamba2CPSerial(_DTestModelBase):
         torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in mamba2.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in mamba2_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
-        assert set(grads) == set(grads_cp)
         tol = 1e-3
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(mamba2, mamba2_cp, atol=tol, rtol=tol)
 
 
 class TestMamba2CPAllGather(_DTestModelBase):
@@ -635,24 +617,8 @@ class TestMamba2CPAllGather(_DTestModelBase):
         torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in mamba2.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in mamba2_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()  # Apparently needed for correctness if running the test under a debugger.
-        assert set(grads) == set(grads_cp)
         tol = 1e-3
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(mamba2, mamba2_cp, atol=tol, rtol=tol)
 
 
 class TestMHACP(_DTestModelBase):
@@ -698,24 +664,8 @@ class TestMHACP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in mha.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in mha_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()
-        assert set(grads) == set(grads_cp)
         tol = 1e-1
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(mha, mha_cp, atol=tol, rtol=tol)
 
 
 class TestFSDP1MambaCPSerial(_DTestModelBase):
@@ -768,7 +718,7 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
         # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
         # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
         # 2) Scale up the loss by a factor of the DP world size
-        # Note that 2) is also automatically handled if the loss function scales by the world size,
+        # The latter is also automatically handled if the loss function scales by the world size,
         # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
         # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
         #
@@ -785,24 +735,10 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
             dist.barrier()
-            grads = {
-                n: deepcopy(p.grad)
-                for n, p in model.named_parameters()
-                if p.grad is not None
-            }
-            grads_cp_fsdp = {
-                n: deepcopy(p.grad)
-                for n, p in model_cp_fsdp.named_parameters()
-                if p.grad is not None
-            }
             tol = 1e-3
-            for n, g_cp_fsdp in grads_cp_fsdp.items():
-                g = grads[n]
-                try:
-                    torch.testing.assert_close(g, g_cp_fsdp, atol=tol, rtol=tol)
-                except Exception as e:
-                    print(f"Failed on {n}")
-                    raise e
+            _test_model_model_cp_grads_close(
+                model, model_cp_fsdp, atol=tol, rtol=tol, allreduce=False
+            )
 
 
 class TestFSDP1MambaCPAllGather(_DTestModelBase):
@@ -855,7 +791,7 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
         # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
         # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
         # 2) Scale up the loss by a factor of the DP world size
-        # Note that 2) is also automatically handled if the loss function scales by the world size,
+        # The latter is also automatically handled if the loss function scales by the world size,
         # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
         # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
         #
@@ -872,24 +808,10 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
             dist.barrier()
-            grads = {
-                n: deepcopy(p.grad)
-                for n, p in model.named_parameters()
-                if p.grad is not None
-            }
-            grads_cp_fsdp = {
-                n: deepcopy(p.grad)
-                for n, p in model_cp_fsdp.named_parameters()
-                if p.grad is not None
-            }
             tol = 1e-3
-            for n, g_cp_fsdp in grads_cp_fsdp.items():
-                g = grads[n]
-                try:
-                    torch.testing.assert_close(g, g_cp_fsdp, atol=tol, rtol=tol)
-                except Exception as e:
-                    print(f"Failed on {n}")
-                    raise e
+            _test_model_model_cp_grads_close(
+                model, model_cp_fsdp, atol=tol, rtol=tol, allreduce=False
+            )
 
 
 class TestModelSerial(_DTestModelBase):
@@ -929,24 +851,8 @@ class TestModelSerial(_DTestModelBase):
         outputs_cp.sum().backward()
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in model_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()
-        assert set(grads) == set(grads_cp)
         tol = 1e-1
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(model, model_cp, atol=tol, rtol=tol)
 
 
 class TestModelAllGather(_DTestModelBase):
@@ -986,21 +892,5 @@ class TestModelAllGather(_DTestModelBase):
         outputs_cp.sum().backward()
 
         # Parameter grads should match after all-reducing.
-        grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
-        grads_cp = {
-            n: deepcopy(p.grad)
-            for n, p in model_cp.named_parameters()
-            if p.grad is not None
-        }
-        for g in grads_cp.values():
-            dist.all_reduce(g)
-        dist.barrier()
-        assert set(grads) == set(grads_cp)
         tol = 1e-1
-        for n, g_cp in grads_cp.items():
-            g = grads[n]
-            try:
-                torch.testing.assert_close(g, g_cp, atol=tol, rtol=tol)
-            except Exception as e:
-                print(f"Failed on {n}")
-                raise e
+        _test_model_model_cp_grads_close(model, model_cp, atol=tol, rtol=tol)
