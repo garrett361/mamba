@@ -249,6 +249,13 @@ class _Mamba2Ref(Mamba2):
 
 
 class Mamba2CP(Mamba2):
+    """
+    NOTE: @goon - currently we expect an external mechanism to all-reduce the grads which get
+    populated on Mamba2CP instances. This is handled automatically if the model is wrapped in
+    FSDP, but not otherwise. Need to raise a warning or offer some flag for enabling the all-reduce
+    in other cases.
+    """
+
     def __init__(self, *args, cp_mesh: dist.device_mesh.DeviceMesh, **kwargs) -> None:
         self.cp_mesh = cp_mesh
         super().__init__(*args, **kwargs)
@@ -294,6 +301,13 @@ class Mamba2CP(Mamba2):
 
 
 class MHACP(MHA):
+    """
+    NOTE: @goon - currently we expect an external mechanism to all-reduce the grads which get
+    populated on Mamba2CP instances. This is handled automatically if the model is wrapped in
+    FSDP, but not otherwise. Need to raise a warning or offer some flag for enabling the all-reduce
+    in other cases.
+    """
+
     def __init__(self, *args, cp_mesh: dist.device_mesh.DeviceMesh, **kwargs) -> None:
         if cp_mesh.ndim != 1:
             raise ValueError("Only supports 1D DeviceMesh instances.")
