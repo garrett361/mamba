@@ -129,17 +129,18 @@ bamba_9dot8b_defaults = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cp", action="store_true")
+    parser.add_argument("--cp_impl", type=str, default="allgather")
     parser.add_argument("--mamba_only", action="store_true")
     parser.add_argument("--hsdp", action="store_true")
     parser.add_argument("--no_ac", action="store_true")
-    parser.add_argument("--warmups", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--warmups", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_layer", type=int, default=bamba_9dot8b_defaults["n_layer"])
     args = parser.parse_args()
 
-    cli_args = {"n_layer": args.n_layer}
+    cli_args = {"n_layer": args.n_layer, "cp_impl": args.cp_impl if args.cp else None}
     if args.mamba_only:
         cli_args["attn_layer_idx"] = []
     config = MambaConfig(**{**bamba_9dot8b_defaults, **cli_args})
@@ -160,16 +161,16 @@ if __name__ == "__main__":
     )
     mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
 
-    model = MambaLMHeadModel(config=config, cp_mesh=mesh if args.cp else None)
-    # I don't see why HYBRID_SHARD wouldn't be fine itself, but I'm OOM-ing with HYBRID_SHARD on
-    # 8 GPUs.
+    model = MambaLMHeadModel(
+        config=config,
+        cp_mesh=mesh if args.cp else None,
+        cp_impl=args.cp_impl if args.cp else None,
+    )
 
     model = FSDP(
         model,
         auto_wrap_policy=get_wrapper(Block),
-        sharding_strategy=ShardingStrategy.HYBRID_SHARD
-        if args.hsdp
-        else ShardingStrategy.FULL_SHARD,
+        sharding_strategy=ShardingStrategy.HYBRID_SHARD,
         use_orig_params=True,
         device_id=device,
         mixed_precision=MixedPrecision(
