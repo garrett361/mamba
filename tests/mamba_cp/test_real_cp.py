@@ -32,18 +32,20 @@ from mamba_ssm.ops.triton.ssd_combined_cp import (
 
 def _test_model_model_cp_grads_close(
     model: nn.Module,
-    model2: nn.Module,
+    model_cp: nn.Module,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
     all_reduce: bool = True,
 ) -> None:
     grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
     grads_cp = {
-        n: deepcopy(p.grad) for n, p in model.named_parameters() if p.grad is not None
+        n: deepcopy(p.grad)
+        for n, p in model_cp.named_parameters()
+        if p.grad is not None
     }
     if all_reduce:
-        for g in grads_cp.values():
-            dist.all_reduce(g)
+        for g_cp in grads_cp.values():
+            dist.all_reduce(g_cp)
     dist.barrier()
     assert set(grads) == set(grads_cp)
     fails = {}
@@ -54,10 +56,13 @@ def _test_model_model_cp_grads_close(
         except Exception as e:
             fails[n] = e
     if fails:
+        err_msg = []
         for n, err in fails.items():
-            print(f"FAILED on parameter {n}")
-            print(err)
-        raise RuntimeError
+            err_msg.append("\n***************")
+            err_msg.append(f"FAILED on parameter {n}")
+            err_msg.append(str(err))
+            err_msg.append("***************\n")
+        raise RuntimeError("\n".join(err_msg))
 
 
 class TestCausalPassingFn(DTest):
