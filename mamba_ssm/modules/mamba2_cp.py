@@ -271,7 +271,7 @@ class Mamba2CP(Mamba2):
     ) -> None:
         self.cp_mesh = cp_mesh
         self.cp_impl = cp_impl or "allgather"
-        self.cp_impl_fn = CP_IMPLS[cp_impl]
+        self.cp_impl_fn = CP_IMPLS[self.cp_impl]
         super().__init__(*args, **kwargs)
 
     def forward(
