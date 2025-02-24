@@ -139,11 +139,11 @@ class TestLocalCP(_TestBase):
 
         outputs = conv(xBC, self.get_mamba2())
         outputs_cp_list: list[torch.Tensor] = []
-        for cp_rank in range(self.cp_dim):
+        for rank_cp in range(self.cp_dim):
             cp_out = conv(
-                xBC_cp[..., cp_rank],
+                xBC_cp[..., rank_cp],
                 mamba2=self.get_mamba2(),
-                conv_state=xBC_cp_conv_states[..., cp_rank],
+                conv_state=xBC_cp_conv_states[..., rank_cp],
             )
             outputs_cp_list.append(cp_out)
         outputs_cp = torch.cat(outputs_cp_list, dim=1)
@@ -165,13 +165,13 @@ class TestLocalCP(_TestBase):
         outputs = conv(xBC, mamba2)
         outputs.sum().backward()
 
-        for cp_rank in range(self.cp_dim):
+        for rank_cp in range(self.cp_dim):
             cp_out = conv(
-                xBC_cp[..., cp_rank],
+                xBC_cp[..., rank_cp],
                 mamba2=mamba2_cp,
                 conv_state=None
-                if not cp_rank
-                else xBC_cp_conv_states[..., cp_rank - 1],
+                if not rank_cp
+                else xBC_cp_conv_states[..., rank_cp - 1],
             )
             cp_out.sum().backward()
         for p1, p2 in zip(mamba2.parameters(), mamba2_cp.parameters()):
@@ -208,10 +208,10 @@ class TestLocalCP(_TestBase):
         initial_states = None
         # Step through ranks serially, one passing their final states as the initial states of the
         # next rank.
-        for cp_rank in range(self.cp_dim):
+        for rank_cp in range(self.cp_dim):
             out_cp, initial_states = _state_passing_fwd(
-                states_cp[..., cp_rank],
-                dA_chunk_cumsum_cp[..., cp_rank],
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
                 initial_states,
             )
             out_cp_list.append(out_cp)
@@ -259,11 +259,11 @@ class TestLocalCP(_TestBase):
         dfinal_states = None
         # Step through ranks serially in reversed order, one passing their dinitstates as the
         # dfinal_states of the preceding rank.
-        for cp_rank in reversed(range(self.cp_dim)):
+        for rank_cp in reversed(range(self.cp_dim)):
             dstates_cp, ddA_chunk_cumsum_cp, dfinal_states, _ = _state_passing_bwd(
-                states_cp[..., cp_rank],
-                dA_chunk_cumsum_cp[..., cp_rank],
-                dout_cp[..., cp_rank],
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+                dout_cp[..., rank_cp],
                 dfinal_states=dfinal_states,
                 has_initial_states=True,
                 dstates_dtype=states.dtype,
@@ -284,7 +284,8 @@ class TestLocalCP(_TestBase):
     def test_chunked_state_passing_allgather_fwd(self) -> None:
         """
         Simulated CP with more parallelized state_passing step:
-        - Every rank completes its _state_passing_fwd with initial_sates = None.
+        - Every rank completes its _state_passing_fwd with initial_sates = None to get its
+          final_state
         - final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
         - The above data can be passed through _state_passing_fwd again to get the corrected
           initial_states on each rank.
@@ -304,7 +305,7 @@ class TestLocalCP(_TestBase):
         )
 
         # Ground truth
-        out, final_state = _state_passing_fwd(states, dA_chunk_cumsum)
+        out, _ = _state_passing_fwd(states, dA_chunk_cumsum)
 
         # Compute the states local to each rank (trivial initial_states)
         final_state_cp_list = []
@@ -315,7 +316,7 @@ class TestLocalCP(_TestBase):
             )
             final_state_cp_list.append(final_state_cp)
 
-        # Simulate all-gathering the final states summed dA_chunk_cumsum_cp per rank.
+        # Simulate all-gathering the final states and summed dA_chunk_cumsum_cp per rank.
         final_states_allgather = torch.stack(final_state_cp_list, dim=1)
         # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
         dA_chunk_sum_allgather = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2)
@@ -340,6 +341,93 @@ class TestLocalCP(_TestBase):
         out_cp = torch.stack(out_cp_list, dim=-1)
         out_cp = rearrange(out_cp, "b c h p r -> b (r c) h p")
 
-        # Again needs high tolerance to fully pass.
-        tol = 1e-1
+        tol = 1e-3
         torch.testing.assert_close(out, out_cp, atol=tol, rtol=tol)
+
+    def test_chunked_state_passing_allgather_bwd(self) -> None:
+        """
+        Simulated CP with more parallelized state_passing step:
+        - Every rank completes its _state_passing_bwd with dfinal_states = None to get its
+          dinitial_state
+        - dinitial_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+        - The above data can be passed through _state_passing_fwd again to get the corrected
+          dfinal_states on each rank.
+        - Finally, every rank computes its _state_passing_bwd again, now with its proper
+          dfinal_states
+        NOTE: omits the d_state dim
+        """
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        dout = torch.randn_like(states)
+
+        # Shard
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+        )
+
+        # Ground truth
+        dstates, ddA_chunk_cumsum, *_ = _state_passing_bwd(
+            states,
+            dA_chunk_cumsum,
+            dout,
+            dfinal_states=None,
+            has_initial_states=True,
+            dstates_dtype=states.dtype,
+            states_dtype=states.dtype,
+        )
+
+        # Run the backwards with only local data (i.e. with the incorrect dfinal_states = None)
+        dinitstates_cp_list = []
+        for rank_cp in range(self.cp_dim):
+            _, _, dinitstates_cp, *_ = _state_passing_bwd(
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+                dout_cp[..., rank_cp],
+                dfinal_states=None,
+                has_initial_states=True,
+                dstates_dtype=states.dtype,
+                states_dtype=states.dtype,
+            )
+            dinitstates_cp_list.append(dinitstates_cp)
+
+        # Simulate all-gathering the dinitstates and summed dA_chunk_cumsum_cp per rank.
+        dinitstates_cp = torch.stack(dinitstates_cp_list, dim=1)
+        # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
+        dA_chunk_sum_allgather = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2)
+
+        # Run another backwards to turn the dinitstates into the correct dfinal_states for each rank
+        dfinal_states_cp, *_ = _state_passing_bwd(
+            torch.empty_like(dinitstates_cp),  # Not used, but can't be None
+            dA_chunk_sum_allgather,
+            dinitstates_cp,
+            dfinal_states=None,
+            has_initial_states=True,
+            dstates_dtype=states.dtype,
+            states_dtype=states.dtype,
+        )
+        dfinal_states_cp = rearrange(dfinal_states_cp, "b r h p -> b h p r")
+
+        # Then recompute derivatives with the now-known dfinal_states states.
+        dstates_cp_list = []
+        ddA_chunk_cumsum_cp_list = []
+        for rank_cp in range(self.cp_dim):
+            dstates_cp, ddA_chunk_cumsum_cp, *_ = _state_passing_bwd(
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+                dout_cp[..., rank_cp],
+                dfinal_states=dfinal_states_cp[..., rank_cp],
+                has_initial_states=True,
+                dstates_dtype=states.dtype,
+                states_dtype=states.dtype,
+            )
+            dstates_cp_list.append(dstates_cp)
+            ddA_chunk_cumsum_cp_list.append(ddA_chunk_cumsum_cp)
+
+        dstates_cp = torch.cat(dstates_cp_list, dim=1)
+        ddA_chunk_cumsum_cp = torch.cat(ddA_chunk_cumsum_cp_list, dim=2)
+        tol = 1e-3
+        torch.testing.assert_close(dstates, dstates_cp, atol=tol, rtol=tol)
+        torch.testing.assert_close(
+            ddA_chunk_cumsum, ddA_chunk_cumsum_cp, atol=tol, rtol=tol
+        )
