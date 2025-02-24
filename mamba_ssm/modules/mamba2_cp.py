@@ -10,7 +10,13 @@ from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_non_cp,
     mamba_chunk_scan_combined_serial_cp,
+    mamba_chunk_scan_combined_allgather_cp,
 )
+
+CP_IMPLS = {
+    "serial": mamba_chunk_scan_combined_serial_cp,
+    "allgather": mamba_chunk_scan_combined_allgather_cp,
+}
 
 
 try:
@@ -256,8 +262,16 @@ class Mamba2CP(Mamba2):
     in other cases.
     """
 
-    def __init__(self, *args, cp_mesh: dist.device_mesh.DeviceMesh, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        cp_mesh: dist.device_mesh.DeviceMesh,
+        cp_impl: Optional[str] = None,
+        **kwargs,
+    ) -> None:
         self.cp_mesh = cp_mesh
+        self.cp_impl = cp_impl or "allgather"
+        self.cp_impl_fn = CP_IMPLS[cp_impl]
         super().__init__(*args, **kwargs)
 
     def forward(
@@ -275,7 +289,7 @@ class Mamba2CP(Mamba2):
 
         xBC = conv_cp(xBC, self, self.cp_mesh, seq_idx)
         y = scan(
-            mamba_chunk_scan_combined_serial_cp,
+            self.cp_impl_fn,
             xBC,
             dt,
             z,
