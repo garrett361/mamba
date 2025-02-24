@@ -826,7 +826,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
         # Compute the partial states with the locally available information. I.e. use trivial
         # initial_states on all but, maybe, the lead rank.
-        states_partial, final_states_partial, _ = StatePassingNonCP.fwd(
+        _, final_states_partial, _ = StatePassingNonCP.fwd(
             chunk_size=chunk_size,
             states=states,
             dA_chunk_cumsum=dA_chunk_cumsum,
@@ -855,7 +855,9 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         dA_chunk_sum_allgather = rearrange(
             dA_chunk_sum_allgather, "r ... -> ... r"
         ).contiguous()
+
         # Build the initial states that each rank should have started with.
+        # TODO: @goon - remove unnecessary compute
         initial_states_corrected, _, _ = StatePassingNonCP.fwd(
             chunk_size=cp_mesh.size(),
             states=final_states_partial_allgather,
@@ -867,19 +869,19 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         initial_states_corrected_this_rank = initial_states_corrected[
             :, cp_mesh.get_rank()
         ]
-        dA_chunk_cumsum = dA_chunk_cumsum.roll(1, dims=2)
-        dA_chunk_cumsum[:, :, 0] = 0.0
-        dA_chunk_cumsum = dA_chunk_cumsum.cumsum(dim=2).exp()
-        states_correction = torch.einsum(
-            "bhpd,bhc->bchpd",
-            initial_states_corrected_this_rank,
-            dA_chunk_cumsum,
+
+        states, final_states, _ = StatePassingNonCP.fwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            initial_states=initial_states_corrected_this_rank,
+            seq_idx=seq_idx,
+            out_dtype=out_dtype,
         )
-        states = states_partial + states_correction
 
         bwd_args = None
         # TODO: @goon -  return correct final states
-        return states, final_states_partial, bwd_args
+        return states, final_states, bwd_args
 
     @staticmethod
     def bwd(
