@@ -5,7 +5,10 @@ from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import conv, _Mamba2Ref
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
+from mamba_ssm.ops.triton.ssd_state_passing import (
+    _state_passing_fwd,
+    _state_passing_bwd,
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -30,7 +33,9 @@ class _TestBase:
     d_conv = 4
     d_inner = expand * d_model
     d_ssm = d_inner
-    dtype = torch.bfloat16
+    dtype = (
+        torch.float32
+    )  # Important: makes verifying correctness much easier than bfloat16
     device = "cuda"
     factory_kwargs = {"device": device, "dtype": dtype}
     model_kwargs = {
@@ -190,26 +195,91 @@ class TestLocalCP(_TestBase):
         torch.manual_seed(42)
         states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
 
-        # Shard and create the conv states
+        # Shard
         states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
         dA_chunk_cumsum_cp = rearrange(
             dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
         )
 
+        # Ground truth
         out, final_state = _state_passing_fwd(states, dA_chunk_cumsum)
 
         out_cp_list = []
         initial_states = None
+        # Step through ranks serially, one passing their final states as the initial states of the
+        # next rank.
         for cp_rank in range(self.cp_dim):
-            cp_out, initial_states = _state_passing_fwd(
+            out_cp, initial_states = _state_passing_fwd(
                 states_cp[..., cp_rank],
                 dA_chunk_cumsum_cp[..., cp_rank],
                 initial_states,
             )
-            out_cp_list.append(cp_out)
+            out_cp_list.append(out_cp)
         out_cp = torch.cat(out_cp_list, dim=1)
         torch.testing.assert_close(out, out_cp)
         torch.testing.assert_close(final_state, initial_states)
+
+    def test_chunked_state_passing_sequential_bwd(self) -> None:
+        """
+        Simulated CP with serial state_passing step:
+        - Rank 0 completes its state_passing with initial_sates = None, then passes final_state to
+          Rank 1.
+        - Rank 1 completes its state_passing using the received final_state as its initial_state,
+          and passes the new final_state to Rank 2
+        - ...
+        - The last rank completes its state_passing using the received final_state as its
+          initial_state.
+
+        NOTE: omits the d_state dim
+        """
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        dout = torch.randn_like(states)
+
+        # Shard
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+        )
+
+        # Ground truth
+        dstates, ddA_chunk_cumsum, *_ = _state_passing_bwd(
+            states,
+            dA_chunk_cumsum,
+            dout,
+            dfinal_states=None,
+            has_initial_states=True,
+            dstates_dtype=states.dtype,
+            states_dtype=states.dtype,
+        )
+
+        dstates_cp_list = []
+        ddA_chunk_cumsum_cp_list = []
+        dfinal_states = None
+        # Step through ranks serially in reversed order, one passing their dinitstates as the
+        # dfinal_states of the preceding rank.
+        for cp_rank in reversed(range(self.cp_dim)):
+            dstates_cp, ddA_chunk_cumsum_cp, dfinal_states, _ = _state_passing_bwd(
+                states_cp[..., cp_rank],
+                dA_chunk_cumsum_cp[..., cp_rank],
+                dout_cp[..., cp_rank],
+                dfinal_states=dfinal_states,
+                has_initial_states=True,
+                dstates_dtype=states.dtype,
+                states_dtype=states.dtype,
+            )
+            dstates_cp_list.append(dstates_cp)
+            ddA_chunk_cumsum_cp_list.append(ddA_chunk_cumsum_cp)
+        dstates_cp = torch.cat(list(reversed(dstates_cp_list)), dim=1)
+        ddA_chunk_cumsum_cp = torch.cat(
+            list(reversed(ddA_chunk_cumsum_cp_list)), dim=-1
+        )
+        tol = 1e-3
+        torch.testing.assert_close(dstates, dstates_cp)
+        torch.testing.assert_close(
+            ddA_chunk_cumsum, ddA_chunk_cumsum_cp, atol=tol, rtol=tol
+        )
 
     def test_chunked_state_passing_allgather_fwd(self) -> None:
         """
