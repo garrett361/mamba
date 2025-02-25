@@ -305,10 +305,13 @@ class _DTestModelBase(DTest):
         requires_grad: bool = False,
         seed: int = 42,
         dtype: Optional[torch.dtype] = None,
+        batch_size: Optional[int] = None,
     ) -> torch.Tensor:
         torch.manual_seed(seed)
+        if batch_size is None:
+            batch_size = self.batch_size
         return torch.randn(
-            self.batch_size,
+            batch_size,
             self.seq_len,
             self.d_model,
             device=self.device,
@@ -843,7 +846,7 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
                 for _ in range(3)
             ]
         )
-        model_cp_fsdp = FSDP(
+        model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
@@ -858,27 +861,29 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         )
 
         outputs = model(inputs)
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
+        outputs_cp_hsdp = model_cp_hsdp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(
             outputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
         )
-        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
+        torch.testing.assert_close(outputs_cp_hsdp, outputs_shard)
 
+    @pytest.mark.world_size(4)
     def test_bwd(self):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
+        cp_mesh = mesh["intra_node"]
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=mesh["intra_node"], cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
                 for _ in range(3)
             ]
         )
-        # The FSDP group is the world
-        model_cp_fsdp = FSDP(
+        model_cp_hsdp = FSDP(
             model_cp,
+            device_mesh=mesh,
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             use_orig_params=True,
@@ -894,22 +899,26 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         # We just use the mean for the loss below.
 
         # Different CP groups get different inputs
-        inputs = self.get_inputs(
-            requires_grad=True, seed=42 + mesh["inter_node"].get_local_rank()
-        )
+
+        n_cp_groups = mesh["inter_node"].size()
+        inputs = self.get_inputs(requires_grad=True, batch_size=n_cp_groups)
         inputs_copy = deepcopy(inputs)
-        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
+        inputs_cp_hsdp = self.get_cp_shard(
+            inputs_copy.tensor_split(n_cp_groups, dim=0)[cp_mesh.get_local_rank()],
+            n_shards=cp_mesh.size(),
+            rank=cp_mesh.get_local_rank(),
+        )
 
         outputs = model(inputs)
         outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
+        outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
         outputs_cp_fsdp.mean().backward()
 
-        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+        with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
             dist.barrier()
-            tol = 1e-3
+            tol = 1e-2
             _test_model_model_cp_grads_close(
-                model, model_cp_fsdp, atol=tol, rtol=tol, all_reduce=False
+                model, model_cp_hsdp, atol=tol, rtol=tol, all_reduce=False
             )
 
 

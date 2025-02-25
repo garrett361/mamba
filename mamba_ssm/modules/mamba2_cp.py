@@ -1,16 +1,17 @@
-import torch
-import torch.nn.functional as F
 from typing import Callable, Optional
-from einops import rearrange
+
+import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-from mamba_ssm.modules.mamba2 import Mamba2
+import torch.nn.functional as F
+from einops import rearrange
 
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined_cp import (
+    mamba_chunk_scan_combined_allgather_cp,
     mamba_chunk_scan_combined_non_cp,
     mamba_chunk_scan_combined_serial_cp,
-    mamba_chunk_scan_combined_allgather_cp,
 )
 
 CP_IMPLS = {
@@ -78,14 +79,19 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         if ctx.send_to is not None:
             recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
+            # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
             ops.append(
-                dist.P2POp(dist.irecv, recv_buffer, ctx.send_to, ctx.mesh.get_group())
+                dist.P2POp(
+                    dist.irecv, recv_buffer, None, ctx.mesh.get_group(), 0, ctx.send_to
+                )
             )
         else:
             recv_buffer = None
         if ctx.recv_from is not None:
             ops.append(
-                dist.P2POp(dist.isend, dtensor, ctx.recv_from, ctx.mesh.get_group())
+                dist.P2POp(
+                    dist.isend, dtensor, None, ctx.mesh.get_group(), 0, ctx.recv_from
+                )
             )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
