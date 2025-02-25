@@ -55,12 +55,17 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
-            # TODO: @goon - we might need to use the group_dst arg for more complex sharding
-            # situations?
-            ops.append(dist.P2POp(dist.isend, tensor, send_to, mesh.get_group()))
+            # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+            ops.append(
+                dist.P2POp(dist.isend, tensor, None, mesh.get_group(), 0, send_to)
+            )
         if recv_from is not None:
             recv_buffer = torch.empty_like(tensor)
-            ops.append(dist.P2POp(dist.irecv, recv_buffer, recv_from, mesh.get_group()))
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_buffer, None, mesh.get_group(), 0, recv_from
+                )
+            )
         else:
             recv_buffer = torch.zeros_like(tensor)
         for op in dist.batch_isend_irecv(ops):

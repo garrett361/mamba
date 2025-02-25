@@ -317,12 +317,17 @@ class _DTestModelBase(DTest):
         )
 
     def get_cp_shard(
-        self, tensor: torch.Tensor, n_shards: Optional[int] = None
+        self,
+        tensor: torch.Tensor,
+        n_shards: Optional[int] = None,
+        rank: Optional[int] = None,
     ) -> torch.Tensor:
-        n_shards = n_shards or self.world_size
-        shard = rearrange(tensor, "b (r l) ... -> b r l ...", r=self.world_size)[
-            :, self.rank
-        ]
+        if n_shards is None:
+            n_shards = self.world_size
+        if rank is None:
+            rank = self.rank
+
+        shard = rearrange(tensor, "b (r l) ... -> b r l ...", r=n_shards)[:, rank]
         return shard
 
     def get_xBC(self, requires_grad: bool = False) -> torch.Tensor:
@@ -719,7 +724,7 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
+        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
         # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
         # 2) Scale up the loss by a factor of the DP world size
         # The latter is also automatically handled if the loss function scales by the world size,
@@ -792,7 +797,7 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
+        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
         # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
         # 2) Scale up the loss by a factor of the DP world size
         # The latter is also automatically handled if the loss function scales by the world size,
@@ -820,13 +825,47 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
 
 class TestHSDP1MambaCPAllGather(_DTestModelBase):
     """
-    Test HSDP + CP where the FSDP and CP groups cover the same domains.
+    Test HSDP + CP where the HSDP and CP dims cover the same subgroups
     """
 
     cp_impl = "allgather"
 
     @pytest.mark.world_size(4)
     def test_fwd(self):
+        mesh = dist.device_mesh.init_device_mesh(
+            "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
+        )
+        cp_mesh = mesh["intra_node"]
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            device_mesh=mesh,
+            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+        # Different CP groups get different inputs
+        inputs = self.get_inputs(seed=42 + mesh["inter_node"].get_local_rank())
+        inputs_cp = self.get_cp_shard(
+            inputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
+        )
+
+        outputs = model(inputs)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
+
+        outputs_shard = self.get_cp_shard(
+            outputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
+        )
+        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
+
+    def test_bwd(self):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
@@ -837,42 +876,15 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
                 for _ in range(3)
             ]
         )
+        # The FSDP group is the world
         model_cp_fsdp = FSDP(
             model_cp,
-            device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-
-        inputs = self.get_inputs()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs)
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
-
-        outputs_shard = self.get_cp_shard(outputs)
-        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
-                for _ in range(3)
-            ]
-        )
-        model_cp_fsdp = FSDP(
-            model_cp,
-            process_group=cp_mesh.get_group(),
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
+        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
         # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
         # 2) Scale up the loss by a factor of the DP world size
         # The latter is also automatically handled if the loss function scales by the world size,
@@ -881,7 +893,10 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         #
         # We just use the mean for the loss below.
 
-        inputs = self.get_inputs(requires_grad=True)
+        # Different CP groups get different inputs
+        inputs = self.get_inputs(
+            requires_grad=True, seed=42 + mesh["inter_node"].get_local_rank()
+        )
         inputs_copy = deepcopy(inputs)
         inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
 
