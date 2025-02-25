@@ -666,6 +666,7 @@ class TestMHACP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
+        # Needs a high tol to pass?
         tol = 1e-1
         _test_model_model_cp_grads_close(mha, mha_cp, atol=tol, rtol=tol)
 
@@ -834,8 +835,8 @@ class TestModelSerial(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        # Requires a fairly high tolerance.
-        tol = 1e-1
+        # Requires a higher tolerance.
+        tol = 1e-2
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
@@ -853,6 +854,7 @@ class TestModelSerial(_DTestModelBase):
         outputs_cp.sum().backward()
 
         # Parameter grads should match after all-reducing.
+        # Requires high tol
         tol = 1e-1
         _test_model_model_cp_grads_close(model, model_cp, atol=tol, rtol=tol)
 
@@ -875,8 +877,8 @@ class TestModelAllGather(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        # Requires a fairly high tolerance.
-        tol = 1e-1
+        # Requires a higher tolerance.
+        tol = 1e-2
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
@@ -894,5 +896,6 @@ class TestModelAllGather(_DTestModelBase):
         outputs_cp.sum().backward()
 
         # Parameter grads should match after all-reducing.
+        # Requires high tol
         tol = 1e-1
         _test_model_model_cp_grads_close(model, model_cp, atol=tol, rtol=tol)
