@@ -55,11 +55,11 @@ class _StatePassingImpl(ABC):
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Any]:
         """
-        Returns a tuple of (states, final_states, bwd_args), where bwd_args is anything that
+        Returns a tuple of (out_states, final_states, bwd_args), where bwd_args is anything that
         _StatePassingImpl.bwd might require for its backwards pass.
 
         Shapes:
-        - states: (batch, nchunks, nheads, headdim, d_state)
+        - out_states: (batch, nchunks, nheads, headdim, d_state)
         - final_states: (batch, nheads, headdim, d_state)
         """
         ...
@@ -569,7 +569,7 @@ class StatePassingNonCP(_StatePassingImpl):
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Intentionally unused
     ):
         d_state = states.shape[-1]
-        states, final_states = _state_passing_fwd(
+        out_states, final_states = _state_passing_fwd(
             rearrange(states, "... p n -> ... (p n)"),
             dA_chunk_cumsum,
             initial_states=rearrange(initial_states, "... p n -> ... (p n)")
@@ -579,11 +579,11 @@ class StatePassingNonCP(_StatePassingImpl):
             chunk_size=chunk_size,
             out_dtype=out_dtype,
         )
-        states, final_states = [
+        out_states, final_states = [
             rearrange(t, "... (p n) -> ... p n", n=d_state)
-            for t in [states, final_states]
+            for t in [out_states, final_states]
         ]
-        return states, final_states, None
+        return out_states, final_states, None
 
     @staticmethod
     def bwd(
@@ -660,14 +660,15 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank != cp_mesh.mesh[0] and initial_states is not None:
+        is_lead_rank = rank == cp_mesh.mesh[0]
+        if not is_lead_rank and initial_states is not None:
             raise ValueError(
-                "initial_states can only be non-trival on the first CP rank."
+                "initial_states can only be non-trival on the lead CP rank."
             )
         recv_init_states = None
         for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
             if rank == send_rank:
-                states, final_states, _ = StatePassingNonCP.fwd(
+                out_states, final_states, _ = StatePassingNonCP.fwd(
                     chunk_size=chunk_size,
                     states=states,
                     dA_chunk_cumsum=dA_chunk_cumsum,
@@ -692,7 +693,7 @@ class StatePassingSerialCP(_StatePassingImpl):
 
         # Final rank only:
         if rank == recv_rank:
-            states, final_states, _ = StatePassingNonCP.fwd(
+            out_states, final_states, _ = StatePassingNonCP.fwd(
                 chunk_size=chunk_size,
                 states=states,
                 dA_chunk_cumsum=dA_chunk_cumsum,
@@ -701,7 +702,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 out_dtype=out_dtype,
             )
         bwd_args = recv_init_states
-        return states, final_states, bwd_args
+        return out_states, final_states, bwd_args
 
     @staticmethod
     def bwd(
@@ -723,13 +724,15 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank != cp_mesh.mesh[0] and initial_states is not None:
+        is_lead_rank = rank != cp_mesh.mesh[0]
+        if not is_lead_rank and initial_states is not None:
             raise ValueError(
-                "initial_states can only be non-trival on the first CP rank."
+                "initial_states can only be non-trival on the lead CP rank."
             )
-        if rank != cp_mesh.mesh[-1] and dfinal_states is not None:
+        is_last_rank = rank == cp_mesh.mesh[-1]
+        if not is_last_rank and dfinal_states is not None:
             raise ValueError(
-                "dfinal_states can only be non-trival on the final CP rank."
+                "dfinal_states can only be non-trival on the last CP rank."
             )
         recv_init_states = bwd_args
         reversed_mesh = cp_mesh.mesh.flip(0)
@@ -815,9 +818,10 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank != cp_mesh.mesh[0] and initial_states is not None:
+        is_lead_rank = rank == cp_mesh.mesh[0]
+        if not is_lead_rank and initial_states is not None:
             raise ValueError(
-                "initial_states can only be non-trival on the first CP rank."
+                "initial_states can only be non-trival on the lead CP rank."
             )
         # Start communicating info for later
 
@@ -838,7 +842,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
         # Compute the partial states with the locally available information. I.e. use trivial
         # initial_states on all but, maybe, the lead rank.
-        _, final_states_partial, _ = StatePassingNonCP.fwd(
+        states_partial, final_states_partial, _ = StatePassingNonCP.fwd(
             chunk_size=chunk_size,
             states=states,
             dA_chunk_cumsum=dA_chunk_cumsum,
@@ -869,31 +873,33 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         ).contiguous()
 
         # Build the initial states that each rank should have started with.
-        # TODO: @goon - remove unnecessary compute and/or write a more focused kernel for this step.
-        initial_states_corrected, _, _ = StatePassingNonCP.fwd(
-            chunk_size=cp_mesh.size(),
-            states=final_states_partial_allgather,
-            dA_chunk_cumsum=dA_chunk_sum_allgather,
-            initial_states=initial_states,
-            seq_idx=seq_idx,
-            out_dtype=out_dtype,
-        )
-        initial_states_corrected_this_rank = initial_states_corrected[
-            :, cp_mesh.get_rank()
-        ]
+        # TODO: @goon - write a more focused kernel for this step.
+        if is_lead_rank:
+            initial_states_corrected = initial_states
+            final_states = final_states_partial
+            out_states = states_partial
+        else:
+            _, initial_states_corrected, _ = StatePassingNonCP.fwd(
+                chunk_size=cp_mesh.size(),
+                states=final_states_partial_allgather[:, : cp_mesh.get_local_rank()],
+                dA_chunk_cumsum=dA_chunk_sum_allgather[..., : cp_mesh.get_local_rank()],
+                initial_states=None,
+                seq_idx=seq_idx,
+                out_dtype=out_dtype,
+            )
 
-        states, final_states, _ = StatePassingNonCP.fwd(
-            chunk_size=chunk_size,
-            states=states,
-            dA_chunk_cumsum=dA_chunk_cumsum,
-            initial_states=initial_states_corrected_this_rank,
-            seq_idx=seq_idx,
-            out_dtype=out_dtype,
-        )
+            out_states, final_states, _ = StatePassingNonCP.fwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_chunk_cumsum=dA_chunk_cumsum,
+                initial_states=initial_states_corrected,
+                seq_idx=seq_idx,
+                out_dtype=out_dtype,
+            )
 
-        bwd_args = (initial_states_corrected_this_rank, dA_chunk_sum_allgather)
-        # TODO: @goon -  return correct final states
-        return states, final_states, bwd_args
+        bwd_args = (initial_states_corrected, dA_chunk_sum_allgather)
+
+        return out_states, final_states, bwd_args
 
     @staticmethod
     def bwd(
@@ -919,24 +925,26 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         rank = cp_mesh.get_rank()
-        if rank != cp_mesh.mesh[0] and initial_states is not None:
+        is_lead_rank = rank == cp_mesh.mesh[0]
+        if not is_lead_rank and initial_states is not None:
             raise ValueError(
-                "initial_states can only be non-trival on the first CP rank."
+                "initial_states can only be non-trival on the lead CP rank."
             )
-        if rank != cp_mesh.mesh[-1] and dfinal_states is not None:
+        is_last_rank = rank == cp_mesh.mesh[-1]
+        if not is_last_rank and dfinal_states is not None:
             raise ValueError(
-                "dfinal_states can only be non-trival on the final CP rank."
+                "dfinal_states can only be non-trival on the last CP rank."
             )
 
         assert bwd_args is not None
-        initial_states_corrected_this_rank, dA_chunk_sum_allgather = bwd_args
+        initial_states_corrected, dA_chunk_sum_allgather = bwd_args
 
         _, _, dinitial_states_partial, _ = StatePassingNonCP.bwd(
             chunk_size=chunk_size,
             states=states,
             dA_chunk_cumsum=dA_chunk_cumsum,
             dstates=dstates,
-            initial_states=initial_states_corrected_this_rank,
+            initial_states=initial_states_corrected,
             dfinal_states=dfinal_states,
             seq_idx=seq_idx,
             dstates_dtype=dstates_dtype,
@@ -968,7 +976,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             ),  # Not used, but can't be None
             dA_chunk_cumsum=dA_chunk_sum_allgather,
             dstates=dinitial_states_partial_allgather,
-            initial_states=initial_states_corrected_this_rank,
+            initial_states=initial_states_corrected,
             dfinal_states=dfinal_states,
             seq_idx=seq_idx,
             dstates_dtype=dstates_dtype,
@@ -984,7 +992,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             states=states,
             dA_chunk_cumsum=dA_chunk_cumsum,
             dstates=dstates,
-            initial_states=initial_states_corrected_this_rank,
+            initial_states=initial_states_corrected,
             dfinal_states=dfinal_states_corrected_this_rank,
             seq_idx=seq_idx,
             dstates_dtype=dstates_dtype,
