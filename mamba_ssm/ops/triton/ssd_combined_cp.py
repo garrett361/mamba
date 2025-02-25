@@ -630,13 +630,11 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 
 def send(tensor: torch.Tensor, dst: int, group: dist.ProcessGroup):
     # HACK replacement for dist.send, which is giving errors.
-    # Maybe https://github.com/pytorch/pytorch/issues/129341
     dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)])[0].wait()
 
 
 def recv(tensor: torch.Tensor, src: int, group: dist.ProcessGroup):
     # HACK replacement for dist.recv, which is giving errors.
-    # Maybe https://github.com/pytorch/pytorch/issues/129341
     dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src, group)])[0].wait()
 
 

@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import Optional
+import pytest
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
@@ -761,6 +762,86 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
             process_group=cp_mesh.get_group(),
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+
+        inputs = self.get_inputs()
+        inputs_cp = self.get_cp_shard(inputs)
+
+        outputs = model(inputs)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
+
+        outputs_shard = self.get_cp_shard(outputs)
+        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
+
+    def test_bwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+        # NOTE: for grads match the non-FSDP case, some scaling need to be performed. Options:
+        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
+        # 2) Scale up the loss by a factor of the DP world size
+        # The latter is also automatically handled if the loss function scales by the world size,
+        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
+        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
+        #
+        # We just use the mean for the loss below.
+
+        inputs = self.get_inputs(requires_grad=True)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
+
+        outputs = model(inputs)
+        outputs.mean().backward()
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
+        outputs_cp_fsdp.mean().backward()
+
+        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+            dist.barrier()
+            tol = 1e-3
+            _test_model_model_cp_grads_close(
+                model, model_cp_fsdp, atol=tol, rtol=tol, all_reduce=False
+            )
+
+
+class TestHSDP1MambaCPAllGather(_DTestModelBase):
+    """
+    Test HSDP + CP where the FSDP and CP groups cover the same domains.
+    """
+
+    cp_impl = "allgather"
+
+    @pytest.mark.world_size(4)
+    def test_fwd(self):
+        mesh = dist.device_mesh.init_device_mesh(
+            "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
+        )
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mamba2_cp(cp_mesh=mesh["intra_node"], cp_impl=self.cp_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            device_mesh=mesh,
+            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
