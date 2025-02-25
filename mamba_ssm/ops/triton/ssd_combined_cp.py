@@ -89,7 +89,7 @@ class _StatePassingImpl(ABC):
         Returns a tuple of (dstates, ddA_chunk_cumsum, dinitial_states, states). bwd_args is
         whatever may have been passed along by _StatePassingImpl.fwd.
         Shapes:
-        - dstates: (batch, nchunks, nheads, headdim, d_state)
+        - dstates_out: (batch, nchunks, nheads, headdim, d_state)
         - ddA_chunk_cumsum: (batch, nheads, nchunks, n_blocks),  n_blocks set by triton config
         - dinitial_states: Optional[(batch, nchunks, nheads, headdim, d_state)]
         - states:  Optional[(batch, nchunks, nheads, headdim, d_state)]
@@ -600,7 +600,7 @@ class StatePassingNonCP(_StatePassingImpl):
         bwd_args: Optional[Any] = None,  # Intentionally unused
     ):
         d_state = states.shape[-1]
-        dstates, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
+        dstates_out, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
             rearrange(states, "... p n -> ... (p n)"),
             dA_chunk_cumsum,
             rearrange(dstates, "... p n -> ... (p n)"),
@@ -614,12 +614,12 @@ class StatePassingNonCP(_StatePassingImpl):
             chunk_size=chunk_size,
         )
         states = rearrange(states, "... (p n) -> ... p n", n=d_state)
-        dstates = rearrange(dstates, "... (p n) -> ... p n", n=d_state)
+        dstates_out = rearrange(dstates_out, "... (p n) -> ... p n", n=d_state)
         if dinitial_states is not None:
             dinitial_states = rearrange(
                 dinitial_states, "... (p n) -> ... p n", n=d_state
             )
-        return dstates, ddA_chunk_cumsum, dinitial_states, states
+        return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
 mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn()
@@ -629,13 +629,13 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 
 
 def send(tensor: torch.Tensor, dst: int, group: dist.ProcessGroup):
-    # Hack replacement for dist.send, which is giving errors.
+    # HACK replacement for dist.send, which is giving errors.
     # Maybe https://github.com/pytorch/pytorch/issues/129341
     dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)])[0].wait()
 
 
 def recv(tensor: torch.Tensor, src: int, group: dist.ProcessGroup):
-    # Hack replacement for dist.recv, which is giving errors.
+    # HACK replacement for dist.recv, which is giving errors.
     # Maybe https://github.com/pytorch/pytorch/issues/129341
     dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src, group)])[0].wait()
 
@@ -739,7 +739,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         recv_dfinal_states = None
         for send_rank, recv_rank in zip(reversed_mesh[:-1], reversed_mesh[1:]):
             if rank == send_rank:
-                dstates, ddA_chunk_cumsum, send_dinitial_states, states = (
+                dstates_out, ddA_chunk_cumsum, send_dinitial_states, states = (
                     StatePassingNonCP.bwd(
                         chunk_size=chunk_size,
                         states=states,
@@ -772,23 +772,25 @@ class StatePassingSerialCP(_StatePassingImpl):
 
         if rank == recv_rank:
             # First rank only:
-            dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
-                chunk_size=chunk_size,
-                states=states,
-                dA_chunk_cumsum=dA_chunk_cumsum,
-                dstates=dstates,
-                initial_states=initial_states,  # Gets the original initial_states, if any
-                dfinal_states=recv_dfinal_states,
-                seq_idx=seq_idx,
-                dstates_dtype=dstates_dtype,
-                states_dtype=states_dtype,
-                cp_mesh=cp_mesh,
+            dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
+                StatePassingNonCP.bwd(
+                    chunk_size=chunk_size,
+                    states=states,
+                    dA_chunk_cumsum=dA_chunk_cumsum,
+                    dstates=dstates,
+                    initial_states=initial_states,  # Gets the original initial_states, if any
+                    dfinal_states=recv_dfinal_states,
+                    seq_idx=seq_idx,
+                    dstates_dtype=dstates_dtype,
+                    states_dtype=states_dtype,
+                    cp_mesh=cp_mesh,
+                )
             )
         else:
             # Only the first rank potentially had non-trivial initial_states as proper inputs, so
             # all other ranks get dinitial_state = None.
             dinitial_states = None
-        return dstates, ddA_chunk_cumsum, dinitial_states, states
+        return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
 mamba_chunk_scan_combined_serial_cp = StatePassingSerialCP.get_chunk_scan_autograd_fn()
@@ -866,7 +868,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
         final_states_partial_allgather = rearrange(
             final_states_partial_allgather, "r b ... -> b r ... "
-        ).contiguous()
+        )
         dA_comms_handle.wait()
         dA_chunk_sum_allgather = rearrange(
             dA_chunk_sum_allgather, "r ... -> ... r"
@@ -879,10 +881,16 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             final_states = final_states_partial
             out_states = states_partial
         else:
+            states_slice = final_states_partial_allgather[
+                :, : cp_mesh.get_local_rank()
+            ].contiguous()
+            dA_chunk_cumsum_slice = dA_chunk_sum_allgather[
+                ..., : cp_mesh.get_local_rank()
+            ].contiguous()
             _, initial_states_corrected, _ = StatePassingNonCP.fwd(
                 chunk_size=cp_mesh.size(),
-                states=final_states_partial_allgather[:, : cp_mesh.get_local_rank()],
-                dA_chunk_cumsum=dA_chunk_sum_allgather[..., : cp_mesh.get_local_rank()],
+                states=states_slice,
+                dA_chunk_cumsum=dA_chunk_cumsum_slice,
                 initial_states=None,
                 seq_idx=seq_idx,
                 out_dtype=out_dtype,
@@ -939,17 +947,21 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         assert bwd_args is not None
         initial_states_corrected, dA_chunk_sum_allgather = bwd_args
 
-        _, _, dinitial_states_partial, _ = StatePassingNonCP.bwd(
-            chunk_size=chunk_size,
-            states=states,
-            dA_chunk_cumsum=dA_chunk_cumsum,
-            dstates=dstates,
-            initial_states=initial_states_corrected,
-            dfinal_states=dfinal_states,
-            seq_idx=seq_idx,
-            dstates_dtype=dstates_dtype,
-            states_dtype=states_dtype,
-            cp_mesh=cp_mesh,
+        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, _ = (
+            StatePassingNonCP.bwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_chunk_cumsum=dA_chunk_cumsum,
+                dstates=dstates,
+                # HACK: initial_states=True ensures dinitial_states_partial is never None, maybe
+                # just zeros
+                initial_states=True,
+                dfinal_states=dfinal_states,
+                seq_idx=seq_idx,
+                dstates_dtype=dstates_dtype,
+                states_dtype=states_dtype,
+                cp_mesh=cp_mesh,
+            )
         )
 
         dinitial_states_partial_allgather = torch.empty(
@@ -966,46 +978,56 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         )
         dinitial_states_partial_allgather = rearrange(
             dinitial_states_partial_allgather, "r b ... -> b r ... "
-        ).contiguous()
-
-        # TODO: @goon - remove unnecessary compute and/or write a more focused kernel for this step.
-        dfinal_states_corrected, _, _, _ = StatePassingNonCP.bwd(
-            chunk_size=chunk_size,
-            states=torch.empty_like(
-                dinitial_states_partial_allgather
-            ),  # Not used, but can't be None
-            dA_chunk_cumsum=dA_chunk_sum_allgather,
-            dstates=dinitial_states_partial_allgather,
-            initial_states=initial_states_corrected,
-            dfinal_states=dfinal_states,
-            seq_idx=seq_idx,
-            dstates_dtype=dstates_dtype,
-            states_dtype=states_dtype,
-            cp_mesh=cp_mesh,
-        )
-        dfinal_states_corrected_this_rank = dfinal_states_corrected[
-            :, cp_mesh.get_rank()
-        ]
-
-        dstates, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
-            chunk_size=chunk_size,
-            states=states,
-            dA_chunk_cumsum=dA_chunk_cumsum,
-            dstates=dstates,
-            initial_states=initial_states_corrected,
-            dfinal_states=dfinal_states_corrected_this_rank,
-            seq_idx=seq_idx,
-            dstates_dtype=dstates_dtype,
-            states_dtype=states_dtype,
-            cp_mesh=cp_mesh,
         )
 
-        # Only the first rank potentially had non-trivial initial_states as proper inputs, so
-        # all other ranks get dinitial_state = None. The first rank also has None derivatives if
-        # its initial_states arg was trivial.
-        if rank != cp_mesh.mesh[0] or initial_states is None:
+        # TODO: @goon - write a more focused kernel for this step.
+        if is_last_rank:
             dinitial_states = None
-        return dstates, ddA_chunk_cumsum, dinitial_states, states
+            dstates_out = dstates_partial
+            ddA_chunk_cumsum = ddA_chunk_cumsum_partial
+        else:
+            dstates_slice = dinitial_states_partial_allgather[
+                :, cp_mesh.get_local_rank() + 1 :
+            ]
+            dA_chunk_cumsum_slice = dA_chunk_sum_allgather[
+                ..., cp_mesh.get_local_rank() + 1 :
+            ]
+            _, _, dfinal_states_corrected, _ = StatePassingNonCP.bwd(
+                chunk_size=chunk_size,
+                # `states` is not used, but can't be None and it needs to pass shape checks
+                states=dstates_slice,
+                dA_chunk_cumsum=dA_chunk_cumsum_slice,
+                dstates=dstates_slice,
+                # HACK: initial_states=True ensures dfinal_states_corrected is never None, maybe
+                # just zeros
+                initial_states=True,
+                dfinal_states=dfinal_states,
+                seq_idx=seq_idx,
+                dstates_dtype=dstates_dtype,
+                states_dtype=states_dtype,
+                cp_mesh=cp_mesh,
+            )
+
+            dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
+                StatePassingNonCP.bwd(
+                    chunk_size=chunk_size,
+                    states=states,
+                    dA_chunk_cumsum=dA_chunk_cumsum,
+                    dstates=dstates,
+                    initial_states=initial_states_corrected,
+                    dfinal_states=dfinal_states_corrected,
+                    seq_idx=seq_idx,
+                    dstates_dtype=dstates_dtype,
+                    states_dtype=states_dtype,
+                    cp_mesh=cp_mesh,
+                )
+            )
+
+            # Only the first rank potentially had non-trivial initial_states as proper inputs, so
+            # all other ranks get dinitial_states = None.
+            if not is_lead_rank:
+                dinitial_states = None
+        return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
 mamba_chunk_scan_combined_allgather_cp = (
