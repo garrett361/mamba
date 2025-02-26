@@ -57,7 +57,7 @@ def create_block(
         # Create a copy of the config to modify
         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
-        mixer_cls_kwargs = {**mixer_cls_kwargs, **ssm_cfg}
+        ssm_cls_kwargs = {**mixer_cls_kwargs, **ssm_cfg}
         if ssm_layer not in ["Mamba1", "Mamba2"]:
             raise ValueError(
                 f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2"
@@ -65,21 +65,21 @@ def create_block(
         if cp_mesh is not None:
             if ssm_layer == "Mamba1":
                 raise NotImplementedError("Context parallel not implemented for Mamba1")
-            mixer_cls_kwargs["cp_mesh"] = cp_mesh
-            mixer_cls_kwargs["cp_mamba_impl"] = cp_mamba_impl
+            ssm_cls_kwargs["cp_mesh"] = cp_mesh
+            ssm_cls_kwargs["cp_mamba_impl"] = cp_mamba_impl
             ssm_cls = Mamba2CP
         else:
             ssm_cls = Mamba
-        mixer_cls = partial(ssm_cls, **mixer_cls_kwargs)
+        mixer_cls = partial(ssm_cls, **ssm_cls_kwargs)
     else:
-        mixer_cls_kwargs = {**mixer_cls_kwargs, **attn_cfg}
+        mha_cls_kwargs = {**mixer_cls_kwargs, **attn_cfg}
         if cp_mesh is not None:
-            mixer_cls_kwargs["cp_mesh"] = cp_mesh
-            mixer_cls_kwargs["cp_attn_impl"] = cp_attn_impl
+            mha_cls_kwargs["cp_mesh"] = cp_mesh
+            mha_cls_kwargs["cp_attn_impl"] = cp_attn_impl
             mha_cls = MHACP
         else:
             mha_cls = MHA
-        mixer_cls = partial(mha_cls, **mixer_cls_kwargs)
+        mixer_cls = partial(mha_cls, **mha_cls_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
