@@ -840,7 +840,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             async_op=True,
         )
 
-        # Compute the partial states with the locally available information. I.e. use trivial
+        # Compute the partial final states with the locally available information. I.e. use trivial
         # initial_states on all but, maybe, the lead rank.
         _, final_states_partial, _ = StatePassingNonCP.fwd(
             chunk_size=chunk_size,
@@ -886,6 +886,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         )
         initial_states_corrected = initial_states_corrected[:, cp_mesh.get_rank()]
 
+        # And perform the corrected fwd, now using the right initial states.
         out_states, final_states, _ = StatePassingNonCP.fwd(
             chunk_size=chunk_size,
             states=states,
@@ -937,6 +938,8 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         assert bwd_args is not None
         initial_states_corrected, dA_chunk_sum_allgather = bwd_args
 
+        # Compute the partial dinitial_states with the locally available information. I.e. use
+        # trivial initial_states on all but, maybe, the lead rank.
         _, _, dinitial_states_partial, _ = StatePassingNonCP.bwd(
             chunk_size=chunk_size,
             states=states,
@@ -968,11 +971,11 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             dinitial_states_partial_allgather, "r b ... -> b r ... "
         )
 
+        # Build the dfinal_states that each rank should have started with.
         # TODO: @goon - write a more focused kernel for this step.
         # NOTE: @goon - I also tried removing unnecessary compute from each rank, but it did not
         # help.
 
-        # TODO: @goon - remove unnecessary compute and/or write a more focused kernel for this step.
         dfinal_states_corrected, _, _, _ = StatePassingNonCP.bwd(
             chunk_size=chunk_size,
             states=torch.empty_like(
@@ -989,6 +992,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         )
         dfinal_states_corrected = dfinal_states_corrected[:, cp_mesh.get_rank()]
 
+        # And perform the corrected bwd, now using the right dfinal_states states.
         dstates_out, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
             chunk_size=chunk_size,
             states=states,
