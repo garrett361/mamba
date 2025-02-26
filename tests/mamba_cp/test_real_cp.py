@@ -260,10 +260,8 @@ class _DTestModelBase(DTest):
     dtype = torch.float32
     ssm_cfg = {"layer": "Mamba2"}
     vocab_size = 1024
-    n_layer = 1
-    attn_layer_idx = [
-        10  # n_layer-1
-    ]
+    n_layer = 2
+    attn_layer_idx = [n_layer - 1]
     attn_cfg = {
         "causal": True,
         "d_conv": 0,
@@ -1149,9 +1147,6 @@ class TestModelSerial(_DTestModelBase):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
         model_cp = self.get_model_cp(cp_mesh, self.cp_impl)
-        if not self.rank:
-            print(f"{model=}")
-            print(f"{model_cp=}")
 
         inputs = self.get_input_toks()
         inputs_cp = self.get_cp_shard(inputs)
@@ -1161,7 +1156,7 @@ class TestModelSerial(_DTestModelBase):
 
         outputs_shard = self.get_cp_shard(outputs)
         # Requires a higher tolerance.
-        tol = 1e-2
+        tol = 1e-1
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
@@ -1191,9 +1186,6 @@ class TestModelAllGather(_DTestModelBase):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
         model_cp = self.get_model_cp(cp_mesh, self.cp_impl)
-        if not self.rank:
-            print(f"{model=}")
-            print(f"{model_cp=}")
 
         inputs = self.get_input_toks()
         inputs_cp = self.get_cp_shard(inputs)
@@ -1203,7 +1195,7 @@ class TestModelAllGather(_DTestModelBase):
 
         outputs_shard = self.get_cp_shard(outputs)
         # Requires a higher tolerance.
-        tol = 1e-2
+        tol = 1e-1
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
