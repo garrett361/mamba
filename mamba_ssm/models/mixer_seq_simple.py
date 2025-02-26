@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.modules.mamba2_cp import MHACP, Mamba2CP
+from mamba_ssm.modules.mamba2_cp import MHACPZigZag, Mamba2CP
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
@@ -76,7 +76,7 @@ def create_block(
         mixer_cls_kwargs = {**mixer_cls_kwargs, **attn_cfg}
         if cp_mesh is not None:
             mixer_cls_kwargs["cp_mesh"] = cp_mesh
-        mixer_cls = partial(MHA if cp_mesh is None else MHACP, **mixer_cls_kwargs)
+        mixer_cls = partial(MHA if cp_mesh is None else MHACPZigZag, **mixer_cls_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
