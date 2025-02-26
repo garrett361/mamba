@@ -979,52 +979,43 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         )
 
         # TODO: @goon - write a more focused kernel for this step.
-        if is_last_rank:
+        # NOTE: @goon - I also tried removing unnecessary compute from each rank, but it did not
+        # help.
+
+        # TODO: @goon - remove unnecessary compute and/or write a more focused kernel for this step.
+        dfinal_states_corrected, _, _, _ = StatePassingNonCP.bwd(
+            chunk_size=chunk_size,
+            states=torch.empty_like(
+                dinitial_states_partial_allgather
+            ),  # Not used, but can't be None
+            dA_chunk_cumsum=dA_chunk_sum_allgather,
+            dstates=dinitial_states_partial_allgather,
+            initial_states=initial_states_corrected,
+            dfinal_states=dfinal_states,
+            seq_idx=seq_idx,
+            dstates_dtype=dstates_dtype,
+            states_dtype=states_dtype,
+            cp_mesh=cp_mesh,
+        )
+        dfinal_states_corrected = dfinal_states_corrected[:, cp_mesh.get_rank()]
+
+        dstates_out, ddA_chunk_cumsum, dinitial_states, states = StatePassingNonCP.bwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            dstates=dstates,
+            initial_states=initial_states_corrected,
+            dfinal_states=dfinal_states_corrected,
+            seq_idx=seq_idx,
+            dstates_dtype=dstates_dtype,
+            states_dtype=states_dtype,
+            cp_mesh=cp_mesh,
+        )
+
+        # Only the first rank potentially had non-trivial initial_states as proper inputs, so
+        # all other ranks get dinitial_states = None.
+        if not is_lead_rank:
             dinitial_states = None
-            dstates_out = dstates_partial
-            ddA_chunk_cumsum = ddA_chunk_cumsum_partial
-        else:
-            dstates_slice = dinitial_states_partial_allgather[
-                :, cp_mesh.get_local_rank() + 1 :
-            ]
-            dA_chunk_cumsum_slice = dA_chunk_sum_allgather[
-                ..., cp_mesh.get_local_rank() + 1 :
-            ]
-            _, _, dfinal_states_corrected, _ = StatePassingNonCP.bwd(
-                chunk_size=chunk_size,
-                # `states` is not used, but can't be None and it needs to pass shape checks
-                states=dstates_slice,
-                dA_chunk_cumsum=dA_chunk_cumsum_slice,
-                dstates=dstates_slice,
-                # HACK: initial_states=True ensures dfinal_states_corrected is never None, maybe
-                # just zeros
-                initial_states=True,
-                dfinal_states=dfinal_states,
-                seq_idx=seq_idx,
-                dstates_dtype=dstates_dtype,
-                states_dtype=states_dtype,
-                cp_mesh=cp_mesh,
-            )
-
-            dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
-                StatePassingNonCP.bwd(
-                    chunk_size=chunk_size,
-                    states=states,
-                    dA_chunk_cumsum=dA_chunk_cumsum,
-                    dstates=dstates,
-                    initial_states=initial_states_corrected,
-                    dfinal_states=dfinal_states_corrected,
-                    seq_idx=seq_idx,
-                    dstates_dtype=dstates_dtype,
-                    states_dtype=states_dtype,
-                    cp_mesh=cp_mesh,
-                )
-            )
-
-            # Only the first rank potentially had non-trivial initial_states as proper inputs, so
-            # all other ranks get dinitial_states = None.
-            if not is_lead_rank:
-                dinitial_states = None
         return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
