@@ -14,7 +14,7 @@ from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_serial_cp,
 )
 
-CP_IMPLS = {
+CP_MAMBA_IMPLS = {
     "serial": mamba_chunk_scan_combined_serial_cp,
     "allgather": mamba_chunk_scan_combined_allgather_cp,
 }
@@ -451,7 +451,7 @@ class Mamba2CP(Mamba2):
     ) -> None:
         self.cp_mesh = cp_mesh
         self.cp_mamba_impl = cp_mamba_impl
-        self.cp_impl_fn = CP_IMPLS[self.cp_mamba_impl]
+        self.cp_impl_fn = CP_MAMBA_IMPLS[self.cp_mamba_impl]
         super().__init__(*args, **kwargs)
 
     def forward(
