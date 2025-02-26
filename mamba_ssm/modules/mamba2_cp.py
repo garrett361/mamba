@@ -40,6 +40,7 @@ class CausalPassingFn(torch.autograd.Function):
             raise ValueError("Only supports 1D DeviceMesh instances.")
         mesh_size = mesh.size()
         mesh_rank = mesh.get_local_rank()
+        group = mesh.get_group()
         send_to: Optional[int] = mesh_rank + 1
         if send_to == mesh_size:
             send_to = None
@@ -49,7 +50,7 @@ class CausalPassingFn(torch.autograd.Function):
 
         ctx.device = tensor.device
         ctx.dtype = tensor.dtype
-        ctx.mesh = mesh
+        ctx.group = group
         ctx.recv_from = recv_from
         ctx.send_to = send_to
         ctx.shape = tensor.shape
@@ -57,16 +58,10 @@ class CausalPassingFn(torch.autograd.Function):
         tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
             # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
-            ops.append(
-                dist.P2POp(dist.isend, tensor, None, mesh.get_group(), 0, send_to)
-            )
+            ops.append(dist.P2POp(dist.isend, tensor, None, group, 0, send_to))
         if recv_from is not None:
             recv_buffer = torch.empty_like(tensor)
-            ops.append(
-                dist.P2POp(
-                    dist.irecv, recv_buffer, None, mesh.get_group(), 0, recv_from
-                )
-            )
+            ops.append(dist.P2POp(dist.irecv, recv_buffer, None, group, 0, recv_from))
         else:
             recv_buffer = torch.zeros_like(tensor)
         for op in dist.batch_isend_irecv(ops):
@@ -81,17 +76,13 @@ class CausalPassingFn(torch.autograd.Function):
             recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
             # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
             ops.append(
-                dist.P2POp(
-                    dist.irecv, recv_buffer, None, ctx.mesh.get_group(), 0, ctx.send_to
-                )
+                dist.P2POp(dist.irecv, recv_buffer, None, ctx.group, 0, ctx.send_to)
             )
         else:
             recv_buffer = None
         if ctx.recv_from is not None:
             ops.append(
-                dist.P2POp(
-                    dist.isend, dtensor, None, ctx.mesh.get_group(), 0, ctx.recv_from
-                )
+                dist.P2POp(dist.isend, dtensor, None, ctx.group, 0, ctx.recv_from)
             )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
@@ -99,6 +90,105 @@ class CausalPassingFn(torch.autograd.Function):
 
 
 causal_passing_comms = CausalPassingFn.apply
+
+
+def _get_seq_to_zigzag_minishard_maps(
+    group_size: int,
+) -> tuple[dict[int, int], dict[int, int]]:
+    minishard_list = list(range(2 * group_size))
+    minishard_list[::2], minishard_list[1::2] = (
+        minishard_list[:group_size],
+        minishard_list[: group_size - 1 : -1],
+    )
+    seq_to_zigzag_map = {seq: zigzag for seq, zigzag in enumerate(minishard_list)}
+    zigzag_to_seq_map = {zigzag: seq for seq, zigzag in seq_to_zigzag_map.items()}
+    return seq_to_zigzag_map, zigzag_to_seq_map
+
+
+class SeqToZigZagFn(torch.autograd.Function):
+    """
+    Convert from sequentially sharded tensors to zig-zag sharded tensors, as in ring-flash-attn.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, tensor: torch.Tensor, mesh: dist.device_mesh.DeviceMesh, seq_dim: int
+    ) -> torch.Tensor:
+        sharded_seq_len = tensor.shape[seq_dim]
+        assert sharded_seq_len % 2 == 0
+        if mesh.ndim != 1:
+            raise ValueError("Only supports 1D DeviceMesh instances.")
+        mesh_size = mesh.size()
+        assert mesh_size % 2 == 0
+        group = mesh.get_group()
+        mesh_rank = mesh.get_local_rank()
+        seq_to_zigzag_map, zigzag_to_seq_map = _get_seq_to_zigzag_minishard_maps(
+            mesh_size
+        )
+
+        minishard_seq_idxs = (2 * mesh_rank, 2 * mesh_rank + 1)
+        send_to_idxs = tuple(zigzag_to_seq_map[s] for s in minishard_seq_idxs)
+        recv_from_idxs = tuple(seq_to_zigzag_map[s] for s in minishard_seq_idxs)
+
+        ctx.device = tensor.device
+        ctx.dtype = tensor.dtype
+        ctx.group = group
+        ctx.send_to_idxs = send_to_idxs
+        ctx.recv_from_idxs = recv_from_idxs
+        ctx.shape = tensor.shape
+        ctx.seq_dim = seq_dim
+
+        mini_shard_0, mini_shard_1 = tensor.tensor_split(2, dim=seq_dim)
+        # contiguous is crucial for correctness
+        send_buffers = (mini_shard_0.contiguous(), mini_shard_1.contiguous())
+        recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
+
+        ops = []
+        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        for send_buf, send_idx in zip(send_buffers, send_to_idxs):
+            ops.append(
+                dist.P2POp(dist.isend, send_buf, None, group, send_idx, send_idx // 2)
+            )
+        for recv_buf, recv_idx, send_idx in zip(
+            recv_buffers, recv_from_idxs, send_to_idxs
+        ):
+            ops.append(
+                dist.P2POp(dist.irecv, recv_buf, None, group, send_idx, recv_idx // 2)
+            )
+        for op in dist.batch_isend_irecv(ops):
+            op.wait()
+        return torch.cat(recv_buffers, dim=1).contiguous()
+
+    @staticmethod
+    def backward(ctx, dtensor: torch.Tensor) -> tuple[Optional[torch.Tensor], None]:
+        mini_shard_0, mini_shard_1 = dtensor.tensor_split(2, dim=ctx.seq_dim)
+        # contiguous is crucial for correctness
+        send_buffers = (mini_shard_0.contiguous(), mini_shard_1.contiguous())
+        recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
+
+        ops = []
+        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        for send_buf, send_idx in zip(send_buffers, ctx.recv_from_idxs):
+            ops.append(
+                dist.P2POp(
+                    dist.isend, send_buf, None, ctx.group, send_idx, send_idx // 2
+                )
+            )
+        for recv_buf, recv_idx, send_idx in zip(
+            recv_buffers, ctx.send_to_idxs, ctx.recv_from_idxs
+        ):
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_buf, None, ctx.group, send_idx, recv_idx // 2
+                )
+            )
+        for op in dist.batch_isend_irecv(ops):
+            op.wait()
+
+        return torch.cat(recv_buffers, dim=1).contiguous(), None, None
+
+
+seq_to_zigzag_comms = SeqToZigZagFn.apply
 
 
 class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
@@ -339,7 +429,7 @@ class MHACP(MHA):
         self.cp_mesh = cp_mesh
         from ring_flash_attn import ring_flash_attn_func
 
-        self.ring_flash_attn_func = ring_flash_attn_func
+        self.ring_flash_attn_impl = ring_flash_attn_func
         super().__init__(*args, **kwargs)
         if self.d_conv:
             raise NotImplementedError
@@ -377,7 +467,7 @@ class MHACP(MHA):
             v, dim=2, repeats=self.num_heads // self.num_heads_kv
         )
 
-        context = self.ring_flash_attn_func(
+        context = self.ring_flash_attn_impl(
             q,
             k,
             v,

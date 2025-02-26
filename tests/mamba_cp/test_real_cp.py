@@ -19,6 +19,7 @@ from mamba_ssm.modules.mamba2_cp import (
     MHACP,
     Mamba2CP,
     causal_passing_comms,
+    seq_to_zigzag_comms,
     conv,
     conv_cp,
     identity_fwd_all_reduce_bwd,
@@ -102,6 +103,43 @@ class TestCausalPassingFn(DTest):
             other_idxs = torch.arange(self.world_size, device=self.device) != self.rank
             zero_grads = t_send.grad[other_idxs]
             torch.testing.assert_close(zero_grads, torch.zeros_like(zero_grads))
+
+
+class TestSeqToZigZagFn(DTest):
+    def test_fwd(self):
+        seq_dim = 1
+        dtype = torch.bfloat16
+        # Send the mini shard idx tensors around
+        t_send = torch.tensor(
+            [[2 * self.rank, 2 * self.rank + 1]],
+            device=self.device,
+            dtype=dtype,
+        )
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+        t_expected = torch.tensor(
+            [[self.rank, 2 * self.world_size - self.rank - 1]],
+            device=self.device,
+            dtype=dtype,
+        )
+        torch.testing.assert_close(t_recv, t_expected)
+
+    def test_bwd(self):
+        seq_dim = 1
+        dtype = torch.bfloat16
+        t_send = torch.tensor(
+            [[2 * self.rank, 2 * self.rank + 1]],
+            device=self.device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+        t_recv.pow(2).div(2).sum().backward()
+
+        grad = t_send.grad
+        torch.testing.assert_close(grad, t_send)
 
 
 class TestIdentityFwdAllGatherBwdFn(DTest):
@@ -245,6 +283,7 @@ class _DTestModelBase(DTest):
         return MHA(
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
+            causal=True,
             device=self.device,
             dtype=dtype,
         )
@@ -260,6 +299,7 @@ class _DTestModelBase(DTest):
             cp_mesh=cp_mesh,
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
+            causal=True,
             device=self.device,
             dtype=dtype,
         )
