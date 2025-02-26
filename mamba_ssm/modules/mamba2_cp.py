@@ -48,12 +48,9 @@ class CausalPassingFn(torch.autograd.Function):
         if recv_from == -1:
             recv_from = None
 
-        ctx.device = tensor.device
-        ctx.dtype = tensor.dtype
         ctx.group = group
         ctx.recv_from = recv_from
         ctx.send_to = send_to
-        ctx.shape = tensor.shape
         ops = []
         tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
@@ -73,7 +70,7 @@ class CausalPassingFn(torch.autograd.Function):
         dtensor = dtensor.contiguous()  # Crucial for correctness
         ops = []
         if ctx.send_to is not None:
-            recv_buffer = torch.empty(*ctx.shape, dtype=ctx.dtype, device=ctx.device)
+            recv_buffer = torch.empty_like(dtensor)
             # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
             ops.append(
                 dist.P2POp(dist.irecv, recv_buffer, None, ctx.group, 0, ctx.send_to)
@@ -130,12 +127,9 @@ class SeqToZigZagFn(torch.autograd.Function):
         send_to_idxs = tuple(zigzag_to_seq_map[s] for s in minishard_seq_idxs)
         recv_from_idxs = tuple(seq_to_zigzag_map[s] for s in minishard_seq_idxs)
 
-        ctx.device = tensor.device
-        ctx.dtype = tensor.dtype
         ctx.group = group
         ctx.send_to_idxs = send_to_idxs
         ctx.recv_from_idxs = recv_from_idxs
-        ctx.shape = tensor.shape
         ctx.seq_dim = seq_dim
 
         mini_shard_0, mini_shard_1 = tensor.tensor_split(2, dim=seq_dim)
