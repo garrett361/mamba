@@ -842,7 +842,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
         # Compute the partial states with the locally available information. I.e. use trivial
         # initial_states on all but, maybe, the lead rank.
-        states_partial, final_states_partial, _ = StatePassingNonCP.fwd(
+        _, final_states_partial, _ = StatePassingNonCP.fwd(
             chunk_size=chunk_size,
             states=states,
             dA_chunk_cumsum=dA_chunk_cumsum,
@@ -874,34 +874,26 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
         # Build the initial states that each rank should have started with.
         # TODO: @goon - write a more focused kernel for this step.
-        if is_lead_rank:
-            initial_states_corrected = initial_states
-            final_states = final_states_partial
-            out_states = states_partial
-        else:
-            states_slice = final_states_partial_allgather[
-                :, : cp_mesh.get_local_rank()
-            ].contiguous()
-            dA_chunk_cumsum_slice = dA_chunk_sum_allgather[
-                ..., : cp_mesh.get_local_rank()
-            ].contiguous()
-            _, initial_states_corrected, _ = StatePassingNonCP.fwd(
-                chunk_size=cp_mesh.size(),
-                states=states_slice,
-                dA_chunk_cumsum=dA_chunk_cumsum_slice,
-                initial_states=None,
-                seq_idx=seq_idx,
-                out_dtype=out_dtype,
-            )
+        # NOTE: @goon - I also tried removing unnecessary compute from each rank, but it did not
+        # help.
+        initial_states_corrected, _, _ = StatePassingNonCP.fwd(
+            chunk_size=cp_mesh.size(),
+            states=final_states_partial_allgather,
+            dA_chunk_cumsum=dA_chunk_sum_allgather,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            out_dtype=out_dtype,
+        )
+        initial_states_corrected = initial_states_corrected[:, cp_mesh.get_rank()]
 
-            out_states, final_states, _ = StatePassingNonCP.fwd(
-                chunk_size=chunk_size,
-                states=states,
-                dA_chunk_cumsum=dA_chunk_cumsum,
-                initial_states=initial_states_corrected,
-                seq_idx=seq_idx,
-                out_dtype=out_dtype,
-            )
+        out_states, final_states, _ = StatePassingNonCP.fwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            initial_states=initial_states_corrected,
+            seq_idx=seq_idx,
+            out_dtype=out_dtype,
+        )
 
         bwd_args = (initial_states_corrected, dA_chunk_sum_allgather)
 
@@ -945,21 +937,19 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         assert bwd_args is not None
         initial_states_corrected, dA_chunk_sum_allgather = bwd_args
 
-        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, _ = (
-            StatePassingNonCP.bwd(
-                chunk_size=chunk_size,
-                states=states,
-                dA_chunk_cumsum=dA_chunk_cumsum,
-                dstates=dstates,
-                # HACK: initial_states=True ensures dinitial_states_partial is never None, maybe
-                # just zeros
-                initial_states=True,
-                dfinal_states=dfinal_states,
-                seq_idx=seq_idx,
-                dstates_dtype=dstates_dtype,
-                states_dtype=states_dtype,
-                cp_mesh=cp_mesh,
-            )
+        _, _, dinitial_states_partial, _ = StatePassingNonCP.bwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            dstates=dstates,
+            # HACK: initial_states=True ensures dinitial_states_partial is never None, maybe
+            # just zeros
+            initial_states=True,
+            dfinal_states=dfinal_states,
+            seq_idx=seq_idx,
+            dstates_dtype=dstates_dtype,
+            states_dtype=states_dtype,
+            cp_mesh=cp_mesh,
         )
 
         dinitial_states_partial_allgather = torch.empty(
