@@ -15,7 +15,7 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
-    CP_IMPLS,
+    CP_MAMBA_IMPLS,
     MHACP,
     Mamba2CP,
     causal_passing_comms,
@@ -496,7 +496,7 @@ class TestConvCP(_DTestModelBase):
 
 
 class TestSerialCP(_DTestModelBase):
-    cp_impl = "serial"
+    cp_mamba_impl = "serial"
 
     def test_fwd(self):
         torch.manual_seed(42)
@@ -511,7 +511,7 @@ class TestSerialCP(_DTestModelBase):
         # And the CP output:
         inputs_cp_shard = self.get_cp_shard(inputs)
         kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, mamba2)
-        outputs_cp = CP_IMPLS[self.cp_impl](cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
 
         # All-gather and verify correctness
         outputs_cp_all_gathered = torch.empty(
@@ -547,7 +547,7 @@ class TestSerialCP(_DTestModelBase):
 
         # And on the CP output:
         kwargs_cp = self.get_scan_kwargs(inputs_cp, mamba2_cp)
-        outputs_cp = CP_IMPLS[self.cp_impl](cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
         outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
@@ -564,7 +564,7 @@ class TestSerialCP(_DTestModelBase):
 
 
 class TestAllGatherCP(_DTestModelBase):
-    cp_impl = "allgather"
+    cp_mamba_impl = "allgather"
 
     def test_fwd(self):
         torch.manual_seed(42)
@@ -579,7 +579,7 @@ class TestAllGatherCP(_DTestModelBase):
         # And the CP output:
         inputs_cp_shard = self.get_cp_shard(inputs)
         kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, mamba2)
-        outputs_cp = CP_IMPLS[self.cp_impl](cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
 
         # All-gather and verify correctness
         outputs_cp_all_gathered = torch.empty(
@@ -615,7 +615,7 @@ class TestAllGatherCP(_DTestModelBase):
 
         # And on the CP output:
         kwargs_cp = self.get_scan_kwargs(inputs_cp, mamba2_cp)
-        outputs_cp = CP_IMPLS[self.cp_impl](cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
         outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
