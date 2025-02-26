@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import MHACP, Mamba2CP
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mha import MHA
@@ -69,7 +70,7 @@ def create_block(
             ssm_cls_kwargs["cp_mamba_impl"] = cp_mamba_impl
             ssm_cls = Mamba2CP
         else:
-            ssm_cls = Mamba
+            ssm_cls = Mamba if ssm_layer == "Mamba1" else Mamba2
         mixer_cls = partial(ssm_cls, **ssm_cls_kwargs)
     else:
         mha_cls_kwargs = {**mixer_cls_kwargs, **attn_cfg}
