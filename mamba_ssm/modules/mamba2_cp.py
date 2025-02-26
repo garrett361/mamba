@@ -140,6 +140,7 @@ class SeqToZigZagFn(torch.autograd.Function):
         ops = []
         # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
         for send_buf, send_idx in zip(send_buffers, send_to_idxs):
+            # Use send_idx to tag the comms. Convert to rank via rank = idx // 2
             ops.append(
                 dist.P2POp(dist.isend, send_buf, None, group, send_idx, send_idx // 2)
             )
@@ -223,6 +224,7 @@ class ZigZagToSeqFn(torch.autograd.Function):
         ops = []
         # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
         for send_buf, send_idx in zip(send_buffers, send_to_idxs):
+            # Use send_idx to tag the comms. Convert to rank via rank = idx // 2
             ops.append(
                 dist.P2POp(dist.isend, send_buf, None, group, send_idx, send_idx // 2)
             )
