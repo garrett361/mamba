@@ -1005,6 +1005,154 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
             )
 
 
+class TestFSDP1MHACPRing(_DTestModelBase):
+    cp_attn_impl = "ring"
+
+    def test_fwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+
+        inputs = self.get_inputs(dtype=torch.bfloat16)
+        inputs_cp = self.get_cp_shard(inputs)
+
+        outputs = model(inputs)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
+
+        outputs_shard = self.get_cp_shard(outputs)
+        tol = 1e-3
+        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard, atol=tol, rtol=tol)
+
+    def test_bwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
+        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
+        # 2) Scale up the loss by a factor of the DP world size
+        # The latter is also automatically handled if the loss function scales by the world size,
+        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
+        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
+        #
+        # We just use the mean for the loss below.
+
+        inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
+
+        outputs = model(inputs)
+        outputs.mean().backward()
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
+        outputs_cp_fsdp.mean().backward()
+
+        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+            dist.barrier()
+            tol = 1e-3
+            _test_model_model_cp_grads_close(
+                model, model_cp_fsdp, atol=tol, rtol=tol, all_reduce=False
+            )
+
+
+class TestFSDP1MHACPZigZag(_DTestModelBase):
+    cp_attn_impl = "zigzag"
+
+    def test_fwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+
+        inputs = self.get_inputs(dtype=torch.bfloat16)
+        inputs_cp = self.get_cp_shard(inputs)
+
+        outputs = model(inputs)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
+
+        outputs_shard = self.get_cp_shard(outputs)
+        tol = 1e-3
+        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard, atol=tol, rtol=tol)
+
+    def test_bwd(self):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                for _ in range(3)
+            ]
+        )
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
+        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
+        # 2) Scale up the loss by a factor of the DP world size
+        # The latter is also automatically handled if the loss function scales by the world size,
+        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
+        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
+        #
+        # We just use the mean for the loss below.
+
+        inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
+
+        outputs = model(inputs)
+        outputs.mean().backward()
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
+        outputs_cp_fsdp.mean().backward()
+
+        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+            dist.barrier()
+            tol = 1e-3
+            _test_model_model_cp_grads_close(
+                model, model_cp_fsdp, atol=tol, rtol=tol, all_reduce=False
+            )
+
+
 class TestHSDP1MambaCPAllGather(_DTestModelBase):
     """
     Test HSDP + CP for MambaCP where the HSDP and CP dims cover the same subgroups
