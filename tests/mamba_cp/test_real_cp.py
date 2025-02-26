@@ -531,7 +531,7 @@ class TestConvCP(_DTestModelBase):
         torch.testing.assert_close(xBC_grad_shard, xBC_cp_grad_shard)
 
 
-class TestSerialCP(_DTestModelBase):
+class TestSerialScanCP(_DTestModelBase):
     cp_mamba_impl = "serial"
 
     def test_fwd(self):
@@ -599,7 +599,7 @@ class TestSerialCP(_DTestModelBase):
         _test_model_model_cp_grads_close(mamba2, mamba2_cp, atol=tol, rtol=tol)
 
 
-class TestAllGatherCP(_DTestModelBase):
+class TestAllGatherScanCP(_DTestModelBase):
     cp_mamba_impl = "allgather"
 
     def test_fwd(self):
