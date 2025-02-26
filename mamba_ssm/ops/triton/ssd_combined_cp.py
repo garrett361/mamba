@@ -1004,7 +1004,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
         # Only the first rank potentially had non-trivial initial_states as proper inputs, so
         # all other ranks get dinitial_states = None.
-        if not is_lead_rank:
+        if not is_lead_rank or initial_states is None:
             dinitial_states = None
         return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
