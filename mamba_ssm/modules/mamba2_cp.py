@@ -558,3 +558,25 @@ class MHACP(MHA):
             context = torch.cat([context, x_mlp], dim=-1)
         out = self.out_proj(context)
         return out
+
+
+class MHACPZigZag(MHACP):
+    """
+    NOTE: @goon - currently we expect an external mechanism to all-reduce the grads which get
+    populated on Mamba2CP instances. This is handled automatically if the model is wrapped in
+    FSDP, but not otherwise. Need to raise a warning or offer some flag for enabling the all-reduce
+    in other cases.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        from ring_flash_attn import zigzag_ring_flash_attn_func
+
+        self.ring_flash_attn_impl = zigzag_ring_flash_attn_func
+        self.seq_dim = 1
+
+    def forward(self, x, inference_params=None):
+        x = seq_to_zigzag_comms(x, self.cp_mesh, self.seq_dim)
+        x = super().forward(x, inference_params)
+        out = zigzag_to_seq_comms(x, self.cp_mesh, self.seq_dim)
+        return out

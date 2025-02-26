@@ -17,6 +17,7 @@ from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
     CP_IMPLS,
     MHACP,
+    MHACPZigZag,
     Mamba2CP,
     causal_passing_comms,
     conv,
@@ -331,9 +332,11 @@ class _DTestModelBase(DTest):
         cp_mesh: dist.device_mesh.DeviceMesh,
         seed: int = 42,
         dtype: torch.dtype = torch.bfloat16,
+        zigzag: bool = False,
     ) -> MHA:
         torch.manual_seed(seed)
-        return MHACP(
+        mha_cls = MHACPZigZag if zigzag else MHACP
+        return mha_cls(
             cp_mesh=cp_mesh,
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
@@ -733,6 +736,54 @@ class TestMHACP(_DTestModelBase):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
         mha_cp = self.get_mha_cp(cp_mesh=cp_mesh)
+
+        # Requires bfloat16
+        inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
+        inputs_copy = deepcopy(inputs)
+        inputs_cp = self.get_cp_shard(inputs_copy)
+
+        outputs = mha(inputs)
+        outputs.sum().backward()
+        outputs_cp = mha_cp(inputs_cp)
+        outputs_cp.sum().backward()
+
+        inputs_grad_shard = self.get_cp_shard(inputs.grad)
+        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
+        tol = 1e-2
+        dist.barrier()
+        torch.testing.assert_close(
+            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+        )
+
+        # Parameter grads should match after all-reducing.
+        # Needs a high tol to pass?
+        tol = 1e-1
+        _test_model_model_cp_grads_close(mha, mha_cp, atol=tol, rtol=tol)
+
+
+class TestMHACPZigZag(_DTestModelBase):
+    def test_fwd(self):
+        torch.manual_seed(42)
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        mha = self.get_mha()
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, zigzag=True)
+
+        # Requires bfloat16
+        inputs = self.get_inputs(dtype=torch.bfloat16)
+        inputs_cp = self.get_cp_shard(inputs)
+
+        outputs = mha(inputs)
+        outputs_cp = mha_cp(inputs_cp)
+
+        outputs_shard = self.get_cp_shard(outputs)
+        tol = 1e-2
+        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
+
+    def test_bwd(self):
+        torch.manual_seed(42)
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        mha = self.get_mha()
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, zigzag=True)
 
         # Requires bfloat16
         inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
