@@ -579,5 +579,5 @@ class MHACP(MHA):
             context = torch.cat([context, x_mlp], dim=-1)
         out = self.out_proj(context)
         if self.cp_attn_impl == "zigzag":
-            out = zigzag_to_seq_comms(x, self.cp_mesh, self.seq_dim)
+            out = zigzag_to_seq_comms(out, self.cp_mesh, self.seq_dim)
         return out
