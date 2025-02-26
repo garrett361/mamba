@@ -1,4 +1,4 @@
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -446,12 +446,12 @@ class Mamba2CP(Mamba2):
         self,
         *args,
         cp_mesh: dist.device_mesh.DeviceMesh,
-        cp_impl: Optional[str] = None,
+        cp_mamba_impl: Literal["serial", "allgather"] = "zigzag",
         **kwargs,
     ) -> None:
         self.cp_mesh = cp_mesh
-        self.cp_impl = cp_impl or "allgather"
-        self.cp_impl_fn = CP_IMPLS[self.cp_impl]
+        self.cp_mamba_impl = cp_mamba_impl
+        self.cp_impl_fn = CP_IMPLS[self.cp_mamba_impl]
         super().__init__(*args, **kwargs)
 
     def forward(
@@ -497,18 +497,35 @@ class Mamba2CP(Mamba2):
 class MHACP(MHA):
     """
     NOTE: @goon - currently we expect an external mechanism to all-reduce the grads which get
-    populated on Mamba2CP instances. This is handled automatically if the model is wrapped in
+    populated on MHACP instances. This is handled automatically if the model is wrapped in
     FSDP, but not otherwise. Need to raise a warning or offer some flag for enabling the all-reduce
     in other cases.
     """
 
-    def __init__(self, *args, cp_mesh: dist.device_mesh.DeviceMesh, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        cp_mesh: dist.device_mesh.DeviceMesh,
+        cp_attn_impl: Literal["zigzag", "ring"] = "zigzag",
+        seq_dim: int = 1,
+        **kwargs,
+    ) -> None:
         if cp_mesh.ndim != 1:
             raise ValueError("Only supports 1D DeviceMesh instances.")
         self.cp_mesh = cp_mesh
-        from ring_flash_attn import ring_flash_attn_func
+        self.cp_attn_impl = cp_attn_impl
+        self.seq_dim = seq_dim
+        if cp_attn_impl == "ring":
+            from ring_flash_attn import ring_flash_attn_func
 
-        self.ring_flash_attn_impl = ring_flash_attn_func
+            self.ring_flash_attn_impl = ring_flash_attn_func
+        elif cp_attn_impl == "zigzag":
+            from ring_flash_attn import zigzag_ring_flash_attn_func
+
+            self.ring_flash_attn_impl = zigzag_ring_flash_attn_func
+        else:
+            raise ValueError(f"Unexpected {cp_attn_impl=}")
+
         super().__init__(*args, **kwargs)
         if self.d_conv:
             raise NotImplementedError
@@ -516,6 +533,8 @@ class MHACP(MHA):
     def forward(self, x, inference_params=None):
         if inference_params is not None:
             raise NotImplementedError
+        if self.cp_attn_impl == "zigzag":
+            x = seq_to_zigzag_comms(x, self.cp_mesh, self.seq_dim)
 
         seqlen_offset = 0
         rotary_max_seqlen = None
@@ -559,26 +578,6 @@ class MHACP(MHA):
         if self.mlp_dim > 0:
             context = torch.cat([context, x_mlp], dim=-1)
         out = self.out_proj(context)
-        return out
-
-
-class MHACPZigZag(MHACP):
-    """
-    NOTE: @goon - currently we expect an external mechanism to all-reduce the grads which get
-    populated on Mamba2CP instances. This is handled automatically if the model is wrapped in
-    FSDP, but not otherwise. Need to raise a warning or offer some flag for enabling the all-reduce
-    in other cases.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        from ring_flash_attn import zigzag_ring_flash_attn_func
-
-        self.ring_flash_attn_impl = zigzag_ring_flash_attn_func
-        self.seq_dim = 1
-
-    def forward(self, x, inference_params=None):
-        x = seq_to_zigzag_comms(x, self.cp_mesh, self.seq_dim)
-        x = super().forward(x, inference_params)
-        out = zigzag_to_seq_comms(x, self.cp_mesh, self.seq_dim)
+        if self.cp_attn_impl == "zigzag":
+            out = zigzag_to_seq_comms(x, self.cp_mesh, self.seq_dim)
         return out

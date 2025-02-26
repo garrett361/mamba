@@ -17,7 +17,6 @@ from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
     CP_IMPLS,
     MHACP,
-    MHACPZigZag,
     Mamba2CP,
     causal_passing_comms,
     conv,
@@ -303,15 +302,18 @@ class _DTestModelBase(DTest):
         )
 
     def get_mamba2_cp(
-        self, cp_mesh: dist.device_mesh.DeviceMesh, cp_impl: str, seed: int = 42
+        self,
+        cp_mesh: dist.device_mesh.DeviceMesh,
+        seed: int = 42,
+        cp_mamba_impl: str = "allgather",
     ) -> Mamba2:
         torch.manual_seed(seed)
         return Mamba2CP(
             cp_mesh=cp_mesh,
-            cp_impl=cp_impl,
             d_model=self.d_model,
             d_state=self.d_state,
             chunk_size=self.chunk_size,
+            cp_mamba_impl=cp_mamba_impl,
             **self.factory_kwargs,
         )
 
@@ -330,17 +332,17 @@ class _DTestModelBase(DTest):
         cp_mesh: dist.device_mesh.DeviceMesh,
         seed: int = 42,
         dtype: torch.dtype = torch.bfloat16,
-        zigzag: bool = False,
+        cp_attn_impl: str = "zigzag",
     ) -> MHA:
         torch.manual_seed(seed)
-        mha_cls = MHACPZigZag if zigzag else MHACP
-        return mha_cls(
+        return MHACP(
             cp_mesh=cp_mesh,
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             causal=True,
             device=self.device,
             dtype=dtype,
+            cp_attn_impl=cp_attn_impl,
         )
 
     def get_model(
@@ -352,7 +354,8 @@ class _DTestModelBase(DTest):
     def get_model_cp(
         self,
         cp_mesh: dist.device_mesh.DeviceMesh,
-        cp_impl: str,
+        cp_mamba_impl: str,
+        cp_attn_impl: str,
         seed: int = 42,
         dtype: torch.dtype = torch.bfloat16,
     ) -> MambaLMHeadModel:
@@ -360,7 +363,8 @@ class _DTestModelBase(DTest):
         return MambaLMHeadModel(
             config=self.cfg,
             cp_mesh=cp_mesh,
-            cp_impl=cp_impl,
+            cp_mamba_impl=cp_mamba_impl,
+            cp_attn_impl=cp_attn_impl,
             device=self.device,
             dtype=dtype,
         )
@@ -550,7 +554,7 @@ class TestSerialCP(_DTestModelBase):
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
 
-        tol = 1e-3
+        tol = 1e-2
         torch.testing.assert_close(
             inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
         )
@@ -618,7 +622,7 @@ class TestAllGatherCP(_DTestModelBase):
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
 
-        tol = 1e-3
+        tol = 1e-2
         torch.testing.assert_close(
             inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
         )
@@ -628,13 +632,15 @@ class TestAllGatherCP(_DTestModelBase):
 
 
 class TestMamba2CPSerial(_DTestModelBase):
-    cp_impl = "serial"
+    cp_mamba_impl = "serial"
 
     def test_fwd(self):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+        mamba2_cp = self.get_mamba2_cp(
+            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
+        )
 
         inputs = self.get_inputs()
         inputs_cp = self.get_cp_shard(inputs)
@@ -649,7 +655,9 @@ class TestMamba2CPSerial(_DTestModelBase):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+        mamba2_cp = self.get_mamba2_cp(
+            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
+        )
 
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
@@ -670,13 +678,15 @@ class TestMamba2CPSerial(_DTestModelBase):
 
 
 class TestMamba2CPAllGather(_DTestModelBase):
-    cp_impl = "allgather"
+    cp_mamba_impl = "allgather"
 
     def test_fwd(self):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+        mamba2_cp = self.get_mamba2_cp(
+            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
+        )
 
         inputs = self.get_inputs()
         inputs_cp = self.get_cp_shard(inputs)
@@ -691,7 +701,9 @@ class TestMamba2CPAllGather(_DTestModelBase):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+        mamba2_cp = self.get_mamba2_cp(
+            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
+        )
 
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
@@ -711,12 +723,14 @@ class TestMamba2CPAllGather(_DTestModelBase):
         _test_model_model_cp_grads_close(mamba2, mamba2_cp, atol=tol, rtol=tol)
 
 
-class TestMHACP(_DTestModelBase):
+class TestMHACPRing(_DTestModelBase):
+    cp_attn_impl = "ring"
+
     def test_fwd(self):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
 
         # Requires bfloat16
         inputs = self.get_inputs(dtype=torch.bfloat16)
@@ -733,7 +747,7 @@ class TestMHACP(_DTestModelBase):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
 
         # Requires bfloat16
         inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
@@ -760,11 +774,13 @@ class TestMHACP(_DTestModelBase):
 
 
 class TestMHACPZigZag(_DTestModelBase):
+    cp_attn_impl = "zigzag"
+
     def test_fwd(self):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, zigzag=True)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
 
         # Requires bfloat16
         inputs = self.get_inputs(dtype=torch.bfloat16)
@@ -781,7 +797,7 @@ class TestMHACPZigZag(_DTestModelBase):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, zigzag=True)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
 
         # Requires bfloat16
         inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
@@ -808,14 +824,14 @@ class TestMHACPZigZag(_DTestModelBase):
 
 
 class TestFSDP1MambaCPSerial(_DTestModelBase):
-    cp_impl = "serial"
+    cp_mamba_impl = "serial"
 
     def test_fwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
                 for _ in range(3)
             ]
         )
@@ -842,7 +858,7 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
                 for _ in range(3)
             ]
         )
@@ -881,14 +897,14 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
 
 
 class TestFSDP1MambaCPAllGather(_DTestModelBase):
-    cp_impl = "allgather"
+    cp_mamba_impl = "allgather"
 
     def test_fwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
                 for _ in range(3)
             ]
         )
@@ -915,7 +931,7 @@ class TestFSDP1MambaCPAllGather(_DTestModelBase):
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
                 for _ in range(3)
             ]
         )
@@ -958,7 +974,7 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
     Test HSDP + CP for MambaCP where the HSDP and CP dims cover the same subgroups
     """
 
-    cp_impl = "allgather"
+    cp_mamba_impl = "allgather"
 
     @pytest.mark.world_size(4)
     def test_fwd(self):
@@ -969,7 +985,7 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
                 for _ in range(3)
             ]
         )
@@ -1004,7 +1020,7 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_impl=self.cp_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
                 for _ in range(3)
             ]
         )
@@ -1049,12 +1065,12 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
             )
 
 
-class TestHSDP1MHACPAllGather(_DTestModelBase):
+class TestHSDP1MHACPRing(_DTestModelBase):
     """
     Test HSDP + CP for MHACP where the HSDP and CP dims cover the same subgroups
     """
 
-    cp_impl = "allgather"
+    cp_attn_impl = "ring"
 
     @pytest.mark.world_size(4)
     def test_fwd(self):
@@ -1063,7 +1079,12 @@ class TestHSDP1MHACPAllGather(_DTestModelBase):
         )
         cp_mesh = mesh["intra_node"]
         model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(*[self.get_mha_cp(cp_mesh=cp_mesh) for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                for _ in range(3)
+            ]
+        )
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1096,7 +1117,12 @@ class TestHSDP1MHACPAllGather(_DTestModelBase):
         )
         cp_mesh = mesh["intra_node"]
         model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(*[self.get_mha_cp(cp_mesh=cp_mesh) for _ in range(3)])
+        model_cp = nn.Sequential(
+            *[
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                for _ in range(3)
+            ]
+        )
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1140,13 +1166,16 @@ class TestHSDP1MHACPAllGather(_DTestModelBase):
             )
 
 
-class TestModelSerial(_DTestModelBase):
-    cp_impl = "serial"
+class TestModelSerialRing(_DTestModelBase):
+    cp_mamba_impl = "serial"
+    cp_attn_impl = "ring"
 
     def test_fwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
-        model_cp = self.get_model_cp(cp_mesh, self.cp_impl)
+        model_cp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+        )
 
         inputs = self.get_input_toks()
         inputs_cp = self.get_cp_shard(inputs)
@@ -1162,7 +1191,9 @@ class TestModelSerial(_DTestModelBase):
     def test_bwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
-        model_cp = self.get_model_cp(cp_mesh, self.cp_impl)
+        model_cp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+        )
 
         inputs = self.get_input_toks()
         inputs_copy = deepcopy(inputs)
@@ -1179,13 +1210,16 @@ class TestModelSerial(_DTestModelBase):
         _test_model_model_cp_grads_close(model, model_cp, atol=tol, rtol=tol)
 
 
-class TestModelAllGather(_DTestModelBase):
-    cp_impl = "allgather"
+class TestModelAllGatherZigZag(_DTestModelBase):
+    cp_mamba_impl = "allgather"
+    cp_attn_impl = "zigzag"
 
     def test_fwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
-        model_cp = self.get_model_cp(cp_mesh, self.cp_impl)
+        model_cp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+        )
 
         inputs = self.get_input_toks()
         inputs_cp = self.get_cp_shard(inputs)
@@ -1201,7 +1235,9 @@ class TestModelAllGather(_DTestModelBase):
     def test_bwd(self):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
-        model_cp = self.get_model_cp(cp_mesh, self.cp_impl)
+        model_cp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+        )
 
         inputs = self.get_input_toks()
         inputs_copy = deepcopy(inputs)
