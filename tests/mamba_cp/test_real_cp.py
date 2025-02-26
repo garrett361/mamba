@@ -180,6 +180,42 @@ class TestZigZagToSeqFn(DTest):
         torch.testing.assert_close(grad, t_send)
 
 
+class TestZigZagToSeqInverse(DTest):
+    """
+    zigzag_to_seq_comms and seq_to_zigzag_comms should be inverses of each other.
+    """
+
+    def test_seq_then_zig(self) -> None:
+        seq_dim = 1
+        dtype = torch.bfloat16
+        # Send the mini shard idx tensors around
+        t_send = torch.tensor(
+            [[self.rank, 2 * self.world_size - self.rank - 1]],
+            device=self.device,
+            dtype=dtype,
+        )
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        # Send and send again
+        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+        t_recv = zigzag_to_seq_comms(t_recv, mesh, seq_dim)
+        torch.testing.assert_close(t_recv, t_send)
+
+    def test_zig_then_seq(self) -> None:
+        seq_dim = 1
+        dtype = torch.bfloat16
+        # Send the mini shard idx tensors around
+        t_send = torch.tensor(
+            [[self.rank, 2 * self.world_size - self.rank - 1]],
+            device=self.device,
+            dtype=dtype,
+        )
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        # Send and send again
+        t_recv = zigzag_to_seq_comms(t_send, mesh, seq_dim)
+        t_recv = seq_to_zigzag_comms(t_recv, mesh, seq_dim)
+        torch.testing.assert_close(t_recv, t_send)
+
+
 class TestIdentityFwdAllGatherBwdFn(DTest):
     def test_fwd(self):
         dim = 16
