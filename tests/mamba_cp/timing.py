@@ -129,7 +129,8 @@ bamba_9dot8b_defaults = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cp", action="store_true")
-    parser.add_argument("--cp_impl", type=str, default="allgather")
+    parser.add_argument("--cp_mamba_impl", type=str, default="allgather")
+    parser.add_argument("--cp_attn_impl", type=str, default="zigzag")
     parser.add_argument("--mamba_only", action="store_true")
     parser.add_argument("--hsdp", action="store_true")
     parser.add_argument("--no_ac", action="store_true")
@@ -140,7 +141,11 @@ if __name__ == "__main__":
     parser.add_argument("--n_layer", type=int, default=bamba_9dot8b_defaults["n_layer"])
     args = parser.parse_args()
 
-    cli_args = {"n_layer": args.n_layer, "cp_impl": args.cp_impl if args.cp else None}
+    cli_args = {
+        "n_layer": args.n_layer,
+        "cp_mamba_impl": args.cp_mamba_impl if args.cp else None,
+        "cp_attn_impl": args.cp_attn_impl if args.cp else None,
+    }
     if args.mamba_only:
         cli_args["attn_layer_idx"] = []
     config = MambaConfig(**{**bamba_9dot8b_defaults, **cli_args})
@@ -164,7 +169,8 @@ if __name__ == "__main__":
     model = MambaLMHeadModel(
         config=config,
         cp_mesh=mesh if args.cp else None,
-        cp_impl=args.cp_impl if args.cp else None,
+        cp_mamba_impl=args.cp_mamba_impl if args.cp else None,
+        cp_attn_impl=args.cp_attn_impl if args.cp else None,
     )
 
     model = FSDP(
