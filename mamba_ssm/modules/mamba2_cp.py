@@ -185,6 +185,89 @@ class SeqToZigZagFn(torch.autograd.Function):
 seq_to_zigzag_comms = SeqToZigZagFn.apply
 
 
+class ZigZagToSeqFn(torch.autograd.Function):
+    """
+    Convert from zig-zag sharded tensors to sequentually sharded tensors, as in ring-flash-attn.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, tensor: torch.Tensor, mesh: dist.device_mesh.DeviceMesh, seq_dim: int
+    ) -> torch.Tensor:
+        sharded_seq_len = tensor.shape[seq_dim]
+        assert sharded_seq_len % 2 == 0
+        if mesh.ndim != 1:
+            raise ValueError("Only supports 1D DeviceMesh instances.")
+        mesh_size = mesh.size()
+        assert mesh_size % 2 == 0
+        group = mesh.get_group()
+        mesh_rank = mesh.get_local_rank()
+        seq_to_zigzag_map, zigzag_to_seq_map = _get_seq_to_zigzag_minishard_maps(
+            mesh_size
+        )
+
+        minishard_seq_idxs = (2 * mesh_rank, 2 * mesh_rank + 1)
+        send_to_idxs = tuple(seq_to_zigzag_map[s] for s in minishard_seq_idxs)
+        recv_from_idxs = tuple(zigzag_to_seq_map[s] for s in minishard_seq_idxs)
+
+        ctx.group = group
+        ctx.send_to_idxs = send_to_idxs
+        ctx.recv_from_idxs = recv_from_idxs
+        ctx.seq_dim = seq_dim
+
+        mini_shard_0, mini_shard_1 = tensor.tensor_split(2, dim=seq_dim)
+        # contiguous is crucial for correctness
+        send_buffers = (mini_shard_0.contiguous(), mini_shard_1.contiguous())
+        recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
+
+        ops = []
+        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        for send_buf, send_idx in zip(send_buffers, send_to_idxs):
+            ops.append(
+                dist.P2POp(dist.isend, send_buf, None, group, send_idx, send_idx // 2)
+            )
+        for recv_buf, recv_idx, send_idx in zip(
+            recv_buffers, recv_from_idxs, send_to_idxs
+        ):
+            ops.append(
+                dist.P2POp(dist.irecv, recv_buf, None, group, send_idx, recv_idx // 2)
+            )
+        for op in dist.batch_isend_irecv(ops):
+            op.wait()
+        return torch.cat(recv_buffers, dim=1).contiguous()
+
+    @staticmethod
+    def backward(ctx, dtensor: torch.Tensor) -> tuple[Optional[torch.Tensor], None]:
+        mini_shard_0, mini_shard_1 = dtensor.tensor_split(2, dim=ctx.seq_dim)
+        # contiguous is crucial for correctness
+        send_buffers = (mini_shard_0.contiguous(), mini_shard_1.contiguous())
+        recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
+
+        ops = []
+        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        for send_buf, send_idx in zip(send_buffers, ctx.recv_from_idxs):
+            ops.append(
+                dist.P2POp(
+                    dist.isend, send_buf, None, ctx.group, send_idx, send_idx // 2
+                )
+            )
+        for recv_buf, recv_idx, send_idx in zip(
+            recv_buffers, ctx.send_to_idxs, ctx.recv_from_idxs
+        ):
+            ops.append(
+                dist.P2POp(
+                    dist.irecv, recv_buf, None, ctx.group, send_idx, recv_idx // 2
+                )
+            )
+        for op in dist.batch_isend_irecv(ops):
+            op.wait()
+
+        return torch.cat(recv_buffers, dim=1).contiguous(), None, None
+
+
+zigzag_to_seq_comms = ZigZagToSeqFn.apply
+
+
 class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
     """
     Wrapper for all-gathering grads onto unsharded tensors which are used in rank-sharded

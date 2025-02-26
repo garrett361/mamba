@@ -1,10 +1,7 @@
 from copy import deepcopy
 from typing import Optional
-import pytest
 
-from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.modules.mha import MHA
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -14,18 +11,22 @@ from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
 from dtest import DTest
+from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
+    CP_IMPLS,
     MHACP,
     Mamba2CP,
     causal_passing_comms,
-    seq_to_zigzag_comms,
     conv,
     conv_cp,
     identity_fwd_all_reduce_bwd,
     in_proj_split,
-    CP_IMPLS,
+    seq_to_zigzag_comms,
+    zigzag_to_seq_comms,
 )
+from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
@@ -129,6 +130,43 @@ class TestSeqToZigZagFn(DTest):
         dtype = torch.bfloat16
         t_send = torch.tensor(
             [[2 * self.rank, 2 * self.rank + 1]],
+            device=self.device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+        t_recv.pow(2).div(2).sum().backward()
+
+        grad = t_send.grad
+        torch.testing.assert_close(grad, t_send)
+
+
+class TestZigZagToSeqFn(DTest):
+    def test_fwd(self):
+        seq_dim = 1
+        dtype = torch.bfloat16
+        # Send the mini shard idx tensors around
+        t_send = torch.tensor(
+            [[self.rank, 2 * self.world_size - self.rank - 1]],
+            device=self.device,
+            dtype=dtype,
+        )
+        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        t_recv = zigzag_to_seq_comms(t_send, mesh, seq_dim)
+        t_expected = torch.tensor(
+            [[2 * self.rank, 2 * self.rank + 1]],
+            device=self.device,
+            dtype=dtype,
+        )
+        torch.testing.assert_close(t_recv, t_expected)
+
+    def test_bwd(self):
+        seq_dim = 1
+        dtype = torch.bfloat16
+        t_send = torch.tensor(
+            [[self.rank, 2 * self.world_size - self.rank - 1]],
             device=self.device,
             dtype=dtype,
             requires_grad=True,
