@@ -132,7 +132,6 @@ if __name__ == "__main__":
     parser.add_argument("--cp_mamba_impl", type=str, default="allgather")
     parser.add_argument("--cp_attn_impl", type=str, default="zigzag")
     parser.add_argument("--mamba_only", action="store_true")
-    parser.add_argument("--hsdp", action="store_true")
     parser.add_argument("--no_ac", action="store_true")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
@@ -143,8 +142,6 @@ if __name__ == "__main__":
 
     cli_args = {
         "n_layer": args.n_layer,
-        "cp_mamba_impl": args.cp_mamba_impl if args.cp else None,
-        "cp_attn_impl": args.cp_attn_impl if args.cp else None,
     }
     if args.mamba_only:
         cli_args["attn_layer_idx"] = []
@@ -176,7 +173,7 @@ if __name__ == "__main__":
     model = FSDP(
         model,
         auto_wrap_policy=get_wrapper(Block),
-        sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
         use_orig_params=True,
         device_id=device,
         mixed_precision=MixedPrecision(
