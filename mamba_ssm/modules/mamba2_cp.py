@@ -178,7 +178,6 @@ class SeqToZigZagFn(torch.autograd.Function):
                     dist.get_global_rank(group, recv_idx // 2),
                     group,
                     send_idx,
-                    recv_idx // 2,
                 )
             )
         for op in dist.batch_isend_irecv(ops):
