@@ -39,12 +39,12 @@ class CausalPassingFn(torch.autograd.Function):
         if mesh.ndim != 1:
             raise ValueError("Only supports 1D DeviceMesh instances.")
         mesh_size = mesh.size()
-        mesh_rank = mesh.get_local_rank()
+        local_rank = mesh.get_local_rank()
         group = mesh.get_group()
-        send_to: Optional[int] = mesh_rank + 1
+        send_to: Optional[int] = local_rank + 1
         if send_to == mesh_size:
             send_to = None
-        recv_from: Optional[int] = mesh_rank - 1
+        recv_from: Optional[int] = local_rank - 1
         if recv_from == -1:
             recv_from = None
 
@@ -54,12 +54,21 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
-            # NOTE : @goon - using group_dst arg which requires torch >= 2.6.0
-            # TODO use get_global_rank to avoid using new features, like in ring_flash_attn
-            ops.append(dist.P2POp(dist.isend, tensor, None, group, 0, send_to))
+            ops.append(
+                dist.P2POp(
+                    dist.isend, tensor, dist.get_global_rank(group, send_to), group
+                )
+            )
         if recv_from is not None:
             recv_buffer = torch.empty_like(tensor)
-            ops.append(dist.P2POp(dist.irecv, recv_buffer, None, group, 0, recv_from))
+            ops.append(
+                dist.P2POp(
+                    dist.irecv,
+                    recv_buffer,
+                    dist.get_global_rank(group, recv_from),
+                    group,
+                )
+            )
         else:
             recv_buffer = torch.zeros_like(tensor)
         for op in dist.batch_isend_irecv(ops):
