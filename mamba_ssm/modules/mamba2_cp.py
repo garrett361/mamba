@@ -81,15 +81,24 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         if ctx.send_to is not None:
             recv_buffer = torch.empty_like(dtensor)
-            # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
             ops.append(
-                dist.P2POp(dist.irecv, recv_buffer, None, ctx.group, 0, ctx.send_to)
+                dist.P2POp(
+                    dist.irecv,
+                    recv_buffer,
+                    dist.get_global_rank(ctx.group, ctx.send_to),
+                    ctx.group,
+                )
             )
         else:
             recv_buffer = None
         if ctx.recv_from is not None:
             ops.append(
-                dist.P2POp(dist.isend, dtensor, None, ctx.group, 0, ctx.recv_from)
+                dist.P2POp(
+                    dist.isend,
+                    dtensor,
+                    dist.get_global_rank(ctx.group, ctx.recv_from),
+                    ctx.group,
+                )
             )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
@@ -148,17 +157,29 @@ class SeqToZigZagFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, send_to_idxs):
             # Use send_idx to tag the comms. Convert to rank via rank = idx // 2
             ops.append(
-                dist.P2POp(dist.isend, send_buf, None, group, send_idx, send_idx // 2)
+                dist.P2POp(
+                    dist.isend,
+                    send_buf,
+                    dist.get_global_rank(group, send_idx // 2),
+                    group,
+                    send_idx,
+                )
             )
         for recv_buf, recv_idx, send_idx in zip(
             recv_buffers, recv_from_idxs, send_to_idxs
         ):
             ops.append(
-                dist.P2POp(dist.irecv, recv_buf, None, group, send_idx, recv_idx // 2)
+                dist.P2POp(
+                    dist.irecv,
+                    recv_buf,
+                    dist.get_global_rank(group, recv_idx // 2),
+                    group,
+                    send_idx,
+                    recv_idx // 2,
+                )
             )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
@@ -172,11 +193,14 @@ class SeqToZigZagFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, ctx.recv_from_idxs):
             ops.append(
                 dist.P2POp(
-                    dist.isend, send_buf, None, ctx.group, send_idx, send_idx // 2
+                    dist.isend,
+                    send_buf,
+                    dist.get_global_rank(ctx.group, send_idx // 2),
+                    ctx.group,
+                    send_idx,
                 )
             )
         for recv_buf, recv_idx, send_idx in zip(
@@ -184,7 +208,11 @@ class SeqToZigZagFn(torch.autograd.Function):
         ):
             ops.append(
                 dist.P2POp(
-                    dist.irecv, recv_buf, None, ctx.group, send_idx, recv_idx // 2
+                    dist.irecv,
+                    recv_buf,
+                    dist.get_global_rank(ctx.group, recv_idx // 2),
+                    ctx.group,
+                    send_idx,
                 )
             )
         for op in dist.batch_isend_irecv(ops):
@@ -232,17 +260,28 @@ class ZigZagToSeqFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, send_to_idxs):
             # Use send_idx to tag the comms. Convert to rank via rank = idx // 2
             ops.append(
-                dist.P2POp(dist.isend, send_buf, None, group, send_idx, send_idx // 2)
+                dist.P2POp(
+                    dist.isend,
+                    send_buf,
+                    dist.get_global_rank(group, send_idx // 2),
+                    group,
+                    send_idx,
+                )
             )
         for recv_buf, recv_idx, send_idx in zip(
             recv_buffers, recv_from_idxs, send_to_idxs
         ):
             ops.append(
-                dist.P2POp(dist.irecv, recv_buf, None, group, send_idx, recv_idx // 2)
+                dist.P2POp(
+                    dist.irecv,
+                    recv_buf,
+                    dist.get_global_rank(group, recv_idx // 2),
+                    group,
+                    send_idx,
+                )
             )
         for op in dist.batch_isend_irecv(ops):
             op.wait()
@@ -256,11 +295,14 @@ class ZigZagToSeqFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, ctx.recv_from_idxs):
             ops.append(
                 dist.P2POp(
-                    dist.isend, send_buf, None, ctx.group, send_idx, send_idx // 2
+                    dist.isend,
+                    send_buf,
+                    dist.get_global_rank(ctx.group, send_idx // 2),
+                    ctx.group,
+                    send_idx,
                 )
             )
         for recv_buf, recv_idx, send_idx in zip(
@@ -268,7 +310,11 @@ class ZigZagToSeqFn(torch.autograd.Function):
         ):
             ops.append(
                 dist.P2POp(
-                    dist.irecv, recv_buf, None, ctx.group, send_idx, recv_idx // 2
+                    dist.irecv,
+                    recv_buf,
+                    dist.get_global_rank(ctx.group, recv_idx // 2),
+                    ctx.group,
+                    send_idx,
                 )
             )
         for op in dist.batch_isend_irecv(ops):
