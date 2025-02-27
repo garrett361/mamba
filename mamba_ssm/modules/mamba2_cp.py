@@ -54,7 +54,8 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         tensor = tensor.contiguous()  # Crucial for correctness
         if send_to is not None:
-            # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+            # NOTE : @goon - using group_dst arg which requires torch >= 2.6.0
+            # TODO use get_global_rank to avoid using new features, like in ring_flash_attn
             ops.append(dist.P2POp(dist.isend, tensor, None, group, 0, send_to))
         if recv_from is not None:
             recv_buffer = torch.empty_like(tensor)
@@ -71,7 +72,7 @@ class CausalPassingFn(torch.autograd.Function):
         ops = []
         if ctx.send_to is not None:
             recv_buffer = torch.empty_like(dtensor)
-            # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+            # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
             ops.append(
                 dist.P2POp(dist.irecv, recv_buffer, None, ctx.group, 0, ctx.send_to)
             )
@@ -138,7 +139,7 @@ class SeqToZigZagFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, send_to_idxs):
             # Use send_idx to tag the comms. Convert to rank via rank = idx // 2
             ops.append(
@@ -162,7 +163,7 @@ class SeqToZigZagFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, ctx.recv_from_idxs):
             ops.append(
                 dist.P2POp(
@@ -222,7 +223,7 @@ class ZigZagToSeqFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, send_to_idxs):
             # Use send_idx to tag the comms. Convert to rank via rank = idx // 2
             ops.append(
@@ -246,7 +247,7 @@ class ZigZagToSeqFn(torch.autograd.Function):
         recv_buffers = (torch.empty_like(mini_shard_0), torch.empty_like(mini_shard_1))
 
         ops = []
-        # NOTE : @goon - using group_dst arg which requires recent torch. Maybe torch >= 2.6.0?
+        # NOTE : @goon - using using group_dst arg which requires torch >= 2.6.0
         for send_buf, send_idx in zip(send_buffers, ctx.recv_from_idxs):
             ops.append(
                 dist.P2POp(
