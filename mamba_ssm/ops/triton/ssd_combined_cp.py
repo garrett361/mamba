@@ -630,12 +630,16 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 
 def send(tensor: torch.Tensor, dst: int, group: dist.ProcessGroup):
     # HACK replacement for dist.send, which is giving errors.
-    dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)])[0].wait()
+    dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, None, group, 0, dst)])[
+        0
+    ].wait()
 
 
 def recv(tensor: torch.Tensor, src: int, group: dist.ProcessGroup):
     # HACK replacement for dist.recv, which is giving errors.
-    dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src, group)])[0].wait()
+    dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, None, group, 0, src)])[
+        0
+    ].wait()
 
 
 class StatePassingSerialCP(_StatePassingImpl):
@@ -664,7 +668,8 @@ class StatePassingSerialCP(_StatePassingImpl):
                 "initial_states can only be non-trival on the lead CP rank."
             )
         recv_init_states = None
-        for send_rank, recv_rank in zip(cp_mesh.mesh[:-1], cp_mesh.mesh[1:]):
+        mesh_size = cp_mesh.size()
+        for send_rank, recv_rank in zip(range(mesh_size - 1), range(1, mesh_size)):
             if rank == send_rank:
                 out_states, final_states, _ = StatePassingNonCP.fwd(
                     chunk_size=chunk_size,
@@ -735,7 +740,10 @@ class StatePassingSerialCP(_StatePassingImpl):
         recv_init_states = bwd_args
         reversed_mesh = cp_mesh.mesh.flip(0)
         recv_dfinal_states = None
-        for send_rank, recv_rank in zip(reversed_mesh[:-1], reversed_mesh[1:]):
+        mesh_size = cp_mesh.size()
+        for send_rank, recv_rank in zip(
+            range(mesh_size - 1, 0, -1), range(mesh_size - 2, -1, -1)
+        ):
             if rank == send_rank:
                 dstates_out, ddA_chunk_cumsum, send_dinitial_states, states = (
                     StatePassingNonCP.bwd(
