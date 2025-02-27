@@ -823,10 +823,9 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             raise ValueError(
                 "initial_states can only be non-trival on the lead CP rank."
             )
+
         # Start communicating info for later
-
         dA_chunk_sum = dA_chunk_cumsum.sum(dim=-1)
-
         dA_chunk_sum_allgather = torch.empty(
             cp_mesh.size(),
             *dA_chunk_sum.shape,
@@ -872,13 +871,13 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             dA_chunk_sum_allgather, "r ... -> ... r"
         ).contiguous()
 
-        # Build the initial states that each rank should have started with.
         # TODO: @goon - write a more focused kernel for this step.
         if is_lead_rank:
             initial_states_corrected = initial_states
             final_states = final_states_partial
             out_states = states_partial
         else:
+            # Build the initial_states that each rank should have started with.
             states_slice = final_states_partial_allgather[
                 :, : cp_mesh.get_local_rank()
             ].contiguous()
@@ -894,6 +893,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
                 out_dtype=out_dtype,
             )
 
+            # And repeat the forward with the now-corrected initial_states
             out_states, final_states, _ = StatePassingNonCP.fwd(
                 chunk_size=chunk_size,
                 states=states,
@@ -945,6 +945,9 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         assert bwd_args is not None
         initial_states_corrected, dA_chunk_sum_allgather = bwd_args
 
+        # Compute dinitial_states with the locally available information. I.e. use trivial
+        # dfinal_states on all but, maybe, the last rank. These can be used to compute the
+        # corrected dfinal_states each rank should have started with.
         dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, _ = (
             StatePassingNonCP.bwd(
                 chunk_size=chunk_size,
@@ -984,6 +987,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
             dstates_out = dstates_partial
             ddA_chunk_cumsum = ddA_chunk_cumsum_partial
         else:
+            # Build the dfinal_states that each rank should have started with.
             dstates_slice = dinitial_states_partial_allgather[
                 :, cp_mesh.get_local_rank() + 1 :
             ]
@@ -1006,6 +1010,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
                 cp_mesh=cp_mesh,
             )
 
+            # And repeat the backward with the now-corrected dfinal_states
             dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
                 StatePassingNonCP.bwd(
                     chunk_size=chunk_size,
