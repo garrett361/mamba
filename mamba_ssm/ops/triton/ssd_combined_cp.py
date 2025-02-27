@@ -662,6 +662,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
+        group = cp_mesh.get_group()
         is_lead_rank = local_rank == 0
         if not is_lead_rank and initial_states is not None:
             raise ValueError(
@@ -683,14 +684,14 @@ class StatePassingSerialCP(_StatePassingImpl):
                 send(
                     final_states.contiguous(),
                     dst=recv_rank,
-                    group=cp_mesh.get_group(),
+                    group=group,
                 )
             elif local_rank == recv_rank:
                 recv_init_states = torch.empty_like(states[:, 0])
                 recv(
                     recv_init_states,
                     src=send_rank,
-                    group=cp_mesh.get_group(),
+                    group=group,
                 )
             dist.barrier()
 
@@ -728,6 +729,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         mesh_size = cp_mesh.size()
+        group = cp_mesh.get_group()
         is_lead_rank = local_rank == 0
         if not is_lead_rank and initial_states is not None:
             raise ValueError(
@@ -761,7 +763,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 send(
                     send_dinitial_states.contiguous(),
                     dst=recv_rank,
-                    group=cp_mesh.get_group(),
+                    group=group,
                 )
             elif local_rank == recv_rank:
                 recv_dfinal_states = torch.empty(
@@ -770,7 +772,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 recv(
                     recv_dfinal_states,
                     src=send_rank,
-                    group=cp_mesh.get_group(),
+                    group=group,
                 )
 
             dist.barrier()
