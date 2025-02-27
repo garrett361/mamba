@@ -824,8 +824,8 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
         """
         assert cp_mesh is not None
-        rank = cp_mesh.get_rank()
-        is_lead_rank = rank == cp_mesh.mesh[0]
+        local_rank = cp_mesh.get_local_rank()
+        is_lead_rank = local_rank == 0
         if not is_lead_rank and initial_states is not None:
             raise ValueError(
                 "initial_states can only be non-trival on the lead CP rank."
@@ -937,13 +937,13 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         values.
         """
         assert cp_mesh is not None
-        rank = cp_mesh.get_rank()
-        is_lead_rank = rank == cp_mesh.mesh[0]
+        local_rank = cp_mesh.get_local_rank()
+        is_lead_rank = local_rank == 0
         if not is_lead_rank and initial_states is not None:
             raise ValueError(
                 "initial_states can only be non-trival on the lead CP rank."
             )
-        is_last_rank = rank == cp_mesh.mesh[-1]
+        is_last_rank = local_rank == cp_mesh.size() - 1
         if not is_last_rank and dfinal_states is not None:
             raise ValueError(
                 "dfinal_states can only be non-trival on the last CP rank."
