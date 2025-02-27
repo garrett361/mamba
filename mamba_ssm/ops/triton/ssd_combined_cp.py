@@ -661,8 +661,8 @@ class StatePassingSerialCP(_StatePassingImpl):
         Serially compute the final state on each rank and pass as initial_states to the next.
         """
         assert cp_mesh is not None
-        rank = cp_mesh.get_rank()
-        is_lead_rank = rank == cp_mesh.mesh[0]
+        local_rank = cp_mesh.get_local_rank()
+        is_lead_rank = local_rank == 0
         if not is_lead_rank and initial_states is not None:
             raise ValueError(
                 "initial_states can only be non-trival on the lead CP rank."
@@ -670,7 +670,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         recv_init_states = None
         mesh_size = cp_mesh.size()
         for send_rank, recv_rank in zip(range(mesh_size - 1), range(1, mesh_size)):
-            if rank == send_rank:
+            if local_rank == send_rank:
                 out_states, final_states, _ = StatePassingNonCP.fwd(
                     chunk_size=chunk_size,
                     states=states,
@@ -685,7 +685,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                     dst=recv_rank,
                     group=cp_mesh.get_group(),
                 )
-            elif rank == recv_rank:
+            elif local_rank == recv_rank:
                 recv_init_states = torch.empty_like(states[:, 0])
                 recv(
                     recv_init_states,
@@ -695,7 +695,7 @@ class StatePassingSerialCP(_StatePassingImpl):
             dist.barrier()
 
         # Final rank only:
-        if rank == recv_rank:
+        if local_rank == recv_rank:
             out_states, final_states, _ = StatePassingNonCP.fwd(
                 chunk_size=chunk_size,
                 states=states,
@@ -726,25 +726,24 @@ class StatePassingSerialCP(_StatePassingImpl):
         dinitial_states and pass these back as the dfinal_states of the preceding rank.
         """
         assert cp_mesh is not None
-        rank = cp_mesh.get_rank()
-        is_lead_rank = rank != cp_mesh.mesh[0]
+        local_rank = cp_mesh.get_local_rank()
+        mesh_size = cp_mesh.size()
+        is_lead_rank = local_rank == 0
         if not is_lead_rank and initial_states is not None:
             raise ValueError(
                 "initial_states can only be non-trival on the lead CP rank."
             )
-        is_last_rank = rank == cp_mesh.mesh[-1]
+        is_last_rank = local_rank == mesh_size - 1
         if not is_last_rank and dfinal_states is not None:
             raise ValueError(
                 "dfinal_states can only be non-trival on the last CP rank."
             )
         recv_init_states = bwd_args
-        reversed_mesh = cp_mesh.mesh.flip(0)
         recv_dfinal_states = None
-        mesh_size = cp_mesh.size()
         for send_rank, recv_rank in zip(
             range(mesh_size - 1, 0, -1), range(mesh_size - 2, -1, -1)
         ):
-            if rank == send_rank:
+            if local_rank == send_rank:
                 dstates_out, ddA_chunk_cumsum, send_dinitial_states, states = (
                     StatePassingNonCP.bwd(
                         chunk_size=chunk_size,
@@ -764,7 +763,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                     dst=recv_rank,
                     group=cp_mesh.get_group(),
                 )
-            elif rank == recv_rank:
+            elif local_rank == recv_rank:
                 recv_dfinal_states = torch.empty(
                     *states[:, 0].shape, dtype=dstates_dtype, device=states.device
                 )
@@ -776,7 +775,7 @@ class StatePassingSerialCP(_StatePassingImpl):
 
             dist.barrier()
 
-        if rank == recv_rank:
+        if local_rank == recv_rank:
             # First rank only:
             dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
                 StatePassingNonCP.bwd(
