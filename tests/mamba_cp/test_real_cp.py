@@ -29,6 +29,10 @@ from mamba_ssm.modules.mamba2_cp import (
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
+"""
+TODO: Parametrize the tests. Currently left unparametrized for easier debugging/dev workflow.
+"""
+
 
 def _test_model_model_cp_grads_close(
     model: nn.Module,
@@ -292,7 +296,7 @@ class _DTestModelBase(DTest):
     embed_dim = d_model
     head_dim = 64
     num_heads = d_model // head_dim
-    dtype = torch.float32
+    dtype = torch.bfloat16
     ssm_cfg = {"layer": "Mamba2"}
     vocab_size = 1024
     n_layer = 2
@@ -528,7 +532,10 @@ class TestConvCP(_DTestModelBase):
 
         xBC_grad_shard = self.get_cp_shard(xBC.grad)
         xBC_cp_grad_shard = self.get_cp_shard(xBC_copy.grad)
-        torch.testing.assert_close(xBC_grad_shard, xBC_cp_grad_shard)
+        tol = None if self.dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(
+            xBC_grad_shard, xBC_cp_grad_shard, atol=tol, rtol=tol
+        )
 
 
 class TestSerialScanCP(_DTestModelBase):
