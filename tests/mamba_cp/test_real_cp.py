@@ -296,7 +296,7 @@ class _DTestModelBase(DTest):
     embed_dim = d_model
     head_dim = 64
     num_heads = d_model // head_dim
-    dtype = torch.bfloat16
+    dtype = torch.float32
     ssm_cfg = {"layer": "Mamba2"}
     vocab_size = 1024
     n_layer = 2
