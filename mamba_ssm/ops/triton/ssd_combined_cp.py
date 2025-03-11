@@ -12,7 +12,7 @@ After defining the `_StatePassingImpl.{fwd,bwd}` methods of an implementation, t
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Type
+from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -23,10 +23,13 @@ from packaging import version
 from mamba_ssm.ops.triton.ssd_combined import (
     _bmm_chunk_bwd,
     _bmm_chunk_fwd,
+    _chunk_cumsum_bwd,
     _chunk_cumsum_fwd,
     _chunk_scan_bwd_dC,
     _chunk_scan_bwd_dcb,
+    _chunk_scan_bwd_ddAcs_stable,
     _chunk_scan_bwd_dstates,
+    _chunk_scan_bwd_dz,
     _chunk_scan_chunk_state_bwd_dx,
     _chunk_scan_fwd,
     _chunk_state_bwd_db,
@@ -34,9 +37,6 @@ from mamba_ssm.ops.triton.ssd_combined import (
     _state_passing_bwd,
     _state_passing_fwd,
     chunk_state_varlen,
-    _chunk_cumsum_bwd,
-    _chunk_scan_bwd_dz,
-    _chunk_scan_bwd_ddAcs_stable,
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -305,7 +305,7 @@ class _StatePassingImpl(ABC):
 
 
 def _mamba_chunk_scan_combined_fwd_template(
-    state_passing_impl: Type[_StatePassingImpl],
+    state_passing_impl: type[_StatePassingImpl],
     x,
     dt,
     A,
@@ -389,7 +389,7 @@ def _mamba_chunk_scan_combined_fwd_template(
 
 
 def _mamba_chunk_scan_combined_bwd_template(
-    state_passing_impl: Type[_StatePassingImpl],
+    state_passing_impl: type[_StatePassingImpl],
     dout,
     x,
     dt,
