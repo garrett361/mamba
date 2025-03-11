@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Optional
+from typing import Literal, Optional
 
 import pytest
 import torch
@@ -361,10 +361,12 @@ class _DTestModelBase(DTest):
 
     def get_mha(self, seed: int = 42, dtype: torch.dtype = torch.bfloat16) -> MHA:
         torch.manual_seed(seed)
+        # Use the bamba value rotary_emb_dim=headdim//2 so that rope is non-trivial
         return MHA(
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             causal=True,
+            rotary_emb_dim=self.head_dim // 2,
             device=self.device,
             dtype=dtype,
         )
@@ -374,14 +376,16 @@ class _DTestModelBase(DTest):
         cp_mesh: dist.device_mesh.DeviceMesh,
         seed: int = 42,
         dtype: torch.dtype = torch.bfloat16,
-        cp_attn_impl: str = "zigzag",
+        cp_attn_impl: Literal["zigzag", "ring"] = "zigzag",
     ) -> MHA:
         torch.manual_seed(seed)
+        # Use the bamba value rotary_emb_dim=headdim//2 so that rope is non-trivial
         return MHACP(
             cp_mesh=cp_mesh,
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             causal=True,
+            rotary_emb_dim=self.head_dim // 2,
             device=self.device,
             dtype=dtype,
             cp_attn_impl=cp_attn_impl,

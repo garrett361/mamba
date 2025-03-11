@@ -588,11 +588,7 @@ class MHACP(MHA):
     def forward(self, x, inference_params=None):
         if inference_params is not None:
             raise NotImplementedError
-        if self.cp_attn_impl == "zigzag":
-            x = seq_to_zigzag_comms(x, self.cp_mesh, self.seq_dim)
 
-        seqlen_offset = 0
-        rotary_max_seqlen = None
         qkv = self.in_proj(x)
 
         if self.mlp_dim > 0:
@@ -608,9 +604,17 @@ class MHACP(MHA):
         kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
 
         if self.rotary_emb_dim > 0:
-            q, kv = self.rotary_emb(
-                q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
-            )
+            # Important: need to offset the seqlens per the cp rank and input size.
+            # Assumption: all ranks are getting inputs of the same seqlen.
+            local_cp_rank = self.cp_mesh.get_local_rank()
+            num_tok_per_rank = x.shape[self.seq_dim]
+            seqlen_offset = local_cp_rank * num_tok_per_rank
+            q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+
+        if self.cp_attn_impl == "zigzag":
+            # Important: change to zigzag sharding *after* applying RoPE.
+            q = seq_to_zigzag_comms(q, self.cp_mesh, self.seq_dim)
+            kv = seq_to_zigzag_comms(kv, self.cp_mesh, self.seq_dim)
 
         k, v = kv.unbind(dim=-3)
         k = torch.repeat_interleave(
