@@ -462,6 +462,24 @@ class _DTestModelBase(DTest):
         shard = rearrange(tensor, "b (r l) ... -> b r l ...", r=n_shards)[:, rank]
         return shard
 
+    def get_cp_hsdp_shard(
+        self,
+        tensor: torch.Tensor,
+        mesh: dist.device_mesh.DeviceMesh,
+        dp_mesh_dim: str = "inter_node",
+        cp_mesh_dim: str = "intra_node",
+    ) -> torch.Tensor:
+        tensor_dp_shard = tensor.tensor_split(mesh[dp_mesh_dim].size(), dim=0)[
+            mesh[dp_mesh_dim].get_local_rank()
+        ]
+        tensor_dp_cp_shard = self.get_cp_shard(
+            tensor_dp_shard,
+            mesh[cp_mesh_dim].size(),
+            mesh[cp_mesh_dim].get_local_rank(),
+        )
+
+        return tensor_dp_cp_shard
+
     def get_xBC(self, requires_grad: bool = False) -> torch.Tensor:
         return torch.randn(
             self.batch_size,
@@ -1174,22 +1192,18 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
             model_cp,
             device_mesh=mesh,
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
-        # Different CP groups get different inputs
-        inputs = self.get_inputs(seed=42 + mesh["inter_node"].get_local_rank())
-        inputs_cp = self.get_cp_shard(
-            inputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
-        )
+
+        inputs = self.get_inputs(batch_size=mesh["inter_node"].size())
+        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs, mesh)
 
         outputs = model(inputs)
-        outputs_cp_hsdp = model_cp_hsdp(inputs_cp)
+        outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
 
-        outputs_shard = self.get_cp_shard(
-            outputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
-        )
+        outputs_shard = self.get_cp_hsdp_shard(outputs, mesh)
         torch.testing.assert_close(outputs_cp_hsdp, outputs_shard)
 
     @pytest.mark.world_size(4)
@@ -1209,7 +1223,7 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
             model_cp,
             device_mesh=mesh,
             auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
@@ -1222,21 +1236,23 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         #
         # We just use the mean for the loss below.
 
-        # Different CP groups get different inputs
-
-        n_cp_groups = mesh["inter_node"].size()
-        inputs = self.get_inputs(requires_grad=True, batch_size=n_cp_groups)
-        inputs_copy = deepcopy(inputs)
-        inputs_cp_hsdp = self.get_cp_shard(
-            inputs_copy.tensor_split(n_cp_groups, dim=0)[cp_mesh.get_local_rank()],
-            n_shards=cp_mesh.size(),
-            rank=cp_mesh.get_local_rank(),
+        inputs = self.get_inputs(
+            batch_size=mesh["inter_node"].size(), requires_grad=True
         )
+        inputs_copy = deepcopy(inputs)
+        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs_copy, mesh)
 
         outputs = model(inputs)
         outputs.mean().backward()
         outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
         outputs_cp_fsdp.mean().backward()
+
+        inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
+        inputs_copy_grad_shard = self.get_cp_hsdp_shard(inputs_copy.grad, mesh)
+        tol = 1e-3
+        torch.testing.assert_close(
+            inputs_copy_grad_shard, inputs_grad_shard, atol=tol, rtol=tol
+        )
 
         with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
             dist.barrier()
@@ -1266,25 +1282,21 @@ class TestHSDP1MHACPRing(_DTestModelBase):
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
-        # Different CP groups get different inputs
+
         inputs = self.get_inputs(
-            seed=42 + mesh["inter_node"].get_local_rank(), dtype=torch.bfloat16
+            batch_size=mesh["inter_node"].size(), dtype=torch.bfloat16
         )
-        inputs_cp = self.get_cp_shard(
-            inputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
-        )
+        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs, mesh)
 
         outputs = model(inputs)
-        outputs_cp_hsdp = model_cp_hsdp(inputs_cp)
+        outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
 
-        outputs_shard = self.get_cp_shard(
-            outputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
-        )
+        outputs_shard = self.get_cp_hsdp_shard(outputs, mesh)
         tol = 1e-3
         torch.testing.assert_close(outputs_cp_hsdp, outputs_shard, atol=tol, rtol=tol)
 
@@ -1304,8 +1316,8 @@ class TestHSDP1MHACPRing(_DTestModelBase):
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
@@ -1320,21 +1332,25 @@ class TestHSDP1MHACPRing(_DTestModelBase):
 
         # Different CP groups get different inputs
 
-        n_cp_groups = mesh["inter_node"].size()
         inputs = self.get_inputs(
-            requires_grad=True, batch_size=n_cp_groups, dtype=torch.bfloat16
+            batch_size=mesh["inter_node"].size(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
         )
         inputs_copy = deepcopy(inputs)
-        inputs_cp_hsdp = self.get_cp_shard(
-            inputs_copy.tensor_split(n_cp_groups, dim=0)[cp_mesh.get_local_rank()],
-            n_shards=cp_mesh.size(),
-            rank=cp_mesh.get_local_rank(),
-        )
+        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs_copy, mesh)
 
         outputs = model(inputs)
         outputs.mean().backward()
         outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
         outputs_cp_fsdp.mean().backward()
+
+        inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
+        inputs_copy_grad_shard = self.get_cp_hsdp_shard(inputs_copy.grad, mesh)
+        tol = 1e-3
+        torch.testing.assert_close(
+            inputs_copy_grad_shard, inputs_grad_shard, atol=tol, rtol=tol
+        )
 
         with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
             dist.barrier()
@@ -1364,25 +1380,21 @@ class TestHSDP1MHACPZigZag(_DTestModelBase):
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
-        # Different CP groups get different inputs
+
         inputs = self.get_inputs(
-            seed=42 + mesh["inter_node"].get_local_rank(), dtype=torch.bfloat16
+            batch_size=mesh["inter_node"].size(), dtype=torch.bfloat16
         )
-        inputs_cp = self.get_cp_shard(
-            inputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
-        )
+        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs, mesh)
 
         outputs = model(inputs)
-        outputs_cp_hsdp = model_cp_hsdp(inputs_cp)
+        outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
 
-        outputs_shard = self.get_cp_shard(
-            outputs, n_shards=cp_mesh.size(), rank=cp_mesh.get_local_rank()
-        )
+        outputs_shard = self.get_cp_hsdp_shard(outputs, mesh)
         tol = 1e-3
         torch.testing.assert_close(outputs_cp_hsdp, outputs_shard, atol=tol, rtol=tol)
 
@@ -1402,8 +1414,8 @@ class TestHSDP1MHACPZigZag(_DTestModelBase):
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
+            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
             use_orig_params=True,
             device_id=self.device,
         )
@@ -1416,23 +1428,25 @@ class TestHSDP1MHACPZigZag(_DTestModelBase):
         #
         # We just use the mean for the loss below.
 
-        # Different CP groups get different inputs
-
-        n_cp_groups = mesh["inter_node"].size()
         inputs = self.get_inputs(
-            requires_grad=True, batch_size=n_cp_groups, dtype=torch.bfloat16
+            batch_size=mesh["inter_node"].size(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
         )
         inputs_copy = deepcopy(inputs)
-        inputs_cp_hsdp = self.get_cp_shard(
-            inputs_copy.tensor_split(n_cp_groups, dim=0)[cp_mesh.get_local_rank()],
-            n_shards=cp_mesh.size(),
-            rank=cp_mesh.get_local_rank(),
-        )
+        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs_copy, mesh)
 
         outputs = model(inputs)
         outputs.mean().backward()
         outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
         outputs_cp_fsdp.mean().backward()
+
+        inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
+        inputs_copy_grad_shard = self.get_cp_hsdp_shard(inputs_copy.grad, mesh)
+        tol = 1e-3
+        torch.testing.assert_close(
+            inputs_copy_grad_shard, inputs_grad_shard, atol=tol, rtol=tol
+        )
 
         with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
             dist.barrier()
