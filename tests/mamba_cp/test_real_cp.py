@@ -1471,8 +1471,7 @@ class TestModelSerialRing(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        # Requires a higher tolerance.
-        tol = 1e-1
+        tol = 1e-2
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
@@ -1514,8 +1513,7 @@ class TestModelAllGatherZigZag(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        # Requires a higher tolerance.
-        tol = 1e-1
+        tol = 1e-2
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
@@ -1557,8 +1555,7 @@ class TestModelSerialZigZag(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        # Requires a higher tolerance.
-        tol = 1e-1
+        tol = 1e-2
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
@@ -1600,8 +1597,7 @@ class TestModelAllGatherRing(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        # Requires a higher tolerance.
-        tol = 1e-1
+        tol = 1e-2
         torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
 
     def test_bwd(self):
