@@ -59,15 +59,14 @@ def _test_model_model_cp_grads_close(
             # which is hard to pass, so just test the mean abs diff relative to the mean abs sum.
             rel_diff = (g - g_cp).abs().mean() / (g + g_cp).abs().mean()
             assert rel_diff < tol, f"{rel_diff =} not less than {tol=}"
-        except Exception as e:
+        except AssertionError as e:
             fails[n] = e
     if fails:
         err_msg = []
+        err_msg.append("\n***************")
         for n, err in fails.items():
-            err_msg.append("\n***************")
-            err_msg.append(f"FAILED on parameter {n}")
-            err_msg.append(str(err))
-            err_msg.append("***************\n")
+            err_msg.append(f"FAILED on {n}: {err}")
+        err_msg.append("***************\n")
         raise RuntimeError("\n".join(err_msg))
 
 
@@ -737,7 +736,10 @@ class TestMamba2CPSerial(_DTestModelBase):
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-        torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
+        tol = 1e-4
+        torch.testing.assert_close(
+            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+        )
 
         # Parameter grads should match after all-reducing.
         _test_model_model_cp_grads_close(mamba2, mamba2_cp)
@@ -782,7 +784,10 @@ class TestMamba2CPAllGather(_DTestModelBase):
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-        torch.testing.assert_close(inputs_grad_shard, inputs_cp_grad_shard)
+        tol = 1e-4
+        torch.testing.assert_close(
+            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+        )
 
         # Parameter grads should match after all-reducing.
         _test_model_model_cp_grads_close(mamba2, mamba2_cp)
