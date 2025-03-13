@@ -438,14 +438,13 @@ class _DTestModelBase(DTest):
             cp_attn_impl=cp_attn_impl,
         )
 
-    def get_model(
-        self, seed: int = 42
-    ) -> MambaLMHeadModel:
+    def get_model(self, seed: int = 42) -> MambaLMHeadModel:
         torch.manual_seed(seed)
         # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
         # uniform dtype, as required by FSDP.
-        return MambaLMHeadModel(config=self.cfg, device=self.device, dtype=self.dtype).to(self.dtype)
-
+        return MambaLMHeadModel(
+            config=self.cfg, device=self.device, dtype=self.dtype
+        ).to(self.dtype)
 
     def get_model_cp(
         self,
@@ -1196,8 +1195,6 @@ class TestHSDP1MHACP(_DTestModelBase):
             _test_model_model_cp_grads_close(model, model_cp_hsdp, all_reduce=False)
 
 
-
-
 class TestModelCPFSDP1(_DTestModelBase):
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
@@ -1257,4 +1254,3 @@ class TestModelCPFSDP1(_DTestModelBase):
         outputs_cp_fsdp.sum().backward()
 
         _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
-
