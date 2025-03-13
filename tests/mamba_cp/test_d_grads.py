@@ -64,6 +64,22 @@ if __name__ == "__main__":
         for n, p in model.named_parameters():
             if n.endswith(".D"):
                 D_grad = p.grad
+            elif p.grad is not None:
+                grad = p.grad
+                non_D_grads = (
+                    [torch.empty_like(grad) for _ in range(world_size)]
+                    if not rank
+                    else None
+                )
+                dist.gather(grad, non_D_grads)
+                if not rank:
+                    for r in range(1, world_size):
+                        torch.testing.assert_close(non_D_grads[0], non_D_grads[r])
+
+        if not rank:
+            print(
+                "\n******************** All non-D parameter grads match ********************\n"
+            )
 
         all_losses = (
             [torch.empty_like(loss) for _ in range(world_size)] if not rank else None
@@ -81,18 +97,18 @@ if __name__ == "__main__":
         if not rank:
             # Nice formatted printing:
             print("********** ALL LOSSES **********", flush=True)
-            for rank, loss in enumerate(all_losses):
-                print(f"[{rank=}]: {loss=}", flush=True)
+            for r, loss in enumerate(all_losses):
+                print(f"[rank={r}]: {loss=}", flush=True)
             print("********** ALL INPUTS **********", flush=True)
-            for rank, inputs in enumerate(all_inputs):
-                print(f"[{rank=}]: {inputs=}", flush=True)
+            for r, inputs in enumerate(all_inputs):
+                print(f"[rank={r}]: {inputs=}", flush=True)
             print("********** ALL D_GRADS **********", flush=True)
-            for rank, D_grad in enumerate(all_D_grads):
-                print(f"[{rank=}]: {D_grad=}", flush=True)
+            for r, D_grad in enumerate(all_D_grads):
+                print(f"[rank={r}]: {D_grad=}", flush=True)
             torch.cuda.synchronize()
-            for rank in range(1, world_size):
-                torch.testing.assert_close(all_losses[0], all_losses[rank])
-                torch.testing.assert_close(all_inputs[0], all_inputs[rank])
-                torch.testing.assert_close(all_D_grads[0], all_D_grads[rank])
+            for r in range(1, world_size):
+                torch.testing.assert_close(all_losses[0], all_losses[r])
+                torch.testing.assert_close(all_inputs[0], all_inputs[r])
+                torch.testing.assert_close(all_D_grads[0], all_D_grads[r])
     finally:
         dist.destroy_process_group()
