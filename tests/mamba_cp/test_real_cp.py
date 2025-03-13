@@ -50,6 +50,7 @@ def _test_model_model_cp_grads_close(
         for g_cp in grads_cp.values():
             dist.all_reduce(g_cp)
     dist.barrier()
+    torch.cuda.synchronize()
     assert set(grads) == set(grads_cp)
     fails = {}
     for n, g_cp in grads_cp.items():
@@ -57,8 +58,9 @@ def _test_model_model_cp_grads_close(
         try:
             # NOTE: @goon - torch.testing.assert_close on the grads is an extremely strict metric,
             # which is hard to pass, so just test the mean abs diff relative to the mean abs sum.
-            rel_diff = (g - g_cp).abs().mean() / (g + g_cp).abs().mean()
-            assert rel_diff < tol, f"{rel_diff =} not less than {tol=}"
+            abs_diff = (g - g_cp).abs().mean()
+            rel_diff = abs_diff / (g + g_cp).abs().mean()
+            assert rel_diff < tol, f"{rel_diff =} not less than {tol=}. {abs_diff=}"
         except AssertionError as e:
             fails[n] = e
     if fails:
@@ -83,9 +85,15 @@ class TestCausalPassingFn(DTest):
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         t_recv = causal_passing_comms(t_send[self.rank], mesh)
         if self.rank == 0:
-            torch.testing.assert_close(t_recv, torch.zeros_like(t_recv))
+            torch.testing.assert_close(
+                t_recv,
+                torch.zeros_like(t_recv),
+            )
         else:
-            torch.testing.assert_close(t_recv, t_send[(self.rank - 1)])
+            torch.testing.assert_close(
+                t_recv,
+                t_send[(self.rank - 1)],
+            )
 
     def test_bwd(self):
         torch.manual_seed(42)
@@ -105,10 +113,16 @@ class TestCausalPassingFn(DTest):
             assert t_send.grad is None
         else:
             grad = t_send.grad[self.rank]
-            torch.testing.assert_close(grad, t_send[self.rank])
+            torch.testing.assert_close(
+                grad,
+                t_send[self.rank],
+            )
             other_idxs = torch.arange(self.world_size, device=self.device) != self.rank
             zero_grads = t_send.grad[other_idxs]
-            torch.testing.assert_close(zero_grads, torch.zeros_like(zero_grads))
+            torch.testing.assert_close(
+                zero_grads,
+                torch.zeros_like(zero_grads),
+            )
 
 
 class TestSeqToZigZagFn(DTest):
@@ -128,7 +142,10 @@ class TestSeqToZigZagFn(DTest):
             device=self.device,
             dtype=dtype,
         )
-        torch.testing.assert_close(t_recv, t_expected)
+        torch.testing.assert_close(
+            t_recv,
+            t_expected,
+        )
 
     def test_bwd(self):
         seq_dim = 1
@@ -145,7 +162,10 @@ class TestSeqToZigZagFn(DTest):
         t_recv.pow(2).div(2).sum().backward()
 
         grad = t_send.grad
-        torch.testing.assert_close(grad, t_send)
+        torch.testing.assert_close(
+            grad,
+            t_send,
+        )
 
 
 class TestZigZagToSeqFn(DTest):
@@ -165,7 +185,10 @@ class TestZigZagToSeqFn(DTest):
             device=self.device,
             dtype=dtype,
         )
-        torch.testing.assert_close(t_recv, t_expected)
+        torch.testing.assert_close(
+            t_recv,
+            t_expected,
+        )
 
     def test_bwd(self):
         seq_dim = 1
@@ -182,7 +205,10 @@ class TestZigZagToSeqFn(DTest):
         t_recv.pow(2).div(2).sum().backward()
 
         grad = t_send.grad
-        torch.testing.assert_close(grad, t_send)
+        torch.testing.assert_close(
+            grad,
+            t_send,
+        )
 
 
 class TestZigZagToSeqInverse(DTest):
@@ -203,7 +229,10 @@ class TestZigZagToSeqInverse(DTest):
         # Send and send again
         t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
         t_recv = zigzag_to_seq_comms(t_recv, mesh, seq_dim)
-        torch.testing.assert_close(t_recv, t_send)
+        torch.testing.assert_close(
+            t_recv,
+            t_send,
+        )
 
     def test_zig_then_seq(self) -> None:
         seq_dim = 1
@@ -218,7 +247,10 @@ class TestZigZagToSeqInverse(DTest):
         # Send and send again
         t_recv = zigzag_to_seq_comms(t_send, mesh, seq_dim)
         t_recv = seq_to_zigzag_comms(t_recv, mesh, seq_dim)
-        torch.testing.assert_close(t_recv, t_send)
+        torch.testing.assert_close(
+            t_recv,
+            t_send,
+        )
 
 
 class TestIdentityFwdAllGatherBwdFn(DTest):
@@ -285,7 +317,6 @@ class TestIdentityFwdAllGatherBwdFn(DTest):
 
 
 class _DTestModelBase(DTest):
-    batch_size = 2
     chunk_size = 4
     d_model = 256
     d_state = 128
@@ -297,7 +328,7 @@ class _DTestModelBase(DTest):
     embed_dim = d_model
     head_dim = 64
     num_heads = d_model // head_dim
-    dtype = torch.float32
+    dtype = torch.bfloat16
     ssm_cfg = {"layer": "Mamba2"}
     vocab_size = 1024
     n_layer = 2
@@ -320,6 +351,18 @@ class _DTestModelBase(DTest):
         attn_cfg=attn_cfg,
         tie_embeddings=False,
     )
+
+    @property
+    def tol(self) -> float:
+        return 1e-2 if self.dtype == torch.bfloat16 else 1e-3
+
+    @property
+    def batch_size(self) -> int:
+        """
+        batch_size == world_size is a reasonable default for testing FSDP-sharded models:
+        easy to distribute world_size batch elements for a local model to batch-size-1 trained FSDP model.
+        """
+        return self.world_size
 
     @property
     def seq_len(self) -> int:
@@ -535,7 +578,10 @@ class TestConvCP(_DTestModelBase):
         outputs = conv(xBC, mamba2)
         outputs_cp = conv_cp(xBC_cp, mamba2, cp_mesh)
         torch.testing.assert_close(
-            outputs_cp, outputs.tensor_split(self.world_size, dim=1)[self.rank]
+            outputs_cp,
+            outputs.tensor_split(self.world_size, dim=1)[self.rank],
+            atol=self.tol,
+            rtol=self.tol,
         )
 
     def test_bwd(self):
@@ -555,16 +601,14 @@ class TestConvCP(_DTestModelBase):
 
         xBC_grad_shard = self.get_cp_shard(xBC.grad)
         xBC_cp_grad_shard = self.get_cp_shard(xBC_copy.grad)
-        tol = None if self.dtype == torch.float32 else 1e-2
         torch.testing.assert_close(
-            xBC_grad_shard, xBC_cp_grad_shard, atol=tol, rtol=tol
+            xBC_grad_shard, xBC_cp_grad_shard, atol=self.tol, rtol=self.tol
         )
 
 
-class TestSerialScanCP(_DTestModelBase):
-    cp_mamba_impl = "serial"
-
-    def test_fwd(self):
+class TestScanCP(_DTestModelBase):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_fwd(self, cp_mamba_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         inputs = self.get_inputs()
@@ -577,7 +621,7 @@ class TestSerialScanCP(_DTestModelBase):
         # And the CP output:
         inputs_cp_shard = self.get_cp_shard(inputs)
         kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, mamba2)
-        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = CP_MAMBA_IMPLS[cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
 
         # All-gather and verify correctness
         outputs_cp_all_gathered = torch.empty(
@@ -592,10 +636,12 @@ class TestSerialScanCP(_DTestModelBase):
         outputs_cp_all_gathered = rearrange(
             outputs_cp_all_gathered, "r b l ... -> b (r l) ..."
         )
-        tol = 1e-3
-        torch.testing.assert_close(outputs, outputs_cp_all_gathered, atol=tol, rtol=tol)
+        torch.testing.assert_close(
+            outputs, outputs_cp_all_gathered, atol=self.tol, rtol=self.tol
+        )
 
-    def test_bwd(self):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_bwd(self, cp_mamba_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
 
@@ -613,100 +659,28 @@ class TestSerialScanCP(_DTestModelBase):
 
         # And on the CP output:
         kwargs_cp = self.get_scan_kwargs(inputs_cp, mamba2_cp)
-        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
+        outputs_cp = CP_MAMBA_IMPLS[cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
         outputs_cp.sum().backward()
 
         # Rearrange grads to compare proper slices
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
 
-        tol = 1e-2
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+            inputs_grad_shard, inputs_cp_grad_shard, atol=self.tol, rtol=self.tol
         )
 
         # Parameter grads should match after all-reducing.
         _test_model_model_cp_grads_close(mamba2, mamba2_cp)
 
 
-class TestAllGatherScanCP(_DTestModelBase):
-    cp_mamba_impl = "allgather"
-
-    def test_fwd(self):
-        torch.manual_seed(42)
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        inputs = self.get_inputs()
-        mamba2 = self.get_mamba2()
-
-        # The correct global outputs:
-        kwargs = self.get_scan_kwargs(inputs, mamba2)
-        outputs = mamba_chunk_scan_combined(**kwargs)
-
-        # And the CP output:
-        inputs_cp_shard = self.get_cp_shard(inputs)
-        kwargs_cp = self.get_scan_kwargs(inputs_cp_shard, mamba2)
-        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
-
-        # All-gather and verify correctness
-        outputs_cp_all_gathered = torch.empty(
-            self.world_size,
-            *outputs_cp.shape,
-            dtype=outputs_cp.dtype,
-            device=outputs_cp.device,
-        )
-        dist.all_gather_into_tensor(
-            outputs_cp_all_gathered, outputs_cp, cp_mesh.get_group()
-        )
-        outputs_cp_all_gathered = rearrange(
-            outputs_cp_all_gathered, "r b l ... -> b (r l) ..."
-        )
-        tol = 1e-3
-        torch.testing.assert_close(outputs, outputs_cp_all_gathered, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        torch.manual_seed(42)
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-
-        inputs = self.get_inputs(requires_grad=True)
-        mamba2 = self.get_mamba2()
-
-        inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
-        mamba2_cp = deepcopy(mamba2)
-
-        # Backward on the correct global result
-        kwargs = self.get_scan_kwargs(inputs, mamba2)
-        outputs = mamba_chunk_scan_combined(**kwargs)
-        outputs.sum().backward()
-
-        # And on the CP output:
-        kwargs_cp = self.get_scan_kwargs(inputs_cp, mamba2_cp)
-        outputs_cp = CP_MAMBA_IMPLS[self.cp_mamba_impl](cp_mesh=cp_mesh, **kwargs_cp)
-        outputs_cp.sum().backward()
-
-        # Rearrange grads to compare proper slices
-        inputs_grad_shard = self.get_cp_shard(inputs.grad)
-        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-
-        tol = 1e-2
-        torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
-        )
-
-        # Parameter grads should match after all-reducing.
-        _test_model_model_cp_grads_close(mamba2, mamba2_cp)
-
-
-class TestMamba2CPSerial(_DTestModelBase):
-    cp_mamba_impl = "serial"
-
-    def test_fwd(self):
+class TestMamba2CP(_DTestModelBase):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_fwd(self, cp_mamba_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(
-            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
-        )
+        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
 
         inputs = self.get_inputs()
         inputs_cp = self.get_cp_shard(inputs)
@@ -715,15 +689,16 @@ class TestMamba2CPSerial(_DTestModelBase):
         outputs_cp = mamba2_cp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
-        torch.testing.assert_close(outputs_cp, outputs_shard)
+        torch.testing.assert_close(
+            outputs_cp, outputs_shard, atol=self.tol, rtol=self.tol
+        )
 
-    def test_bwd(self):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_bwd(self, cp_mamba_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(
-            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
-        )
+        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
 
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
@@ -736,71 +711,21 @@ class TestMamba2CPSerial(_DTestModelBase):
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-        tol = 1e-4
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+            inputs_grad_shard, inputs_cp_grad_shard, atol=self.tol, rtol=self.tol
         )
 
         # Parameter grads should match after all-reducing.
         _test_model_model_cp_grads_close(mamba2, mamba2_cp)
 
 
-class TestMamba2CPAllGather(_DTestModelBase):
-    cp_mamba_impl = "allgather"
-
-    def test_fwd(self):
-        torch.manual_seed(42)
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(
-            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
-        )
-
-        inputs = self.get_inputs()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = mamba2(inputs)
-        outputs_cp = mamba2_cp(inputs_cp)
-
-        outputs_shard = self.get_cp_shard(outputs)
-        torch.testing.assert_close(outputs_cp, outputs_shard)
-
-    def test_bwd(self):
-        torch.manual_seed(42)
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(
-            cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl
-        )
-
-        inputs = self.get_inputs(requires_grad=True)
-        inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
-
-        outputs = mamba2(inputs)
-        outputs.sum().backward()
-        outputs_cp = mamba2_cp(inputs_cp)
-        outputs_cp.sum().backward()
-
-        inputs_grad_shard = self.get_cp_shard(inputs.grad)
-        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-        tol = 1e-4
-        torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
-        )
-
-        # Parameter grads should match after all-reducing.
-        _test_model_model_cp_grads_close(mamba2, mamba2_cp)
-
-
-class TestMHACPRing(_DTestModelBase):
-    cp_attn_impl = "ring"
-
-    def test_fwd(self):
+class TestMHACP(_DTestModelBase):
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_fwd(self, cp_attn_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
 
         # Requires bfloat16
         inputs = self.get_inputs(dtype=torch.bfloat16)
@@ -810,14 +735,16 @@ class TestMHACPRing(_DTestModelBase):
         outputs_cp = mha_cp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-2
-        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
+        torch.testing.assert_close(
+            outputs_cp, outputs_shard, atol=self.tol, rtol=self.tol
+        )
 
-    def test_bwd(self):
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_bwd(self, cp_attn_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
 
         # Requires bfloat16
         inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
@@ -831,10 +758,9 @@ class TestMHACPRing(_DTestModelBase):
 
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-        tol = 1e-2
         dist.barrier()
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+            inputs_grad_shard, inputs_cp_grad_shard, atol=self.tol, rtol=self.tol
         )
 
         # Parameter grads should match after all-reducing.
@@ -842,94 +768,47 @@ class TestMHACPRing(_DTestModelBase):
         _test_model_model_cp_grads_close(mha, mha_cp)
 
 
-class TestMHACPZigZag(_DTestModelBase):
-    cp_attn_impl = "zigzag"
-
-    def test_fwd(self):
-        torch.manual_seed(42)
+class TestFSDP1MambaCP(_DTestModelBase):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_fwd(self, cp_mamba_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
+        model_cp = nn.Sequential(
+            *[
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+                for _ in range(3)
+            ]
+        ).to(self.dtype)
+        model_cp_fsdp = FSDP(
+            model_cp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
 
-        # Requires bfloat16
-        inputs = self.get_inputs(dtype=torch.bfloat16)
+        inputs = self.get_inputs()
         inputs_cp = self.get_cp_shard(inputs)
 
-        outputs = mha(inputs)
-        outputs_cp = mha_cp(inputs_cp)
+        outputs = model(inputs)
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-2
-        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        torch.manual_seed(42)
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        mha = self.get_mha()
-        mha_cp = self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
-
-        # Requires bfloat16
-        inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
-        inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
-
-        outputs = mha(inputs)
-        outputs.sum().backward()
-        outputs_cp = mha_cp(inputs_cp)
-        outputs_cp.sum().backward()
-
-        inputs_grad_shard = self.get_cp_shard(inputs.grad)
-        inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
-        tol = 1e-2
-        dist.barrier()
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=tol, rtol=tol
+            outputs_cp_fsdp, outputs_shard, atol=self.tol, rtol=self.tol
         )
 
-        # Parameter grads should match after all-reducing.
-        # Needs a high tol to pass?
-        _test_model_model_cp_grads_close(mha, mha_cp)
-
-
-class TestFSDP1MambaCPSerial(_DTestModelBase):
-    cp_mamba_impl = "serial"
-
-    def test_fwd(self):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_bwd(self, cp_mamba_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        )
-        model_cp_fsdp = FSDP(
-            model_cp,
-            process_group=cp_mesh.get_group(),
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-
-        inputs = self.get_inputs()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs)
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
-
-        outputs_shard = self.get_cp_shard(outputs)
-        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
-                for _ in range(3)
-            ]
-        )
+        ).to(self.dtype)
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -952,97 +831,43 @@ class TestFSDP1MambaCPSerial(_DTestModelBase):
         inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
 
         outputs = model(inputs)
-        outputs.mean().backward()
+        loss = outputs.mean()
+        loss.backward()
+
         outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
-        outputs_cp_fsdp.mean().backward()
+        loss_cp_fsdp = outputs_cp_fsdp.mean()
+        loss_cp_fsdp.backward()
+
+        # Check the losses and grad norms are the same.
+        with torch.no_grad():
+            dist.all_reduce(loss_cp_fsdp)
+            mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
+            torch.testing.assert_close(
+                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+            )
+
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
+        torch.testing.assert_close(
+            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+        )
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
             dist.barrier()
             _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
 
 
-class TestFSDP1MambaCPAllGather(_DTestModelBase):
-    cp_mamba_impl = "allgather"
-
-    def test_fwd(self):
+class TestFSDP1MHACP(_DTestModelBase):
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_fwd(self, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        )
-        model_cp_fsdp = FSDP(
-            model_cp,
-            process_group=cp_mesh.get_group(),
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-
-        inputs = self.get_inputs()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs)
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
-
-        outputs_shard = self.get_cp_shard(outputs)
-        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
-                for _ in range(3)
-            ]
-        )
-        model_cp_fsdp = FSDP(
-            model_cp,
-            process_group=cp_mesh.get_group(),
-            auto_wrap_policy=ModuleWrapPolicy([Mamba2CP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
-
-        inputs = self.get_inputs(requires_grad=True)
-        inputs_copy = deepcopy(inputs)
-        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
-
-        outputs = model(inputs)
-        outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
-        outputs_cp_fsdp.mean().backward()
-
-        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
-            dist.barrier()
-            _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
-
-
-class TestFSDP1MHACPRing(_DTestModelBase):
-    cp_attn_impl = "ring"
-
-    def test_fwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
-                for _ in range(3)
-            ]
-        )
+        ).to(self.dtype)
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -1059,18 +884,23 @@ class TestFSDP1MHACPRing(_DTestModelBase):
         outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
 
         outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-3
-        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard, atol=tol, rtol=tol)
+        torch.testing.assert_close(
+            outputs_cp_fsdp,
+            outputs_shard,
+            atol=self.tol,
+            rtol=self.tol,
+        )
 
-    def test_bwd(self):
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_bwd(self, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        )
+        ).to(self.dtype)
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -1093,106 +923,51 @@ class TestFSDP1MHACPRing(_DTestModelBase):
         inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
 
         outputs = model(inputs)
-        outputs.mean().backward()
+        loss = outputs.mean()
+        loss.backward()
+
         outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
-        outputs_cp_fsdp.mean().backward()
+        loss_cp_fsdp = outputs_cp_fsdp.mean()
+        loss_cp_fsdp.backward()
+
+        # Check the losses and grad norms are the same.
+        with torch.no_grad():
+            dist.all_reduce(loss_cp_fsdp)
+            mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
+            torch.testing.assert_close(
+                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+            )
+
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
+        torch.testing.assert_close(
+            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+        )
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
             dist.barrier()
             _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
 
 
-class TestFSDP1MHACPZigZag(_DTestModelBase):
-    cp_attn_impl = "zigzag"
-
-    def test_fwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
-                for _ in range(3)
-            ]
-        )
-        model_cp_fsdp = FSDP(
-            model_cp,
-            process_group=cp_mesh.get_group(),
-            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-
-        inputs = self.get_inputs(dtype=torch.bfloat16)
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs)
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp)
-
-        outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-3
-        torch.testing.assert_close(outputs_cp_fsdp, outputs_shard, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
-                for _ in range(3)
-            ]
-        )
-        model_cp_fsdp = FSDP(
-            model_cp,
-            process_group=cp_mesh.get_group(),
-            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
-
-        inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
-        inputs_copy = deepcopy(inputs)
-        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
-
-        outputs = model(inputs)
-        outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp)
-        outputs_cp_fsdp.mean().backward()
-
-        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
-            dist.barrier()
-            _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
-
-
-class TestHSDP1MambaCPAllGather(_DTestModelBase):
+class TestHSDP1MambaCP(_DTestModelBase):
     """
     Test HSDP + CP for MambaCP where the HSDP and CP dims cover the same subgroups
     """
 
-    cp_mamba_impl = "allgather"
-
     @pytest.mark.world_size(4)
-    def test_fwd(self):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_fwd(self, cp_mamba_impl):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        )
+        ).to(self.dtype)
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1209,21 +984,27 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
 
         outputs_shard = self.get_cp_hsdp_shard(outputs, mesh)
-        torch.testing.assert_close(outputs_cp_hsdp, outputs_shard)
+        torch.testing.assert_close(
+            outputs_cp_hsdp,
+            outputs_shard,
+            atol=self.tol,
+            rtol=self.tol,
+        )
 
     @pytest.mark.world_size(4)
-    def test_bwd(self):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    def test_bwd(self, cp_mamba_impl):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=self.cp_mamba_impl)
+                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        )
+        ).to(self.dtype)
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1248,15 +1029,33 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
         inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs_copy, mesh)
 
         outputs = model(inputs)
-        outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
-        outputs_cp_fsdp.mean().backward()
+        loss = outputs.mean()
+        loss.backward()
+        outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
+        loss_cp_hsdp = outputs_cp_hsdp.mean()
+        loss_cp_hsdp.backward()
+
+        # Check the losses and grad norms are the same.
+        with torch.no_grad():
+            dist.all_reduce(loss_cp_hsdp)
+            mean_loss_cp_hsdp = loss_cp_hsdp / self.world_size
+            torch.testing.assert_close(
+                loss, mean_loss_cp_hsdp, atol=self.tol, rtol=self.tol
+            )
+
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm_cp_hsdp = model_cp_hsdp.clip_grad_norm_(1.0)
+        torch.testing.assert_close(
+            grad_norm, grad_norm_cp_hsdp, atol=self.tol, rtol=self.tol
+        )
 
         inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
         inputs_copy_grad_shard = self.get_cp_hsdp_shard(inputs_copy.grad, mesh)
-        tol = 1e-3
         torch.testing.assert_close(
-            inputs_copy_grad_shard, inputs_grad_shard, atol=tol, rtol=tol
+            inputs_copy_grad_shard,
+            inputs_grad_shard,
+            atol=self.tol,
+            rtol=self.tol,
         )
 
         with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
@@ -1264,26 +1063,25 @@ class TestHSDP1MambaCPAllGather(_DTestModelBase):
             _test_model_model_cp_grads_close(model, model_cp_hsdp, all_reduce=False)
 
 
-class TestHSDP1MHACPRing(_DTestModelBase):
+class TestHSDP1MHACP(_DTestModelBase):
     """
     Test HSDP + CP for MHACP where the HSDP and CP dims cover the same subgroups
     """
 
-    cp_attn_impl = "ring"
-
     @pytest.mark.world_size(4)
-    def test_fwd(self):
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_fwd(self, cp_attn_impl):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        )
+        ).to(self.dtype)
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1302,120 +1100,27 @@ class TestHSDP1MHACPRing(_DTestModelBase):
         outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
 
         outputs_shard = self.get_cp_hsdp_shard(outputs, mesh)
-        tol = 1e-3
-        torch.testing.assert_close(outputs_cp_hsdp, outputs_shard, atol=tol, rtol=tol)
-
-    @pytest.mark.world_size(4)
-    def test_bwd(self):
-        mesh = dist.device_mesh.init_device_mesh(
-            "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
-        )
-        cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
-                for _ in range(3)
-            ]
-        )
-        model_cp_hsdp = FSDP(
-            model_cp,
-            device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
-            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
-
-        # Different CP groups get different inputs
-
-        inputs = self.get_inputs(
-            batch_size=mesh["inter_node"].size(),
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
-        inputs_copy = deepcopy(inputs)
-        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs_copy, mesh)
-
-        outputs = model(inputs)
-        outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
-        outputs_cp_fsdp.mean().backward()
-
-        inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
-        inputs_copy_grad_shard = self.get_cp_hsdp_shard(inputs_copy.grad, mesh)
-        tol = 1e-3
         torch.testing.assert_close(
-            inputs_copy_grad_shard, inputs_grad_shard, atol=tol, rtol=tol
+            outputs_cp_hsdp,
+            outputs_shard,
+            atol=self.tol,
+            rtol=self.tol,
         )
 
-        with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
-            dist.barrier()
-            _test_model_model_cp_grads_close(model, model_cp_hsdp, all_reduce=False)
-
-
-class TestHSDP1MHACPZigZag(_DTestModelBase):
-    """
-    Test HSDP + CP for MHACP where the HSDP and CP dims cover the same subgroups
-    """
-
-    cp_attn_impl = "zigzag"
-
     @pytest.mark.world_size(4)
-    def test_fwd(self):
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_bwd(self, cp_attn_impl):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
         model_cp = nn.Sequential(
             *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
+                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        )
-        model_cp_hsdp = FSDP(
-            model_cp,
-            device_mesh=mesh,
-            auto_wrap_policy=ModuleWrapPolicy([MHACP]),
-            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-
-        inputs = self.get_inputs(
-            batch_size=mesh["inter_node"].size(), dtype=torch.bfloat16
-        )
-        inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs, mesh)
-
-        outputs = model(inputs)
-        outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
-
-        outputs_shard = self.get_cp_hsdp_shard(outputs, mesh)
-        tol = 1e-3
-        torch.testing.assert_close(outputs_cp_hsdp, outputs_shard, atol=tol, rtol=tol)
-
-    @pytest.mark.world_size(4)
-    def test_bwd(self):
-        mesh = dist.device_mesh.init_device_mesh(
-            "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
-        )
-        cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
-        model_cp = nn.Sequential(
-            *[
-                self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=self.cp_attn_impl)
-                for _ in range(3)
-            ]
-        )
+        ).to(self.dtype)
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1442,15 +1147,34 @@ class TestHSDP1MHACPZigZag(_DTestModelBase):
         inputs_cp_hsdp = self.get_cp_hsdp_shard(inputs_copy, mesh)
 
         outputs = model(inputs)
-        outputs.mean().backward()
-        outputs_cp_fsdp = model_cp_hsdp(inputs_cp_hsdp)
-        outputs_cp_fsdp.mean().backward()
+        loss = outputs.mean()
+        loss.backward()
+
+        outputs_cp_hsdp = model_cp_hsdp(inputs_cp_hsdp)
+        loss_cp_hsdp = outputs_cp_hsdp.mean()
+        loss_cp_hsdp.backward()
+
+        # Check the losses and grad norms are the same.
+        with torch.no_grad():
+            dist.all_reduce(loss_cp_hsdp)
+            mean_loss_cp_hsdp = loss_cp_hsdp / self.world_size
+            torch.testing.assert_close(
+                loss, mean_loss_cp_hsdp, atol=self.tol, rtol=self.tol
+            )
+
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm_cp_hsdp = model_cp_hsdp.clip_grad_norm_(1.0)
+        torch.testing.assert_close(
+            grad_norm, grad_norm_cp_hsdp, atol=self.tol, rtol=self.tol
+        )
 
         inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
         inputs_copy_grad_shard = self.get_cp_hsdp_shard(inputs_copy.grad, mesh)
-        tol = 1e-3
         torch.testing.assert_close(
-            inputs_copy_grad_shard, inputs_grad_shard, atol=tol, rtol=tol
+            inputs_copy_grad_shard,
+            inputs_grad_shard,
+            atol=self.tol,
+            rtol=self.tol,
         )
 
         with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
@@ -1458,15 +1182,14 @@ class TestHSDP1MHACPZigZag(_DTestModelBase):
             _test_model_model_cp_grads_close(model, model_cp_hsdp, all_reduce=False)
 
 
-class TestModelSerialRing(_DTestModelBase):
-    cp_mamba_impl = "serial"
-    cp_attn_impl = "ring"
-
-    def test_fwd(self):
+class TestModel(_DTestModelBase):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_fwd(self, cp_mamba_impl, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
         model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
         )
 
         inputs = self.get_input_toks()
@@ -1476,140 +1199,20 @@ class TestModelSerialRing(_DTestModelBase):
         outputs_cp = model_cp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-2
-        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+        torch.testing.assert_close(
+            outputs_cp,
+            outputs_shard,
+            atol=self.tol,
+            rtol=self.tol,
         )
 
-        inputs = self.get_input_toks()
-        inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
-
-        outputs = model(inputs).logits
-        outputs.sum().backward()
-        outputs_cp = model_cp(inputs_cp).logits
-        outputs_cp.sum().backward()
-
-        # Parameter grads should match after all-reducing.
-        # Requires high tol
-        _test_model_model_cp_grads_close(model, model_cp)
-
-
-class TestModelAllGatherZigZag(_DTestModelBase):
-    cp_mamba_impl = "allgather"
-    cp_attn_impl = "zigzag"
-
-    def test_fwd(self):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_bwd(self, cp_mamba_impl, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
         model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
-        )
-
-        inputs = self.get_input_toks()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs).logits
-        outputs_cp = model_cp(inputs_cp).logits
-
-        outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-2
-        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
-        )
-
-        inputs = self.get_input_toks()
-        inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
-
-        outputs = model(inputs).logits
-        outputs.sum().backward()
-        outputs_cp = model_cp(inputs_cp).logits
-        outputs_cp.sum().backward()
-
-        # Parameter grads should match after all-reducing.
-        # Requires high tol
-        _test_model_model_cp_grads_close(model, model_cp)
-
-
-class TestModelSerialZigZag(_DTestModelBase):
-    cp_mamba_impl = "serial"
-    cp_attn_impl = "zigzag"
-
-    def test_fwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
-        )
-
-        inputs = self.get_input_toks()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs).logits
-        outputs_cp = model_cp(inputs_cp).logits
-
-        outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-2
-        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
-        )
-
-        inputs = self.get_input_toks()
-        inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
-
-        outputs = model(inputs).logits
-        outputs.sum().backward()
-        outputs_cp = model_cp(inputs_cp).logits
-        outputs_cp.sum().backward()
-
-        # Parameter grads should match after all-reducing.
-        # Requires high tol
-        _test_model_model_cp_grads_close(model, model_cp)
-
-
-class TestModelAllGatherRing(_DTestModelBase):
-    cp_mamba_impl = "allgather"
-    cp_attn_impl = "ring"
-
-    def test_fwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
-        )
-
-        inputs = self.get_input_toks()
-        inputs_cp = self.get_cp_shard(inputs)
-
-        outputs = model(inputs).logits
-        outputs_cp = model_cp(inputs_cp).logits
-
-        outputs_shard = self.get_cp_shard(outputs)
-        tol = 1e-2
-        torch.testing.assert_close(outputs_cp, outputs_shard, atol=tol, rtol=tol)
-
-    def test_bwd(self):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=self.cp_mamba_impl, cp_attn_impl=self.cp_attn_impl
+            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
         )
 
         inputs = self.get_input_toks()
