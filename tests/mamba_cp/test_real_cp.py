@@ -1,5 +1,4 @@
 from copy import deepcopy
-from pprint import pprint
 from typing import Literal, Optional
 
 import pytest
@@ -89,7 +88,7 @@ def _test_model_model_cp_grads_close(
         for n, msg in passes.items():
             pass_msg.append(f"{n}: {msg}")
         pass_msg.append("***************\n")
-        print("\n".join(pass_msg))
+        print("\n".join(pass_msg), flush=True)
 
     if fails:
         err_msg = []
@@ -1260,11 +1259,6 @@ class TestModelCPFSDP1(_DTestModelBase):
         )
         loss.backward()
 
-        # TODO: @goon - DELETE test
-        for n, p in model.named_parameters():
-            if n.endswith(".D"):
-                self.print_rank(f"{n=}, {p.grad=}")
-
         outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp).logits
         loss_cp_fsdp = F.cross_entropy(
             outputs_cp_fsdp.reshape(-1, outputs_cp_fsdp.size(-1)),
@@ -1289,76 +1283,6 @@ class TestModelCPFSDP1(_DTestModelBase):
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
             dist.barrier()
             _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
-
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
-    def test_bwd_test(self, cp_mamba_impl, cp_attn_impl):
-        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = self.get_model()
-        model_cp_fsdp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
-        )
-        model_cp_fsdp = FSDP(
-            model_cp_fsdp,
-            process_group=cp_mesh.get_group(),
-            auto_wrap_policy=ModuleWrapPolicy([Block]),
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            use_orig_params=True,
-            device_id=self.device,
-        )
-
-        inputs = self.get_input_toks()
-        inputs_cp_fsdp = self.get_cp_shard(deepcopy(inputs))
-
-        outputs = model(inputs).logits
-        loss = F.cross_entropy(
-            outputs.reshape(-1, outputs.size(-1)), inputs.reshape(-1).long()
-        )
-        loss.backward()
-
-        # TODO: @goon - DELETE test. For some reason, different grads get populated on the different
-        # D's on different ranks?
-        for n, p in model.named_parameters():
-            if n.endswith(".D"):
-                D_grad = p.grad
-                self.print_rank(f"{inputs=}")
-                self.print_rank(f"{n=}, {p.grad=}")
-
-        all_losses = (
-            [torch.empty_like(loss) for _ in range(self.world_size)]
-            if not self.rank
-            else None
-        )
-        dist.gather(loss, all_losses)
-        all_inputs = (
-            [torch.empty_like(inputs) for _ in range(self.world_size)]
-            if not self.rank
-            else None
-        )
-        dist.gather(inputs, all_inputs)
-        all_D_grads = (
-            [torch.empty_like(D_grad) for _ in range(self.world_size)]
-            if not self.rank
-            else None
-        )
-        dist.gather(D_grad, all_D_grads)
-        if not self.rank:
-            #Nice formatted printing:
-
-            print(f"********** ALL LOSSES **********", flush=True)
-            for rank, loss in enumerate(all_losses):
-                print(f"[{rank=}]: {loss=}", flush=True)
-            print(f"********** ALL INPUTS **********", flush=True)
-            for rank, inputs in enumerate(all_inputs):
-                print(f"[{rank=}]: {inputs=}", flush=True)
-            print(f"********** ALL D_GRADS **********", flush=True)
-            for rank, D_grad in enumerate(all_D_grads):
-                print(f"[{rank=}]: {D_grad=}", flush=True)
-            torch.cuda.synchronize()
-            for rank in range(1, self.world_size):
-                torch.testing.assert_close(all_losses[0], all_losses[rank])
-                torch.testing.assert_close(all_inputs[0], all_inputs[rank])
-                torch.testing.assert_close(all_D_grads[0], all_D_grads[rank])
 
 
 class TestModelCPFSDP2(_DTestModelBase):
@@ -1428,11 +1352,12 @@ class TestModelCPFSDP2(_DTestModelBase):
                 loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
             )
 
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
-        torch.testing.assert_close(
-            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
-        )
+        # TODO: @goon - FSDP2 grad clipping is more involved; see torch-titan.
+        # grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
+        # torch.testing.assert_close(
+        #     grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+        # )
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
             dist.barrier()
