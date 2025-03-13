@@ -1,14 +1,17 @@
 from copy import deepcopy
+from pprint import pprint
 from typing import Literal, Optional
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.fsdp import ShardingStrategy, fully_shard
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.distributed.tensor import DTensor, Replicate
 
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
@@ -40,20 +43,27 @@ def _test_model_model_cp_grads_close(
     model_cp: nn.Module,
     tol: float = 1e-2,
     all_reduce: bool = False,
+    print_passes: bool = True,
 ) -> None:
     grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
-    grads_cp = {
-        n: deepcopy(p.grad)
-        for n, p in model_cp.named_parameters()
-        if p.grad is not None
-    }
-    if all_reduce:
-        for g_cp in grads_cp.values():
-            dist.all_reduce(g_cp)
+    grads_cp = {}
+    for n, p in model_cp.named_parameters():
+        if p.grad is not None:
+            if isinstance(p.grad, DTensor):
+                # FSDP2
+                g_cp = p.grad.redistribute(
+                    p.grad.device_mesh, (Replicate() for pl in p.grad.placements)
+                ).to_local()
+            else:
+                g_cp = deepcopy(p.grad)
+            if all_reduce:
+                dist.all_reduce(g_cp)
+            grads_cp[n] = g_cp
+
     dist.barrier()
-    torch.cuda.synchronize()
     assert set(grads) == set(grads_cp)
     fails = {}
+    passes = {}
     for n, g_cp in grads_cp.items():
         g = grads[n]
         try:
@@ -61,14 +71,31 @@ def _test_model_model_cp_grads_close(
             # which is hard to pass, so just test the mean abs diff relative to the mean abs sum.
             abs_diff = (g - g_cp).abs().mean()
             rel_diff = abs_diff / (g + g_cp).abs().mean()
-            assert rel_diff < tol, f"{rel_diff =} not less than {tol=}. {abs_diff=}"
-        except AssertionError as e:
-            fails[n] = e
+            assert rel_diff < tol
+            if print_passes:
+                passes[n] = f"{rel_diff=}"
+        except AssertionError:
+            fails[n] = (
+                f"{rel_diff =} not less than {tol=}. {abs_diff=}"
+                + "\n"
+                + len(n) * " "
+                + f"  {g=}\n"
+                + len(n) * " "
+                + f"  {g_cp=}"
+            )
+    if print_passes:
+        pass_msg = []
+        pass_msg.append("\n****** PASSES ********")
+        for n, msg in passes.items():
+            pass_msg.append(f"{n}: {msg}")
+        pass_msg.append("***************\n")
+        print("\n".join(pass_msg))
+
     if fails:
         err_msg = []
-        err_msg.append("\n***************")
-        for n, err in fails.items():
-            err_msg.append(f"FAILED on {n}: {err}")
+        err_msg.append("\n****** FAILURES ********")
+        for n, msg in fails.items():
+            err_msg.append(f"{n}: {msg}")
         err_msg.append("***************\n")
         raise RuntimeError("\n".join(err_msg))
 
@@ -438,14 +465,13 @@ class _DTestModelBase(DTest):
             cp_attn_impl=cp_attn_impl,
         )
 
-    def get_model(
-        self, seed: int = 42
-    ) -> MambaLMHeadModel:
+    def get_model(self, seed: int = 42) -> MambaLMHeadModel:
         torch.manual_seed(seed)
         # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
         # uniform dtype, as required by FSDP.
-        return MambaLMHeadModel(config=self.cfg, device=self.device, dtype=self.dtype).to(self.dtype)
-
+        return MambaLMHeadModel(
+            config=self.cfg, device=self.device, dtype=self.dtype
+        ).to(self.dtype)
 
     def get_model_cp(
         self,
@@ -831,14 +857,9 @@ class TestFSDP1MambaCP(_DTestModelBase):
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
+
+        # NOTE: for grads to match the non-FSDP case, it's required that the loss be an average
+        # over the entire batch.
 
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
@@ -923,14 +944,9 @@ class TestFSDP1MHACP(_DTestModelBase):
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
+
+        # NOTE: for grads to match the non-FSDP case, it's required that the loss be an average
+        # over the entire batch.
 
         inputs = self.get_inputs(requires_grad=True, dtype=torch.bfloat16)
         inputs_copy = deepcopy(inputs)
@@ -1027,14 +1043,9 @@ class TestHSDP1MambaCP(_DTestModelBase):
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
+
+        # NOTE: for grads to match the non-FSDP case, it's required that the loss be an average
+        # over the entire batch.
 
         inputs = self.get_inputs(
             batch_size=mesh["inter_node"].size(), requires_grad=True
@@ -1143,14 +1154,9 @@ class TestHSDP1MHACP(_DTestModelBase):
             use_orig_params=True,
             device_id=self.device,
         )
-        # NOTE: for grads to match the non-FSDP case, some scaling need to be performed. Options:
-        # 1) Change FSDP._gradient_predivide_factor from the DP world size to 1.0
-        # 2) Scale up the loss by a factor of the DP world size
-        # The latter is also automatically handled if the loss function scales by the world size,
-        # as in the case of a mean or default cross_entropy loss with equals tokens per rank, but it
-        # also makes the outputs mismatch, while 1) keeps the FSDP and non-FSDP outputs the same.
-        #
-        # We just use the mean for the loss below.
+
+        # NOTE: for grads to match the non-FSDP case, it's required that the loss be an average
+        # over the entire batch.
 
         inputs = self.get_inputs(
             batch_size=mesh["inter_node"].size(),
@@ -1194,8 +1200,6 @@ class TestHSDP1MHACP(_DTestModelBase):
         with FSDP.summon_full_params(model_cp_hsdp, with_grads=True):
             dist.barrier()
             _test_model_model_cp_grads_close(model, model_cp_hsdp, all_reduce=False)
-
-
 
 
 class TestModelCPFSDP1(_DTestModelBase):
@@ -1248,13 +1252,188 @@ class TestModelCPFSDP1(_DTestModelBase):
         )
 
         inputs = self.get_input_toks()
-        inputs_copy = deepcopy(inputs)
-        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
+        inputs_cp_fsdp = self.get_cp_shard(deepcopy(inputs))
 
-        outputs = model_cp_fsdp(inputs).logits
-        outputs.sum().backward()
+        outputs = model(inputs).logits
+        loss = F.cross_entropy(
+            outputs.reshape(-1, outputs.size(-1)), inputs.reshape(-1).long()
+        )
+        loss.backward()
+
+        # TODO: @goon - DELETE test
+        for n, p in model.named_parameters():
+            if n.endswith(".D"):
+                self.print_rank(f"{n=}, {p.grad=}")
+
         outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp).logits
-        outputs_cp_fsdp.sum().backward()
+        loss_cp_fsdp = F.cross_entropy(
+            outputs_cp_fsdp.reshape(-1, outputs_cp_fsdp.size(-1)),
+            inputs_cp_fsdp.reshape(-1).long(),
+        )
+        loss_cp_fsdp.backward()
 
-        _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
+        # Check the losses and grad norms are the same.
+        with torch.no_grad():
+            dist.all_reduce(loss_cp_fsdp)
+            mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
+            torch.testing.assert_close(
+                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+            )
 
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
+        torch.testing.assert_close(
+            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+        )
+
+        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+            dist.barrier()
+            _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
+
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_bwd_test(self, cp_mamba_impl, cp_attn_impl):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = self.get_model()
+        model_cp_fsdp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+        )
+        model_cp_fsdp = FSDP(
+            model_cp_fsdp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Block]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
+        )
+
+        inputs = self.get_input_toks()
+        inputs_cp_fsdp = self.get_cp_shard(deepcopy(inputs))
+
+        outputs = model(inputs).logits
+        loss = F.cross_entropy(
+            outputs.reshape(-1, outputs.size(-1)), inputs.reshape(-1).long()
+        )
+        loss.backward()
+
+        # TODO: @goon - DELETE test. For some reason, different grads get populated on the different
+        # D's on different ranks?
+        for n, p in model.named_parameters():
+            if n.endswith(".D"):
+                D_grad = p.grad
+                self.print_rank(f"{inputs=}")
+                self.print_rank(f"{n=}, {p.grad=}")
+
+        all_losses = (
+            [torch.empty_like(loss) for _ in range(self.world_size)]
+            if not self.rank
+            else None
+        )
+        dist.gather(loss, all_losses)
+        all_inputs = (
+            [torch.empty_like(inputs) for _ in range(self.world_size)]
+            if not self.rank
+            else None
+        )
+        dist.gather(inputs, all_inputs)
+        all_D_grads = (
+            [torch.empty_like(D_grad) for _ in range(self.world_size)]
+            if not self.rank
+            else None
+        )
+        dist.gather(D_grad, all_D_grads)
+        if not self.rank:
+            #Nice formatted printing:
+
+            print(f"********** ALL LOSSES **********", flush=True)
+            for rank, loss in enumerate(all_losses):
+                print(f"[{rank=}]: {loss=}", flush=True)
+            print(f"********** ALL INPUTS **********", flush=True)
+            for rank, inputs in enumerate(all_inputs):
+                print(f"[{rank=}]: {inputs=}", flush=True)
+            print(f"********** ALL D_GRADS **********", flush=True)
+            for rank, D_grad in enumerate(all_D_grads):
+                print(f"[{rank=}]: {D_grad=}", flush=True)
+            torch.cuda.synchronize()
+            for rank in range(1, self.world_size):
+                torch.testing.assert_close(all_losses[0], all_losses[rank])
+                torch.testing.assert_close(all_inputs[0], all_inputs[rank])
+                torch.testing.assert_close(all_D_grads[0], all_D_grads[rank])
+
+
+class TestModelCPFSDP2(_DTestModelBase):
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_fwd(self, cp_mamba_impl, cp_attn_impl):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = self.get_model()
+        model_cp_fsdp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+        )
+
+        for module in model_cp_fsdp.modules():
+            if isinstance(module, Block):
+                fully_shard(module, mesh=cp_mesh)
+        fully_shard(model_cp_fsdp, mesh=cp_mesh)
+
+        inputs = self.get_input_toks()
+        inputs_cp = self.get_cp_shard(inputs)
+
+        outputs = model(inputs).logits
+        outputs_cp = model_cp_fsdp(inputs_cp).logits
+
+        outputs_shard = self.get_cp_shard(outputs)
+        torch.testing.assert_close(
+            outputs_cp,
+            outputs_shard,
+            atol=self.tol,
+            rtol=self.tol,
+        )
+
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
+    def test_bwd(self, cp_mamba_impl, cp_attn_impl):
+        cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
+        model = self.get_model()
+        model_cp_fsdp = self.get_model_cp(
+            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+        )
+
+        for module in model_cp_fsdp.modules():
+            if isinstance(module, Block):
+                fully_shard(module, mesh=cp_mesh)
+        fully_shard(model_cp_fsdp, mesh=cp_mesh)
+
+        inputs = self.get_input_toks()
+        inputs_cp_fsdp = self.get_cp_shard(deepcopy(inputs))
+
+        outputs = model(inputs).logits
+        loss = F.cross_entropy(
+            outputs.reshape(-1, outputs.size(-1)), inputs.reshape(-1).long()
+        )
+        loss.backward()
+
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp).logits
+        loss_cp_fsdp = F.cross_entropy(
+            outputs_cp_fsdp.reshape(-1, outputs_cp_fsdp.size(-1)),
+            inputs_cp_fsdp.reshape(-1).long(),
+        )
+        loss_cp_fsdp.backward()
+
+        # Check the losses and grad norms are the same.
+        with torch.no_grad():
+            dist.all_reduce(loss_cp_fsdp)
+            mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
+            torch.testing.assert_close(
+                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+            )
+
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
+        torch.testing.assert_close(
+            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+        )
+
+        with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
+            dist.barrier()
+            _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
