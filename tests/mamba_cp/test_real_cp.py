@@ -13,6 +13,7 @@ from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import (
     CP_MAMBA_IMPLS,
@@ -38,7 +39,7 @@ def _test_model_model_cp_grads_close(
     model: nn.Module,
     model_cp: nn.Module,
     tol: float = 1e-2,
-    all_reduce: bool = True,
+    all_reduce: bool = False,
 ) -> None:
     grads = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
     grads_cp = {
@@ -378,12 +379,14 @@ class _DTestModelBase(DTest):
 
     def get_mamba2(self, seed: int = 42) -> Mamba2:
         torch.manual_seed(seed)
+        # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
+        # uniform dtype, as required by FSDP.
         return Mamba2(
             d_model=self.d_model,
             d_state=self.d_state,
             chunk_size=self.chunk_size,
             **self.factory_kwargs,
-        )
+        ).to(self.dtype)
 
     def get_mamba2_cp(
         self,
@@ -392,6 +395,8 @@ class _DTestModelBase(DTest):
         cp_mamba_impl: str = "allgather",
     ) -> Mamba2:
         torch.manual_seed(seed)
+        # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
+        # uniform dtype, as required by FSDP.
         return Mamba2CP(
             cp_mesh=cp_mesh,
             d_model=self.d_model,
@@ -399,7 +404,7 @@ class _DTestModelBase(DTest):
             chunk_size=self.chunk_size,
             cp_mamba_impl=cp_mamba_impl,
             **self.factory_kwargs,
-        )
+        ).to(self.dtype)
 
     def get_mha(self, seed: int = 42, dtype: torch.dtype = torch.bfloat16) -> MHA:
         torch.manual_seed(seed)
@@ -434,10 +439,13 @@ class _DTestModelBase(DTest):
         )
 
     def get_model(
-        self, seed: int = 42, dtype: torch.dtype = torch.bfloat16
+        self, seed: int = 42
     ) -> MambaLMHeadModel:
         torch.manual_seed(seed)
-        return MambaLMHeadModel(config=self.cfg, device=self.device, dtype=dtype)
+        # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
+        # uniform dtype, as required by FSDP.
+        return MambaLMHeadModel(config=self.cfg, device=self.device, dtype=self.dtype).to(self.dtype)
+
 
     def get_model_cp(
         self,
@@ -445,17 +453,18 @@ class _DTestModelBase(DTest):
         cp_mamba_impl: str,
         cp_attn_impl: str,
         seed: int = 42,
-        dtype: torch.dtype = torch.bfloat16,
     ) -> MambaLMHeadModel:
         torch.manual_seed(seed)
+        # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
+        # uniform dtype, as required by FSDP.
         return MambaLMHeadModel(
             config=self.cfg,
             cp_mesh=cp_mesh,
             cp_mamba_impl=cp_mamba_impl,
             cp_attn_impl=cp_attn_impl,
             device=self.device,
-            dtype=dtype,
-        )
+            dtype=self.dtype,
+        ).to(self.dtype)
 
     def get_input_toks(
         self,
@@ -595,8 +604,14 @@ class TestConvCP(_DTestModelBase):
 
         xBC_cp = self.get_cp_shard(xBC_copy)
         outputs = conv(xBC, mamba2)
-        outputs.sum().backward()
         outputs_cp = conv_cp(xBC_cp, mamba2_cp, cp_mesh)
+        torch.testing.assert_close(
+            outputs_cp,
+            outputs.tensor_split(self.world_size, dim=1)[self.rank],
+            atol=self.tol,
+            rtol=self.tol,
+        )
+        outputs.sum().backward()
         outputs_cp.sum().backward()
 
         xBC_grad_shard = self.get_cp_shard(xBC.grad)
@@ -671,7 +686,7 @@ class TestScanCP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        _test_model_model_cp_grads_close(mamba2, mamba2_cp)
+        _test_model_model_cp_grads_close(mamba2, mamba2_cp, all_reduce=True)
 
 
 class TestMamba2CP(_DTestModelBase):
@@ -716,7 +731,7 @@ class TestMamba2CP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        _test_model_model_cp_grads_close(mamba2, mamba2_cp)
+        _test_model_model_cp_grads_close(mamba2, mamba2_cp, all_reduce=True)
 
 
 class TestMHACP(_DTestModelBase):
@@ -764,21 +779,20 @@ class TestMHACP(_DTestModelBase):
         )
 
         # Parameter grads should match after all-reducing.
-        # Needs a high tol to pass?
-        _test_model_model_cp_grads_close(mha, mha_cp)
+        _test_model_model_cp_grads_close(mha, mha_cp, all_reduce=True)
 
 
 class TestFSDP1MambaCP(_DTestModelBase):
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     def test_fwd(self, cp_mamba_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -802,13 +816,13 @@ class TestFSDP1MambaCP(_DTestModelBase):
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     def test_bwd(self, cp_mamba_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -861,13 +875,13 @@ class TestFSDP1MHACP(_DTestModelBase):
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
     def test_fwd(self, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -894,13 +908,13 @@ class TestFSDP1MHACP(_DTestModelBase):
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
     def test_bwd(self, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_fsdp = FSDP(
             model_cp,
             process_group=cp_mesh.get_group(),
@@ -961,13 +975,13 @@ class TestHSDP1MambaCP(_DTestModelBase):
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -998,13 +1012,13 @@ class TestHSDP1MambaCP(_DTestModelBase):
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1075,13 +1089,13 @@ class TestHSDP1MHACP(_DTestModelBase):
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1114,13 +1128,13 @@ class TestHSDP1MHACP(_DTestModelBase):
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
         cp_mesh = mesh["intra_node"]
-        model = nn.Sequential(*[self.get_mha() for _ in range(3)]).to(self.dtype)
+        model = nn.Sequential(*[self.get_mha() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
                 self.get_mha_cp(cp_mesh=cp_mesh, cp_attn_impl=cp_attn_impl)
                 for _ in range(3)
             ]
-        ).to(self.dtype)
+        )
         model_cp_hsdp = FSDP(
             model_cp,
             device_mesh=mesh,
@@ -1182,21 +1196,31 @@ class TestHSDP1MHACP(_DTestModelBase):
             _test_model_model_cp_grads_close(model, model_cp_hsdp, all_reduce=False)
 
 
-class TestModel(_DTestModelBase):
+
+
+class TestModelCPFSDP1(_DTestModelBase):
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
     def test_fwd(self, cp_mamba_impl, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
-        model_cp = self.get_model_cp(
+        model_cp_fsdp = self.get_model_cp(
             cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+        )
+        model_cp_fsdp = FSDP(
+            model_cp_fsdp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Block]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
         )
 
         inputs = self.get_input_toks()
         inputs_cp = self.get_cp_shard(inputs)
 
         outputs = model(inputs).logits
-        outputs_cp = model_cp(inputs_cp).logits
+        outputs_cp = model_cp_fsdp(inputs_cp).logits
 
         outputs_shard = self.get_cp_shard(outputs)
         torch.testing.assert_close(
@@ -1211,19 +1235,26 @@ class TestModel(_DTestModelBase):
     def test_bwd(self, cp_mamba_impl, cp_attn_impl):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
-        model_cp = self.get_model_cp(
+        model_cp_fsdp = self.get_model_cp(
             cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+        )
+        model_cp_fsdp = FSDP(
+            model_cp_fsdp,
+            process_group=cp_mesh.get_group(),
+            auto_wrap_policy=ModuleWrapPolicy([Block]),
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            use_orig_params=True,
+            device_id=self.device,
         )
 
         inputs = self.get_input_toks()
         inputs_copy = deepcopy(inputs)
-        inputs_cp = self.get_cp_shard(inputs_copy)
+        inputs_cp_fsdp = self.get_cp_shard(inputs_copy)
 
-        outputs = model(inputs).logits
+        outputs = model_cp_fsdp(inputs).logits
         outputs.sum().backward()
-        outputs_cp = model_cp(inputs_cp).logits
-        outputs_cp.sum().backward()
+        outputs_cp_fsdp = model_cp_fsdp(inputs_cp_fsdp).logits
+        outputs_cp_fsdp.sum().backward()
 
-        # Parameter grads should match after all-reducing.
-        # Requires high tol
-        _test_model_model_cp_grads_close(model, model_cp)
+        _test_model_model_cp_grads_close(model, model_cp_fsdp, all_reduce=False)
+
