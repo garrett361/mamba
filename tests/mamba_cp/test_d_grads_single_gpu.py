@@ -5,7 +5,11 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
 """
-torchrun --nproc-per-node 4 <path-to-this-file>
+To run in a loop until a failure is hit:
+
+```
+while python3 tests/mamba_cp/test_d_grads_single_gpu.py; do :; done
+```
 """
 
 if __name__ == "__main__":
@@ -46,23 +50,28 @@ if __name__ == "__main__":
 
     model = MambaLMHeadModel(config=cfg, device=device, dtype=dtype)
     inputs = torch.randint(vocab_size, size=(batch_size, seq_len), device=device)
-    grad_old = None
-    try:
-        for i in range(100):
-            outputs = model(inputs).logits
-            loss = F.cross_entropy(
-                outputs.reshape(-1, outputs.size(-1)), inputs.reshape(-1).long()
-            )
-            loss.backward()
-            grad_new = model.backbone.layers[0].mixer.D.grad.clone()
-            if grad_old is not None:
-                torch.testing.assert_close(grad_new, grad_old)
-            model.zero_grad()
-            torch.cuda.synchronize()
+    grads_old = None
+    fails = {}
+    for i in range(10):
+        outputs = model(inputs).logits
+        loss = F.cross_entropy(
+            outputs.reshape(-1, outputs.size(-1)), inputs.reshape(-1).long()
+        )
+        loss.backward()
+        grads_new = {
+            n: p.grad for n, p in model.named_parameters() if p.grad is not None
+        }
+        if grads_old is not None:
+            for n, grad in grads_new.items():
+                if not torch.allclose(grad, grads_old[n]):
+                    fails[n] = [grad, grads_old[n]]
+        if fails:
+            print(f"FAILED on iteration {i}")
+            for n, (grad_new, grad_old) in fails.items():
+                print(f"{n=}\n\t{grad_new=}\n\t{grad_old=}")
+            raise RuntimeError
+        model.zero_grad()
+        torch.cuda.synchronize()
+        grads_old = grads_new
+        if i:
             print(f"PASSED on iteration {i}")
-            grad_old = grad_new
-        print(f"{grad_new=}")
-
-    except:
-        print(f"FAILED on iteration {i}\n{grad_old=}\n{grad_new=}")
-        raise
