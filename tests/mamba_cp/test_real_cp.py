@@ -1,3 +1,4 @@
+import warnings
 from copy import deepcopy
 from typing import Literal, Optional
 
@@ -90,6 +91,14 @@ def _test_model_model_cp_grads_close(
                 + len(n) * " "
                 + f"  {g_cp=}"
             )
+    if param_substrs_to_ignore:
+        ignored_params_msg = (
+            ["\n****** IGNORED PARAMS ********"]
+            + param_substrs_to_ignore
+            + ["***************\n"]
+        )
+        warnings.warn("\n".join(ignored_params_msg), stacklevel=1)
+
     if print_passes:
         pass_msg = []
         pass_msg.append("\n****** PASSES ********")
