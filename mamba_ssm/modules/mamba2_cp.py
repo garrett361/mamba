@@ -617,13 +617,6 @@ class MHACP(MHA):
             kv = seq_to_zigzag_comms(kv, self.cp_mesh, self.seq_dim)
 
         k, v = kv.unbind(dim=-3)
-        k = torch.repeat_interleave(
-            k, dim=2, repeats=self.num_heads // self.num_heads_kv
-        )
-        v = torch.repeat_interleave(
-            v, dim=2, repeats=self.num_heads // self.num_heads_kv
-        )
-
         context = self.ring_flash_attn_impl(
             q,
             k,
