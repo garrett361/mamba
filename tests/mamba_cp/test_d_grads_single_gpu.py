@@ -65,6 +65,8 @@ if __name__ == "__main__":
             for n, grad in grads_new.items():
                 if not torch.allclose(grad, grads_old[n]):
                     fails[n] = [grad, grads_old[n]]
+                else:
+                    print(f"{n=} passed")
         if fails:
             print(f"FAILED on iteration {i}")
             for n, (grad_new, grad_old) in fails.items():
