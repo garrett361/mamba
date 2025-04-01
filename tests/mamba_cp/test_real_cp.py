@@ -22,10 +22,10 @@ from mamba_ssm.modules.mamba2_cp import (
     CP_MAMBA_IMPLS,
     MHACP,
     Mamba2CP,
+    _identity_fwd_all_reduce_bwd,
     causal_passing_comms,
     conv,
     conv_cp,
-    identity_fwd_all_reduce_bwd,
     in_proj_split,
     seq_to_zigzag_comms,
     zigzag_to_seq_comms,
@@ -321,7 +321,7 @@ class TestIdentityFwdAllGatherBwdFn(DTest):
         inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
 
         output = inputs * weight
-        output_shard = inputs_shard * identity_fwd_all_reduce_bwd(weight_copy, mesh)
+        output_shard = inputs_shard * _identity_fwd_all_reduce_bwd(weight_copy, mesh)
 
         all_gathered_output_shards = torch.empty_like(inputs)
         dist.all_gather_into_tensor(
@@ -355,7 +355,9 @@ class TestIdentityFwdAllGatherBwdFn(DTest):
         inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
 
         (inputs * weight).sum().backward()
-        (inputs_shard * identity_fwd_all_reduce_bwd(weight_copy, mesh)).sum().backward()
+        (
+            inputs_shard * _identity_fwd_all_reduce_bwd(weight_copy, mesh)
+        ).sum().backward()
 
         torch.testing.assert_close(weight.grad, weight_copy.grad)
 

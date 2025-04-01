@@ -346,7 +346,7 @@ class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
         return dtensor, None
 
 
-identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
+_identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
 
 
 # Break down the Mamba2 forward into components
