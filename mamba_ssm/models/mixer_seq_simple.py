@@ -81,7 +81,6 @@ def create_block(
     elif layer_idx in moe_layer_idx:
         mlp_cls = partial(
             MoE,
-            hidden_features=d_intermediate,
             ep_mesh=ep_mesh,
             **moe_cfg,
             **factory_kwargs,
