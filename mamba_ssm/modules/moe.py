@@ -114,6 +114,8 @@ class MoE(nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         if ep_mesh is not None and n_routed_experts % ep_mesh.size():
+            # TODO: @goon - shouldn't be a necessary constraint. Move to torch.chunk semantics for
+            # placements.
             raise ValueError(
                 f"{self.n_routed_experts=} must be divisible by {ep_mesh.size()=}"
             )
