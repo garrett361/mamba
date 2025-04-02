@@ -92,6 +92,7 @@ class _TestBase(DTest):
             "n_routed_experts": self.n_routed_experts,
             "n_activated_experts": 1,
             "n_shared_experts": 1,
+            "hidden_features": 64,
         }
 
     @property
@@ -134,7 +135,7 @@ class TestMoEEP(_TestBase):
         )
         model_kwargs = dict(
             in_features=self.in_features,
-            hidden_features=self.hidden_features,
+            hidden_features=self.moe_cfg["hidden_features"],
             n_routed_experts=self.n_routed_experts,
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,
@@ -163,7 +164,7 @@ class TestMoEEP(_TestBase):
         )
         model_kwargs = dict(
             in_features=self.in_features,
-            hidden_features=self.hidden_features,
+            hidden_features=self.moe_cfg["hidden_features"],
             n_routed_experts=self.n_routed_experts,
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,

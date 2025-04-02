@@ -42,6 +42,7 @@ class _TestBase:
         "n_routed_experts": 16,
         "n_activated_experts": 1,
         "n_shared_experts": 1,
+        "hidden_features": 64
     }
 
     cfg = MambaConfig(
@@ -93,7 +94,7 @@ class TestMoE(_TestBase):
     def test_fwd(self, score_func: Literal["sigmoid", "softmax"]) -> None:
         model = MoE(
             in_features=self.in_features,
-            hidden_features=self.hidden_features,
+            hidden_features=self.moe_cfg["hidden_features"],
             n_routed_experts=self.n_routed_experts,
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,
