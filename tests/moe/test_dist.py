@@ -3,9 +3,9 @@ from typing import Any
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor
 
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
@@ -23,28 +23,25 @@ def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
                 p_dest.data.copy_(p_src.data)
 
 
-def _test_grads(
-    model: nn.Module, model_fsdp: nn.Module, tol: float, mesh: DeviceMesh
-) -> None:
-    for n, m_fsdp in model_fsdp.named_modules():
-        m = model.get_submodule(n)
-        for (n, p), (_, p_fsdp) in zip(
-            m.named_parameters(recurse=False),
-            m_fsdp.named_parameters(recurse=False),
-        ):
-            if p.grad is None:
-                assert p_fsdp.grad is None
-                return
-            grad = p.grad
-            grad_fsdp = p_fsdp.grad
-            if isinstance(grad_fsdp, DTensor):
-                grad_fsdp = grad_fsdp.redistribute(
-                    mesh, placements=[Replicate() for _ in grad_fsdp.placements]
-                ).to_local()
-            try:
-                torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
-            except Exception as e:
-                raise RuntimeError(f"Failed on {n=}") from e
+def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
+    with torch.no_grad():
+        for n, m_fsdp in model_fsdp.named_modules():
+            m = model.get_submodule(n)
+            for (n, p), (_, p_fsdp) in zip(
+                m.named_parameters(recurse=False),
+                m_fsdp.named_parameters(recurse=False),
+            ):
+                if p.grad is None:
+                    assert p_fsdp.grad is None
+                    return
+                grad = p.grad
+                grad_fsdp = p_fsdp.grad
+                if isinstance(grad_fsdp, DTensor):
+                    grad_fsdp = grad_fsdp.full_tensor()
+                try:
+                    torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
+                except Exception as e:
+                    raise RuntimeError(f"Failed on {n=}") from e
 
 
 class _TestBase(DTest):
@@ -196,7 +193,7 @@ class TestMoEEP(_TestBase):
         outputs.pow(2).mean().backward()
         outputs_ep.pow(2).mean().backward()
 
-        _test_grads(model, model_ep, tol=self.tol, mesh=ep_mesh)
+        _test_grads(model, model_ep, tol=self.tol)
         # Verify the routed experts are not sharded and everything else is
         try:
             for n, p in model_ep.named_parameters():
@@ -235,7 +232,6 @@ class TestModelEP(_TestBase):
 
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
-
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_bwd(self) -> None:
@@ -272,7 +268,7 @@ class TestModelEP(_TestBase):
         outputs.logits.pow(2).mean().backward()
         outputs_ep.logits.pow(2).mean().backward()
 
-        _test_grads(model, model_ep, tol=self.tol, mesh=ep_mesh)
+        _test_grads(model, model_ep, tol=self.tol)
 
         # Verify the routed experts are not sharded and everything else is
         try:
