@@ -101,6 +101,7 @@ class MoE(nn.Module):
         n_routed_experts: int,
         n_shared_experts: int,
         n_activated_experts: int,
+        multiple_of: int = 1,
         score_func: Literal["sigmoid", "softmax"] = "softmax",
         route_scale: float = 1.0,
         ep_mesh: Optional[DeviceMesh] = None,
@@ -129,6 +130,7 @@ class MoE(nn.Module):
         self.hidden_features = hidden_features
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
+        self.multiple_of = multiple_of
         self.score_func = score_func
         self.route_scale = route_scale
         self.ep_mesh = ep_mesh
@@ -156,7 +158,10 @@ class MoE(nn.Module):
         self.experts = nn.ModuleDict(
             {
                 str(i): GatedMLP(
-                    self.in_features, self.hidden_features, **factory_kwargs
+                    self.in_features,
+                    self.hidden_features,
+                    multiple_of=self.multiple_of,
+                    **factory_kwargs,
                 )
                 for i in range(self.experts_start_idx, self.experts_end_idx)
             }
@@ -165,6 +170,7 @@ class MoE(nn.Module):
             GatedMLP(
                 self.in_features,
                 self.n_shared_experts * self.hidden_features,
+                multiple_of=self.multiple_of,
                 **factory_kwargs,
             )
             if self.n_shared_experts
