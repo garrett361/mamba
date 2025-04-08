@@ -69,14 +69,19 @@ if __name__ == "__main__":
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--reps", type=int, default=16)
     parser.add_argument("--force_equal_loads", action="store_true")
+    parser.add_argument("--compute_tok_stats", action="store_true")
 
     args = parser.parse_args()
-    print(f"{args=})")
     dist.init_process_group("nccl")
     try:
-        rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(rank)
+        torch.cuda.set_device(local_rank)
+
+        if not rank:
+            print(f"{args=})")
+
         dtype = torch.bfloat16
         inputs = torch.randn(
             args.batch_size,
@@ -113,7 +118,7 @@ if __name__ == "__main__":
                             ep_mesh=ep_mesh if ep else None,
                             device="cuda",
                             dtype=dtype,
-                            _force_equal_loads=True,
+                            _force_equal_loads=args.force_equal_loads,
                         )
                         for _ in range(n_layers)
                     ]
@@ -138,7 +143,7 @@ if __name__ == "__main__":
                 results["time_std_s" + (" (EP)" if ep else " (FSDP)")].append(
                     time_std_s
                 )
-                if ep:
+                if ep and args.compute_tok_stats:
                     # Collecting stats for the number of tok per expert
                     tok_counts = [layer._tok_count for layer in model]
                     tok_counts_t = torch.tensor(
