@@ -135,6 +135,7 @@ class MoE(nn.Module):
         self.route_scale = route_scale
         self.ep_mesh = ep_mesh
         self.n_activated_experts = n_activated_experts
+        self._tok_count = 0
 
         factory_kwargs = {"device": device, "dtype": dtype}
 
@@ -253,6 +254,7 @@ class MoE(nn.Module):
             .sum(dim=1)
             .tolist()
         )
+        self._tok_count += sum(recv_counts)
 
         # Receive toks from other workers
         x_recv = funcol.all_to_all_single_autograd(
