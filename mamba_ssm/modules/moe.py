@@ -107,6 +107,7 @@ class MoE(nn.Module):
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
+        _force_equal_loads: bool = False,
     ):
         """
         Initializes the MoE module.
@@ -136,6 +137,7 @@ class MoE(nn.Module):
         self.ep_mesh = ep_mesh
         self.n_activated_experts = n_activated_experts
         self._tok_count = 0
+        self._force_equal_loads = _force_equal_loads
 
         factory_kwargs = {"device": device, "dtype": dtype}
 
@@ -197,6 +199,8 @@ class MoE(nn.Module):
         # grad, as it is only used for meta-indexing.
         with torch.no_grad():
             counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
+            if self._force_equal_loads:
+                counts = torch.full_like(counts, counts.sum() // counts.numel())
 
         if self.ep_mesh is None:
             z = self._get_routed_expert_outputs(x, weights, indices, counts)
