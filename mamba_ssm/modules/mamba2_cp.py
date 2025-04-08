@@ -383,6 +383,7 @@ def conv_cp(
     seq_idx=None,
 ) -> torch.Tensor:
     conv_state_send = xBC[:, -(mamba2.d_conv - 1) :]
+    # TODO: @goon - make the conv_state send/recv async. Can overlap with the first conv.
     conv_state_recv = causal_passing_comms(conv_state_send, cp_mesh)
     return conv(xBC, mamba2, conv_state_recv, seq_idx)
 
