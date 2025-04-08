@@ -63,13 +63,15 @@ if __name__ == "__main__":
     parser.add_argument("--n_activated_experts", type=int, default=8)
     parser.add_argument("--in_features", type=int, default=3072)
     parser.add_argument("--d_intermediate", type=int, default=1344)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--seqlen", type=int, default=4096)
     parser.add_argument("--n_layers_max", type=int, default=4)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--reps", type=int, default=16)
+    parser.add_argument("--force_equal_loads", action="store_true")
 
     args = parser.parse_args()
+    print(f"{args=})")
     dist.init_process_group("nccl")
     try:
         rank = int(os.environ["LOCAL_RANK"])
@@ -98,8 +100,8 @@ if __name__ == "__main__":
             results["n_layers"].append(n_layers)
             for ep in (True, False):
                 if not rank:
-                    print(f"Running {ep=}, {n_layers=}")
-                torch.manual_seed(42)
+                    print(f"\nRunning {ep=}, {n_layers=}")
+                torch.manual_seed(42 + (rank if ep else 0))
                 model = nn.Sequential(
                     *[
                         MoE(
@@ -111,6 +113,7 @@ if __name__ == "__main__":
                             ep_mesh=ep_mesh if ep else None,
                             device="cuda",
                             dtype=dtype,
+                            _force_equal_loads=True,
                         )
                         for _ in range(n_layers)
                     ]
@@ -135,6 +138,27 @@ if __name__ == "__main__":
                 results["time_std_s" + (" (EP)" if ep else " (FSDP)")].append(
                     time_std_s
                 )
+                if ep:
+                    # Collecting stats for the number of tok per expert
+                    tok_counts = [layer._tok_count for layer in model]
+                    tok_counts_t = torch.tensor(
+                        tok_counts, device="cuda", dtype=torch.bfloat16
+                    )
+                    tok_counts_gathered = (
+                        [torch.empty_like(tok_counts_t) for _ in range(world_size)]
+                        if not rank
+                        else None
+                    )
+                    dist.gather(tok_counts_t, tok_counts_gathered, dst=0)
+                    if not rank:
+                        # Sanity check
+                        tok_counts_gathered_t = torch.stack(tok_counts_gathered, dim=0)
+                        print(
+                            f"Tok per rank (row) per layer (col): {tok_counts_gathered_t}"
+                        )
+                        print(f"Tok sum over ranks: {tok_counts_gathered_t.sum(dim=0)}")
+                        print(f"Tok std over ranks: {tok_counts_gathered_t.std(dim=0)}")
+
         if not rank:
             import pandas as pd
 
