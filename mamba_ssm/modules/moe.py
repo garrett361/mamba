@@ -192,8 +192,10 @@ class MoE(nn.Module):
         x = x.view(-1, self.in_features)
 
         weights, indices = self.gate(x)
-        # counts[e] = num tokens this rank sends to expert e
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
+        # counts[e] = num tokens this rank sends to expert e. Tiny optimization: counts doesn't need
+        # grad, as it is only used for meta-indexing.
+        with torch.no_grad():
+            counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
 
         if self.ep_mesh is None:
             z = self._get_routed_expert_outputs(x, weights, indices, counts)
