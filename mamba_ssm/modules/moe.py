@@ -246,7 +246,7 @@ class MoE(nn.Module):
             counts, None, None, group=self.ep_mesh
         )
 
-        # We need the list version of the counts due to NCCL sigatures. This incurs a CUDA sync.
+        # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
         # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
         send_counts = (
             counts.reshape(self.ep_mesh_size, self.n_local_experts).sum(dim=1).tolist()
