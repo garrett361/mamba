@@ -79,7 +79,8 @@ if __name__ == "__main__":
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
 
-        # Init NCCL
+        # Init NCCL - NOTE: @goon - might be needed for multi-node to work correctly? Was getting
+        # odd NCCL errors due to all_to_alls without it.
         dist.barrier()
 
         if not rank:
