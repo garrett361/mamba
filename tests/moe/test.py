@@ -11,7 +11,7 @@ from mamba_ssm.modules.moe import Gate, MoE
 
 class _TestBase:
     in_features = 256
-    hidden_features = 2 * in_features
+    d_intermediate = 2 * in_features
     n_routed_experts = 16
     n_shared_experts = 1
     n_activated_experts = 2
@@ -35,19 +35,19 @@ class _TestBase:
         "num_heads_kv": 2,
         "out_proj_bias": False,
         "qkv_proj_bias": False,
-        "rotary_emb_dim": head_dim//2,
+        "rotary_emb_dim": head_dim // 2,
     }
     moe_layer_idx = list(range(1, n_layer))
     moe_cfg = {
         "n_routed_experts": 16,
         "n_activated_experts": 1,
         "n_shared_experts": 1,
-        "hidden_features": 64
+        "d_intermediate": 64,
     }
 
     cfg = MambaConfig(
         d_model=in_features,
-        d_intermediate=hidden_features,
+        d_intermediate=d_intermediate,
         n_layer=n_layer,
         vocab_size=vocab_size,
         tie_embeddings=tie_embeddings,
@@ -94,7 +94,7 @@ class TestMoE(_TestBase):
     def test_fwd(self, score_func: Literal["sigmoid", "softmax"]) -> None:
         model = MoE(
             in_features=self.in_features,
-            hidden_features=self.moe_cfg["hidden_features"],
+            d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,

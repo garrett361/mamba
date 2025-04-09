@@ -2,11 +2,10 @@ from dataclasses import dataclass, field
 
 """
 NOTE: @goon - current MoE config schema:
-moe_cfg = {
-        "n_routed_experts": int,
+moe_cfg = {"n_routed_experts": int,
         "n_activated_experts": int,
         "n_shared_experts": int,
-        "hidden_features": int,
+        "d_intermediate": int,
 }
 """
 
