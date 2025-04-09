@@ -84,7 +84,7 @@ class MoE(nn.Module):
 
     Attributes:
         in_features (int): Dimensionality of input features.
-        hidden_features (int): Dimensionality of hidden features of each expert.
+        d_intermediate (int): Dimensionality of hidden features of each expert.
         n_routed_experts (int): Total number of experts in the model.
         n_local_experts (int): Number of experts handled locally in distributed systems.
         n_activated_experts (int): Number of experts activated for each input.
@@ -97,7 +97,7 @@ class MoE(nn.Module):
     def __init__(
         self,
         in_features: int,
-        hidden_features: int,
+        d_intermediate: int,
         n_routed_experts: int,
         n_shared_experts: int,
         n_activated_experts: int,
@@ -128,7 +128,7 @@ class MoE(nn.Module):
 
         super().__init__()
         self.in_features = in_features
-        self.hidden_features = hidden_features
+        self.d_intermediate = n_routed_experts
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.multiple_of = multiple_of
@@ -162,7 +162,7 @@ class MoE(nn.Module):
             {
                 str(i): GatedMLP(
                     self.in_features,
-                    self.hidden_features,
+                    self.d_intermediate,
                     multiple_of=self.multiple_of,
                     **factory_kwargs,
                 )
@@ -172,7 +172,7 @@ class MoE(nn.Module):
         self.shared_experts = (
             GatedMLP(
                 self.in_features,
-                self.n_shared_experts * self.hidden_features,
+                self.n_shared_experts * self.d_intermediate,
                 multiple_of=self.multiple_of,
                 **factory_kwargs,
             )

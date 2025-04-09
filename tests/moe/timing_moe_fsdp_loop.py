@@ -115,7 +115,7 @@ if __name__ == "__main__":
                     *[
                         MoE(
                             in_features=args.in_features,
-                            hidden_features=args.d_intermediate,
+                            d_intermediate=args.d_intermediate,
                             n_routed_experts=args.n_routed_experts,
                             n_activated_experts=args.n_activated_experts,
                             n_shared_experts=0,

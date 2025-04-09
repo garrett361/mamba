@@ -46,7 +46,7 @@ def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
 
 class _TestBase(DTest):
     in_features = 256
-    hidden_features = in_features // 2
+    d_intermediate = in_features // 2
     n_shared_experts = 1
     n_activated_experts = 2
     n_layer = 2
@@ -89,14 +89,14 @@ class _TestBase(DTest):
             "n_routed_experts": self.n_routed_experts,
             "n_activated_experts": 1,
             "n_shared_experts": 1,
-            "hidden_features": 64,
+            "d_intermediate": 64,
         }
 
     @property
     def cfg(self) -> int:
         return MambaConfig(
             d_model=self.in_features,
-            d_intermediate=self.hidden_features,
+            d_intermediate=self.d_intermediate,
             n_layer=self.n_layer,
             vocab_size=self.vocab_size,
             tie_embeddings=self.tie_embeddings,
@@ -132,7 +132,7 @@ class TestMoEEP(_TestBase):
         )
         model_kwargs = dict(
             in_features=self.in_features,
-            hidden_features=self.moe_cfg["hidden_features"],
+            d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,
@@ -161,7 +161,7 @@ class TestMoEEP(_TestBase):
         )
         model_kwargs = dict(
             in_features=self.in_features,
-            hidden_features=self.moe_cfg["hidden_features"],
+            d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,
