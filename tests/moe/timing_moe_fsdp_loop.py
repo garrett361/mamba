@@ -79,6 +79,9 @@ if __name__ == "__main__":
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
 
+        # Init NCCL
+        dist.barrier()
+
         if not rank:
             print(f"{args=})")
 
