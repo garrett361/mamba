@@ -343,3 +343,10 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config_path = os.path.join(save_directory, 'config.json')
         with open(config_path, 'w') as f:
             json.dump(self.config.__dict__, f, indent=4)
+
+    def _get_tok_counts(self)->int:
+        tok_count = 0
+        for mod in self.modules():
+            if isinstance(mod, MoE):
+                tok_count += mod._tok_count
+        return tok_count
