@@ -112,7 +112,7 @@ if __name__ == "__main__":
             time_std_s = timer.get_std_time_s()
             gib = num_bytes / 2**30
             # Report the gathered sizes
-            results["GiB (gathered)"].append(gib)
+            results["GiB"].append(gib)
             # results["numel"].append(numel)
             results["time_s"].append(time_s)
             # results["time_std_s"].append(time_std_s)

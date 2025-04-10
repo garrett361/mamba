@@ -109,9 +109,9 @@ if __name__ == "__main__":
             time_std_s = timer.get_std_time_s()
             gib = num_bytes / 2**30
             results["GiB"].append(gib)
-            results["numel"].append(numel)
+            # results["numel"].append(numel)
             results["time_s"].append(time_s)
-            results["time_std_s"].append(time_std_s)
+            # results["time_std_s"].append(time_std_s)
             results["GiB/s"].append(gib / time_s)
 
         if not rank:
