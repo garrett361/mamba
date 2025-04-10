@@ -128,7 +128,7 @@ class MoE(nn.Module):
 
         super().__init__()
         self.in_features = in_features
-        self.d_intermediate = n_routed_experts
+        self.d_intermediate = d_intermediate
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.multiple_of = multiple_of
