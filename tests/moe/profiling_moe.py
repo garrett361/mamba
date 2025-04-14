@@ -31,7 +31,7 @@ if __name__ == "__main__":
         os.environ["NCCL_ASYNC_ERROR_HANDLING"] = str(1)
 
         parser = ArgumentParser()
-        parser.add_argument("--n_layers", type=int, default=3)
+        parser.add_argument("--n_layer", type=int, default=3)
         parser.add_argument("--batch_size", type=int, default=2)
         parser.add_argument("--seqlen", type=int, default=4096)
         parser.add_argument("--in_features", type=int, default=3072)
@@ -92,7 +92,7 @@ if __name__ == "__main__":
                     n_activated_experts=args.n_activated_experts,
                     ep_mesh=None if ep_mesh is None else ep_mesh["inner"],
                 )
-                for _ in range(args.n_layers)
+                for _ in range(args.n_layer)
             )
         )
 
@@ -172,5 +172,7 @@ if __name__ == "__main__":
             with open(trace_dir.joinpath("args.json"), "w") as fp:
                 json.dump(vars(args), fp)
             prof.export_chrome_trace(str(trace_dir.joinpath(f"trace_rank_{rank}.json")))
+        for layer_idx, moe in enumerate(model):
+            print(f"[{rank=}]: {layer_idx=} tok sum = {moe._tok_count}")
     finally:
         dist.destroy_process_group()
