@@ -150,6 +150,8 @@ if __name__ == "__main__":
         for _ in range(args.warmups):
             model(inputs).sum().backward()
             model.zero_grad()
+
+        dist.barrier()
         with profile(
             activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
             record_shapes=True,
