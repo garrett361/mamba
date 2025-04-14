@@ -118,3 +118,25 @@ class TestMoEModel(_TestBase):
         inputs = self.get_input_toks()
         outputs = model(inputs).logits
         assert outputs.shape == inputs.shape + torch.Size([self.vocab_size])
+
+
+def test_bincount_impl_equiv():
+    """
+    The DeepSeek-v3 repo uses `torch.bincount` which incurs a CUDA sync. Test equivalence with the
+    code from torchtitan
+    """
+    seqlen = 4096
+    n_routed_experts = 64
+    n_activated_experts = 8
+    scores = torch.randn(seqlen, n_routed_experts)
+    # Crucial: indices must be unique, which topk ensures
+    indices = scores.topk(n_activated_experts, dim=-1)[1]
+
+    counts_bincount = torch.bincount(indices.flatten(), minlength=n_routed_experts)
+
+    # [seq_len, n_routed_experts]
+    counts_scatter = indices.new_zeros((indices.shape[0], n_routed_experts))
+    # Fill 1 to the selected experts
+    counts_scatter.scatter_(1, indices, 1)
+    counts_scatter = counts_scatter.sum(dim=0)
+    torch.testing.assert_close(counts_bincount, counts_scatter)
