@@ -198,7 +198,9 @@ class MoE(nn.Module):
         # counts[e] = num tokens this rank sends to expert e. Tiny optimization: counts doesn't need
         # grad, as it is only used for meta-indexing.
         with torch.no_grad():
-            counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
+            counts= indices.new_zeros((indices.shape[0], self.n_routed_experts))
+            counts.scatter_(1, indices, 1)
+            counts = counts.sum(dim=0)
             if self._force_equal_loads:
                 counts = torch.full_like(counts, counts.sum() // counts.numel())
 
