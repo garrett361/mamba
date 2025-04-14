@@ -225,6 +225,8 @@ class MoE(nn.Module):
         for i in range(self.experts_start_idx, self.experts_end_idx):
             # TODO: @goon - handle no-tokens edge case
             expert = self.experts[str(i)]
+            # TODO: @goon - torch.where incurs a CUDA sync. Can we avoid it? Not sure how, due to
+            # shape-dependent outputs.
             idx, top = torch.where(indices == i)
             z[idx] += expert(x[idx]) * weights[idx, top, None]
         return z
