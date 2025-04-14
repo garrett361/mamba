@@ -166,6 +166,7 @@ if __name__ == "__main__":
         )
         if args.trace_dir is not None:
             trace_dir = Path(args.trace_dir)
+            trace_dir.mkdir(parents=True, exist_ok=True)
 
             import json
 
