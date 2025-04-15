@@ -130,6 +130,7 @@ if __name__ == "__main__":
                         mp_policy=mp_policy,
                         reshard_after_forward=False,
                     )
+                    expert.set_reshard_after_backward(False)
             fully_shard(
                 moe,
                 mesh=fsdp_mesh,
