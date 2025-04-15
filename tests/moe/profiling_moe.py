@@ -16,6 +16,20 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.modules.moe import MoE
 
+
+class SequentialProfileModule(nn.Module):
+    def __init__(self, modules_list) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(modules_list)
+
+    def forward(self, inputs):
+        outputs = inputs
+        for idx, module in enumerate(self.layers):
+            with record_function(f"fwd_{idx}"):
+                outputs = module(outputs)
+        return outputs
+
+
 if __name__ == "__main__":
     # torchrun specific
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -82,8 +96,8 @@ if __name__ == "__main__":
                 mesh_dim_names=("outer", "inner"),
             )
 
-        model = nn.Sequential(
-            *(
+        model = SequentialProfileModule(
+            [
                 MoE(
                     in_features=args.in_features,
                     d_intermediate=args.d_intermediate,
@@ -93,7 +107,7 @@ if __name__ == "__main__":
                     ep_mesh=None if ep_mesh is None else ep_mesh["inner"],
                 )
                 for _ in range(args.n_layer)
-            )
+            ]
         )
 
         if args.act_ckpt:
@@ -105,7 +119,7 @@ if __name__ == "__main__":
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
         )
-        for moe in model:
+        for moe in model.layers:
             # Cases:
             # 1. ep_degree = 1: full replication, fully shard with the fsdp_mesh
             # 2. ep_degree = world_size: no expert replication at all. Ignore experts in fully_shard
@@ -176,7 +190,7 @@ if __name__ == "__main__":
             with open(trace_dir.joinpath("args.json"), "w") as fp:
                 json.dump(vars(args), fp)
             prof.export_chrome_trace(str(trace_dir.joinpath(f"trace_rank_{rank}.json")))
-        for layer_idx, moe in enumerate(model):
+        for layer_idx, moe in enumerate(model.layers):
             print(f"[{rank=}]: {layer_idx=} tok sum = {moe._tok_count}")
     finally:
         dist.destroy_process_group()
