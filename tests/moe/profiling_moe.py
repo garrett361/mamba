@@ -179,6 +179,7 @@ if __name__ == "__main__":
             with record_function("bwd"):
                 out.sum().backward()
             model.zero_grad()
+            dist.barrier()
         print(
             prof.key_averages().table(
                 sort_by="cuda_time_total", row_limit=10, header=f"{rank=}"
