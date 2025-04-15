@@ -27,6 +27,8 @@ class Gate(nn.Module):
         in_features: int,
         n_routed_experts: int,
         n_activated_experts: int,
+        n_expert_groups: int = 1,
+        n_limited_groups: int = 1,
         score_func: Literal["sigmoid", "softmax"] = "softmax",
         route_scale: float = 1.0,
         device=None,
@@ -36,6 +38,8 @@ class Gate(nn.Module):
         self.in_features = in_features
         self.n_routed_experts = n_routed_experts
         self.n_activated_experts = n_activated_experts
+        self.n_expert_groups = n_expert_groups
+        self.n_limited_groups = n_limited_groups
         self.score_func = score_func
         self.route_scale = route_scale
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -70,6 +74,19 @@ class Gate(nn.Module):
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
+        if self.n_expert_groups > 1:
+            scores = scores.view(x.size(0), self.n_expert_groups, -1)
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
+            else:
+                # NOTE: @goon - this line seems odd, but is standard: sum the top-2 scores from each
+                # group to create the group score.
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            indices = group_scores.topk(self.n_limited_groups, dim=-1)[1]
+            mask = scores.new_ones(
+                x.size(0), self.n_expert_groups, dtype=bool
+            ).scatter_(1, indices, False)
+            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
