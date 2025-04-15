@@ -6,6 +6,8 @@ moe_cfg = {"n_routed_experts": int,
         "n_activated_experts": int,
         "n_shared_experts": int,
         "d_intermediate": int,
+        "n_expert_groups": int=1,
+        "n_limited_groups": int=1,
 }
 """
 
