@@ -152,6 +152,9 @@ if __name__ == "__main__":
                 mp_policy=mp_policy,
                 reshard_after_forward=True,
             )
+        # The root unit doesn't own any params, so manually force the first layer to not shard after
+        # bwd
+        model.layers[0].set_reshard_after_backward(False)
         fully_shard(model, mesh=fsdp_mesh, mp_policy=mp_policy)
 
         if not rank:
