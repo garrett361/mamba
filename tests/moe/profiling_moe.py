@@ -42,7 +42,7 @@ if __name__ == "__main__":
     try:
         torch.cuda.empty_cache()
         os.environ["TORCH_SHOW_CPP_STACKTRACES"] = str(1)
-        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = str(1)
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(1)
 
         parser = ArgumentParser()
         parser.add_argument("--n_layer", type=int, default=3)
