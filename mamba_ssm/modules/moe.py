@@ -280,6 +280,7 @@ class MoE(nn.Module):
             )
             % self.n_local_experts
         )
+        # NOTE: @goon - repeat_interleave incurs a CUDA sync
         local_expert_idxs = (
             local_expert_idxs.repeat_interleave(recv_counts_per_local_expert)
             + self.experts_start_idx
