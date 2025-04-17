@@ -255,14 +255,30 @@ class MoE(nn.Module):
         indices: torch.Tensor,
         counts: torch.Tensor,
     ) -> torch.Tensor:
-        # Sort tokens by the expert they are indexed to.
+        # [EP Routing and Indexing]
+        # To perform EP routing with torch comms primitives, each EP rank needs to know how many
+        # tokens EP rank `r` will be sending to its local expert `l`. This can be done by exchanging
+        # information about each rank's `counts`.
+        #
+        # Each rank then sorts their tokens in order of their global expert idx and sends as
+        # appropriate. The received tokens are **not** in expert order: they are first ordered by
+        # the sending rank, and then by local order. Schematically: recv ~ cat([recv_from_rank_0] +
+        # [recv_from_rank_1] + ...) where recv_from_rank_r will contain the tokens for each of the
+        # L local experts sorted by local expert order.
+        #
+        # In order to use GEMM kernels, the received tokens must be re-sorted in local expert
+        # order, so that tokens belonging to the same local expert are all contiguous. This is a
+        # data-dependent resorting and not easy to rewrite without CUDA syncs.
+
+        # Sort tokens by the expert they are indexed to. Tokens belonging to the same expert are
+        # contiguous in x_by_expert and in expert order
         flat_sorted_indices = indices.flatten().argsort(dim=-1)
         x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
 
         assert self.ep_mesh is not None  # mypy
-        # Get counts of incoming tensors. recv_counts_per_local_expert.reshape(self.ep_mesh.size(),
-        # self.n_local_experts[r, l] = num tokens rank r sent to local expert l
-        recv_counts_per_local_expert = funcol.all_to_all_single(
+        # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
+        # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
+        tokens_per_expert_group = funcol.all_to_all_single(
             counts, None, None, group=self.ep_mesh
         )
 
@@ -272,9 +288,7 @@ class MoE(nn.Module):
             counts.reshape(self.ep_mesh_size, self.n_local_experts).sum(dim=1).tolist()
         )
         recv_counts = (
-            recv_counts_per_local_expert.reshape(
-                self.ep_mesh_size, self.n_local_experts
-            )
+            tokens_per_expert_group.reshape(self.ep_mesh_size, self.n_local_experts)
             .sum(dim=1)
             .tolist()
         )
@@ -289,17 +303,18 @@ class MoE(nn.Module):
         x_send = torch.empty_like(x_recv)
 
         # Need to know which idxs in x_recv correspond to which local experts. Can derive from
-        # recv_counts_per_local_expert.
+        # tokens_per_expert_group.
         local_expert_idxs = (
             torch.arange(
-                recv_counts_per_local_expert.numel(),
-                device=recv_counts_per_local_expert.device,
+                tokens_per_expert_group.numel(),
+                device=tokens_per_expert_group.device,
             )
             % self.n_local_experts
         )
-        # NOTE: @goon - repeat_interleave incurs a CUDA sync
+        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
+        # the CUDA tensor tokens_per_expert_group to know the output shape
         local_expert_idxs = (
-            local_expert_idxs.repeat_interleave(recv_counts_per_local_expert)
+            local_expert_idxs.repeat_interleave(tokens_per_expert_group)
             + self.experts_start_idx
         )
 
