@@ -167,7 +167,11 @@ def test_bincount_impl_equiv():
 class TestTitan:
     def test_generate_permute_indices(self) -> None:
         """
-        Working through understanding generate_permute_indices.
+        Working through understanding generate_permute_indices. The purpose of this function is that
+        it takes the toks received from the all-to-all and makes them contiguous by local expert
+        idx, whereas they're naturally instead in blocks ordered by sending rank, and ordered
+        within each block by local expert idx.
+
 
         - tokens_per_expert_group ~ (num_ranks * exp_per_rank, ): tokens per expert
 
@@ -198,6 +202,8 @@ class TestTitan:
         tokens_per_expert_group = torch.arange(
             1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device="cuda"
         )
+        # Here we know exactly how many elements are received, which sets max_len. This is unknown
+        # in other comms frameworks.
         max_len = tokens_per_expert_group.sum().item()
         alignment = 16
         # Use the GPU kernel
@@ -209,4 +215,19 @@ class TestTitan:
             alignment,
             use_cpu=True,
         )
-        m_sizes
+
+        # permuted_indices_gpu should be equivalent to the below.
+        local_expert_idxs = (
+            torch.arange(
+                tokens_per_expert_group.numel(), device=tokens_per_expert_group.device
+            )
+            % experts_per_rank
+        )
+        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
+        # the CUDA tensor tokens_per_expert_group to know the output shape
+        local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
+        local_expert_idxs_argsort = local_expert_idxs.argsort()
+        local_expert_idxs_argsort
+        torch.testing.assert_close(
+            local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
+        )
