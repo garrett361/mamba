@@ -202,18 +202,16 @@ class TestTitan:
         tokens_per_expert_group = torch.arange(
             1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device="cuda"
         )
-        # Here we know exactly how many elements are received, which sets max_len. This is unknown
-        # in other comms frameworks.
+        # Here we know exactly how many elements are received, which sets max_len. This can be
+        # unknown in other comms frameworks.
         max_len = tokens_per_expert_group.sum().item()
         alignment = 16
-        # Use the GPU kernel
         permuted_indices_gpu, m_sizes, m_offsets = generate_permute_indices(
             tokens_per_expert_group,
             experts_per_rank,
             num_ranks,
             max_len,
             alignment,
-            use_cpu=True,
         )
 
         # permuted_indices_gpu should be equivalent to the below.
@@ -227,7 +225,6 @@ class TestTitan:
         # the CUDA tensor tokens_per_expert_group to know the output shape
         local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
         local_expert_idxs_argsort = local_expert_idxs.argsort()
-        local_expert_idxs_argsort
         torch.testing.assert_close(
             local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
         )

@@ -125,6 +125,7 @@ class MoE(nn.Module):
         device=None,
         dtype=None,
         _force_equal_loads: bool = False,
+        _moe_kernel: Literal["torch", "torch_gemm", "torchao"] = "torch",
     ):
         """
         Initializes the MoE module.
@@ -299,6 +300,23 @@ class MoE(nn.Module):
             x_by_expert, recv_counts, send_counts, group=self.ep_mesh
         )
 
+        x_send = self._get_ep_send_toks_torch(x_recv, tokens_per_expert_group)
+
+        # Send results back to original ranks (reversed send/recv count data)
+        x_out = funcol.all_to_all_single_autograd(
+            x_send, send_counts, recv_counts, group=self.ep_mesh
+        )
+
+        # Store the unsorted results back in x_by_expert
+        x_by_expert[flat_sorted_indices] = x_out
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
+
+    def _get_ep_send_toks_torch(
+        self, x_recv: torch.Tensor, tokens_per_expert_group: torch.Tensor
+    ) -> torch.Tensor:
         # Prepare outputs
         x_send = torch.empty_like(x_recv)
 
@@ -322,15 +340,4 @@ class MoE(nn.Module):
             idxs = local_expert_idxs == exp_idx
             # TODO: @goon - handle no-tokens edge case
             x_send[idxs] = self.experts[str(exp_idx)](x_recv[idxs])
-
-        # Send results back to original ranks (reversed send/recv count data)
-        x_out = funcol.all_to_all_single_autograd(
-            x_send, send_counts, recv_counts, group=self.ep_mesh
-        )
-
-        # Store the unsorted results back in x_by_expert
-        x_by_expert[flat_sorted_indices] = x_out
-        # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
-        return z
+        return x_send
