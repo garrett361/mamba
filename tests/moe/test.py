@@ -162,3 +162,51 @@ def test_bincount_impl_equiv():
     counts_scatter.scatter_(1, indices, 1)
     counts_scatter = counts_scatter.sum(dim=0)
     torch.testing.assert_close(counts_bincount, counts_scatter)
+
+
+class TestTitan:
+    def test_generate_permute_indices(self) -> None:
+        """
+        Working through understanding generate_permute_indices.
+
+        - tokens_per_expert_group ~ (num_ranks * exp_per_rank, ): tokens per expert
+
+        - start_index_values = ( torch.cumsum(tokens_per_expert_group, 0) - tokens_per_expert_group)
+          : index values where the tokens for each expert start in tokens_per_expert_group
+
+        - chunk_size_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0) ~ (ep_size,) :
+          num tokens per expert group. It's like column major because of how the all-to-all recv tok
+          order is.
+
+        - m_sizes: chunk_size_per_expert rounded up to the alignment criteria
+
+        - m_offsets = torch.cumsum(m_sizes, 0) cumulative number of toks per expert group with
+          alignment
+
+        - write_offsets = torch.cumsum(m_sizes, 0) - m_sizes : starting points for each expert
+          group's tokens
+
+        - permuted_indices ~ (max_len, ) : max_len is like max expected number of tokens
+        """
+        from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
+
+        experts_per_rank = 2
+        num_ranks = 4
+        # tokens_per_expert_group = torch.arange(
+        #     num_ranks * experts_per_rank, dtype=torch.int32, device="cuda"
+        # )
+        tokens_per_expert_group = torch.arange(
+            1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device="cuda"
+        )
+        max_len = tokens_per_expert_group.sum().item()
+        alignment = 16
+        # Use the GPU kernel
+        permuted_indices_gpu, m_sizes, m_offsets = generate_permute_indices(
+            tokens_per_expert_group,
+            experts_per_rank,
+            num_ranks,
+            max_len,
+            alignment,
+            use_cpu=True,
+        )
+        m_sizes
