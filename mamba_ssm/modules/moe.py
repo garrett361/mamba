@@ -2,6 +2,7 @@ from typing import Literal, Optional
 
 import torch
 import torch.distributed._functional_collectives as funcol
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -341,3 +342,63 @@ class MoE(nn.Module):
             # TODO: @goon - handle no-tokens edge case
             x_send[idxs] = self.experts[str(exp_idx)](x_recv[idxs])
         return x_send
+
+
+class _RoutedExperts(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        n_local_routed_experts: int,
+        hidden_features=None,
+        out_features=None,
+        activation=F.silu,
+        multiple_of=128,
+        device=None,
+        dtype=None,
+    ):
+        """
+        Analogous to a set of GatedMLP layers, but with single combined weights.
+        """
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        out_features = out_features if out_features is not None else in_features
+
+        hidden_features = (
+            hidden_features if hidden_features is not None else int(8 * in_features / 3)
+        )
+        hidden_features = (
+            (hidden_features + multiple_of - 1) // multiple_of * multiple_of
+        )
+
+        self.n_local_routed_experts = n_local_routed_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.hidden_features = hidden_features
+
+        self.fc1_weights = nn.Parameter(
+            torch.empty(
+                self.n_local_routed_experts,
+                2 * hidden_features,
+                in_features,
+                device=device,
+                dtype=dtype,
+            )
+        )
+        self.fc2_weights = nn.Parameter(
+            torch.empty(
+                self.n_local_routed_experts,
+                hidden_features,
+                in_features,
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+        self.activation = activation
+
+    def forward(self, x):
+        y = self.fc1(x)
+        y, gate = y.chunk(2, dim=-1)
+        y = y * self.activation(gate)
+        y = self.fc2(y)
+        return y
