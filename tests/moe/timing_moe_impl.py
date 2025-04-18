@@ -147,20 +147,21 @@ class MoEAlt(MoEBase):
 
         weights, indices = self.gate(x)
 
+        z = torch.empty(
+            x.shape[0] * self.n_activated_experts,
+            x.shape[-1],
+            dtype=x.dtype,
+            device=x.device,
+        )
 
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
-        z = torch.empty_like(x_by_expert)
-
-        for exp_idx in range(self.experts_start_idx, self.experts_end_idx):
-            idxs = flat_sorted_indices == exp_idx
+        for exp_idx in range(self.n_routed_experts):
+            idxs = indices == exp_idx
             # TODO: @goon - handle no-tokens edge case
-            z[idxs] = self.experts[str(exp_idx)](x_by_expert[idxs])
+            z[idxs.flatten()] = self.experts[str(exp_idx)](x[idxs.any(dim=-1)])
 
         # Store the unsorted results back in x_by_expert
-        x_by_expert[flat_sorted_indices] = z
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        z = z.reshape(*(weights.shape + z.shape[-1:]))
+        z = torch.bmm(weights[:, None], z).squeeze(1)
 
         if self.shared_experts is None:
             return z.view(x_shape)
@@ -224,6 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_shared_experts", type=int, default=0)
     parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=4096)
+    parser.add_argument("--bwd", action="store_true")
 
     args = parser.parse_args()
     print(f"{args=}")
@@ -236,8 +238,7 @@ if __name__ == "__main__":
     cache = torch.empty(int(cache_size_bytes // 4), dtype=torch.int, device="cuda")
 
     for model_cls in (MoEBase, MoEAlt):
-
-        model_base = model_cls(
+        model = model_cls(
             in_features=args.in_features,
             d_intermediate=args.d_intermediate,
             n_routed_experts=args.n_routed_experts,
@@ -251,13 +252,17 @@ if __name__ == "__main__":
         )
 
         for _ in range(args.warmups):
-            model_base(inputs)
+            out = model(inputs)
+            if args.bwd:
+                out.sum().backward()
             cache.zero_()
 
         timer = CUDATimer()
         for _ in range(args.reps):
             with timer:
-                model_base(inputs)
+                out = model(inputs)
+                if args.bwd:
+                    out.sum().backward()
             cache.zero_()
         time_s = timer.get_mean_time_s()
         time_std_s = timer.get_std_time_s()
