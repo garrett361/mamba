@@ -2,6 +2,7 @@ from typing import Literal
 
 import pytest
 import torch
+import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
@@ -228,3 +229,69 @@ class TestTitan:
         torch.testing.assert_close(
             local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
         )
+
+
+class TestMoeImpls(_TestBase):
+    def test_bmm_equiv(self):
+        """
+        Testing the equivalence between different impls
+        """
+        gate = Gate(
+            in_features=self.in_features,
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            score_func="softmax",
+            route_scale=1.0,
+            **self.factory_kwargs,
+        )
+        self.experts = nn.ModuleDict(
+            {
+                str(i): GatedMLP(
+                    self.in_features,
+                    self.d_intermediate,
+                    multiple_of=1,
+                    **self.factory_kwargs,
+                )
+                for i in range(self.n_routed_experts)
+            }
+        )
+
+        # Common gating
+        x = self.get_inputs()
+
+        x = x.view(-1, self.in_features)
+
+        weights, indices = gate(x)
+
+        # DeepSeek-v3 impl:
+        z_ds = torch.zeros_like(x)
+        for i in range(self.n_routed_experts):
+            # TODO: @goon - handle no-tokens edge case
+            expert = self.experts[str(i)]
+            idx, top = torch.where(indices == i)
+            z_ds[idx] += expert(x[idx]) * weights[idx, top, None]
+
+        # Alt impl
+        with torch.no_grad():
+            counts = indices.new_zeros((indices.shape[0], self.n_routed_experts))
+            counts.scatter_(1, indices, 1)
+            counts = counts.sum(dim=0)
+
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        flat_sorted_exp_indices = torch.arange(
+            self.n_routed_experts, device=self.device
+        ).repeat_interleave(counts)
+        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
+        z_alt = torch.empty_like(x_by_expert)
+
+        for exp_idx in range(self.n_routed_experts):
+            idxs = flat_sorted_exp_indices == exp_idx
+            # TODO: @goon - handle no-tokens edge case
+            z_alt[idxs] = self.experts[str(exp_idx)](x_by_expert[idxs])
+
+        # Store the unsorted results back in x_by_expert
+        x_by_expert[flat_sorted_indices] = z_alt
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        z_alt = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+
+        torch.testing.assert_close(z_ds, z_alt, atol=1e-3, rtol=1e-3)
