@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Literal
 
 import pytest
@@ -165,7 +166,7 @@ def test_bincount_impl_equiv():
     torch.testing.assert_close(counts_bincount, counts_scatter)
 
 
-class TestTitan:
+class TestTitan(_TestBase):
     def test_generate_permute_indices(self) -> None:
         """
         Working through understanding generate_permute_indices. The purpose of this function is that
@@ -179,7 +180,7 @@ class TestTitan:
         - start_index_values = ( torch.cumsum(tokens_per_expert_group, 0) - tokens_per_expert_group)
           : index values where the tokens for each expert start in tokens_per_expert_group
 
-        - chunk_size_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0) ~ (ep_size,) :
+        - chunk_size_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0) ~ (exp_per_rank,) :
           num tokens per expert group. It's like column major because of how the all-to-all recv tok
           order is.
 
@@ -196,7 +197,7 @@ class TestTitan:
         from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
 
         experts_per_rank = 2
-        num_ranks = 4
+        num_ranks = 8
         # tokens_per_expert_group = torch.arange(
         #     num_ranks * experts_per_rank, dtype=torch.int32, device="cuda"
         # )
@@ -213,6 +214,7 @@ class TestTitan:
             num_ranks,
             max_len,
             alignment,
+            use_cpu=True,
         )
 
         # permuted_indices_gpu should be equivalent to the below.
@@ -229,6 +231,68 @@ class TestTitan:
         torch.testing.assert_close(
             local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
         )
+
+    def test_grouped_mm_equal(self) -> None:
+        """
+        torch's native GEMM
+
+        Contiguous inputs logically separated into N groups which each pass through N different
+        matmuls.
+
+        """
+        # Matmul dims all need to be divisible by 16 (everything but n_groups)
+        n_experts = 4
+        d_model = 16
+        d_out = 4 * d_model
+        bsz = 2
+        seqlen = 8 * n_experts
+        n_toks = bsz * seqlen
+
+        toks = torch.randn(
+            n_toks, d_model, device=self.device, dtype=self.dtype, requires_grad=True
+        )
+        weight = torch.randn(
+            n_experts,
+            d_out,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        # Send equal numbers of toks to each expert.
+        offs = torch.arange(
+            n_toks // n_experts,
+            n_toks + 1,
+            n_toks // n_experts,
+            device=self.device,
+            dtype=torch.int32,
+        )
+
+        out = torch._grouped_mm(
+            toks, weight.transpose(-2, -1), offs=offs, out_dtype=torch.bfloat16
+        )
+        assert out.shape == torch.Size([n_toks, d_out])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        weight_copy = deepcopy(weight)
+        out_alt_list = []
+        for tok_chunk, exp_weight in zip(toks_copy.chunk(n_experts), weight_copy):
+            out_alt_list.append(tok_chunk @ exp_weight.t())
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(out, out_alt)
+
+        # Backwards
+
+        # # For some reason, out.sum().backward() errors out?
+        # out.sum().backward()
+        # out_alt.sum().backward()
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        out_alt.backward(grad)
+
+        torch.testing.assert_close(weight.grad, weight_copy.grad)
+        torch.testing.assert_close(toks.grad, toks_copy.grad)
 
 
 class TestMoeImpls(_TestBase):
@@ -282,9 +346,7 @@ class TestMoeImpls(_TestBase):
         for exp_idx in range(self.n_routed_experts):
             idxs = indices == exp_idx
             # TODO: @goon - handle no-tokens edge case
-            z_alt[idxs.flatten()] = self.experts[str(exp_idx)](
-                x[idxs.any(dim=-1)]
-            )
+            z_alt[idxs.flatten()] = self.experts[str(exp_idx)](x[idxs.any(dim=-1)])
 
         # Store the unsorted results back in x_by_expert
         z_alt = z_alt.reshape(*(weights.shape + z_alt.shape[-1:]))
