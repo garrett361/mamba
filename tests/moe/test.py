@@ -272,26 +272,22 @@ class TestMoeImpls(_TestBase):
             z_ds[idx] += expert(x[idx]) * weights[idx, top, None]
 
         # Alt impl
-        with torch.no_grad():
-            counts = indices.new_zeros((indices.shape[0], self.n_routed_experts))
-            counts.scatter_(1, indices, 1)
-            counts = counts.sum(dim=0)
-
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        flat_sorted_exp_indices = torch.arange(
-            self.n_routed_experts, device=self.device
-        ).repeat_interleave(counts)
-        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
-        z_alt = torch.empty_like(x_by_expert)
+        z_alt = torch.empty(
+            x.shape[0] * self.n_activated_experts,
+            x.shape[-1],
+            dtype=x.dtype,
+            device=x.device,
+        )
 
         for exp_idx in range(self.n_routed_experts):
-            idxs = flat_sorted_exp_indices == exp_idx
+            idxs = indices == exp_idx
             # TODO: @goon - handle no-tokens edge case
-            z_alt[idxs] = self.experts[str(exp_idx)](x_by_expert[idxs])
+            z_alt[idxs.flatten()] = self.experts[str(exp_idx)](
+                x[idxs.any(dim=-1)]
+            )
 
         # Store the unsorted results back in x_by_expert
-        x_by_expert[flat_sorted_indices] = z_alt
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
-        z_alt = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        z_alt = z_alt.reshape(*(weights.shape + z_alt.shape[-1:]))
+        z_alt = torch.bmm(weights[:, None], z_alt).squeeze(1)
 
         torch.testing.assert_close(z_ds, z_alt, atol=1e-3, rtol=1e-3)
