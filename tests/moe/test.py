@@ -59,6 +59,7 @@ class _TestBase:
         moe_cfg=moe_cfg,
         ssm_cfg=ssm_cfg,
     )
+    tol = 1e-3
 
     def get_inputs(self) -> torch.Tensor:
         return torch.randn(
@@ -214,7 +215,6 @@ class TestTitan(_TestBase):
             num_ranks,
             max_len,
             alignment,
-            use_cpu=True,
         )
 
         # permuted_indices_gpu should be equivalent to the below.
@@ -283,7 +283,68 @@ class TestTitan(_TestBase):
         torch.testing.assert_close(out, out_alt)
 
         # Backwards
+        # # For some reason, out.sum().backward() errors out?
+        # out.sum().backward()
+        # out_alt.sum().backward()
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        out_alt.backward(grad)
 
+        torch.testing.assert_close(
+            weight.grad, weight_copy.grad, atol=self.tol, rtol=self.tol
+        )
+        torch.testing.assert_close(
+            toks.grad, toks_copy.grad, atol=self.tol, rtol=self.tol
+        )
+
+    def test_grouped_mm_diff_alignments(self) -> None:
+        """
+        Two experts, give the second expert twice the number of toks
+        """
+        # Matmul dims all need to be divisible by 16 (everything but n_groups)
+        n_experts = 2
+        d_model = 16
+        d_out = 4 * d_model
+        n_toks_expert_0 = 16
+        n_toks_expert_1 = 2 * n_toks_expert_0
+
+        toks = torch.randn(
+            n_toks_expert_0 + n_toks_expert_1,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        weight = torch.randn(
+            n_experts,
+            d_out,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+
+        offs = torch.tensor(
+            [n_toks_expert_0, n_toks_expert_1], device=self.device
+        ).cumsum(dim=0, dtype=torch.int32)
+
+        out = torch._grouped_mm(
+            toks, weight.transpose(-2, -1), offs=offs, out_dtype=torch.bfloat16
+        )
+        assert out.shape == torch.Size([n_toks_expert_0 + n_toks_expert_1, d_out])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        weight_copy = deepcopy(weight)
+        out_alt_list = []
+        for tok_chunk, exp_weight in zip(
+            toks_copy.chunk(3), (weight_copy[0], weight_copy[1], weight_copy[1])
+        ):
+            out_alt_list.append(tok_chunk @ exp_weight.t())
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(out, out_alt)
+
+        # Backwards
         # # For some reason, out.sum().backward() errors out?
         # out.sum().backward()
         # out_alt.sum().backward()
@@ -293,6 +354,136 @@ class TestTitan(_TestBase):
 
         torch.testing.assert_close(weight.grad, weight_copy.grad)
         torch.testing.assert_close(toks.grad, toks_copy.grad)
+
+    def test_titan_gemm_equal(self) -> None:
+        """
+        torchtitan GEMM
+        """
+        from torchtitan.experiments.kernels.triton_mg_group_gemm.torchao_pr import (
+            ALIGN_SIZE_M,
+            grouped_gemm_forward,
+        )
+
+        # Tok alignments need to be rounded to ALIGN_SIZE_M, and it seems like we need d_model >=
+        # 256? Also maybe needs to be a power of 2.
+        n_experts = 4
+        d_model = 512
+        d_out = 4 * d_model
+        bsz = 2
+        seqlen = ALIGN_SIZE_M * n_experts
+        n_toks = bsz * seqlen
+
+        toks = torch.randn(
+            n_toks, d_model, device=self.device, dtype=self.dtype, requires_grad=True
+        )
+        weight = torch.randn(
+            n_experts,
+            d_out,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+
+        # Send equal numbers of toks to each expert. Note: grouped_gemm_forward uses the sizes, not
+        # offsets.
+        sizes = torch.full(
+            (n_experts,), n_toks // n_experts, device=self.device, dtype=torch.int32
+        )
+
+        out = grouped_gemm_forward(toks, weight.view(-1, d_model), sizes)
+        assert out.shape == torch.Size([n_toks, d_out])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        weight_copy = deepcopy(weight)
+        out_alt_list = []
+        for tok_chunk, exp_weight in zip(toks_copy.chunk(n_experts), weight_copy):
+            out_alt_list.append(tok_chunk @ exp_weight.t())
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(out, out_alt)
+
+        # Backwards. Not yet working (April 18):
+        # - titan unit tests failing on shape assertions
+        # - misplaced autograd.Function args in GroupedGEMM_mg
+
+        # # For some reason, out.sum().backward() errors out?
+        # grad = torch.randn_like(out)
+        # out.backward(grad)
+        # out_alt.backward(grad)
+        #
+        # torch.testing.assert_close(
+        #     weight.grad, weight_copy.grad, atol=self.tol, rtol=self.tol
+        # )
+        # torch.testing.assert_close(
+        #     toks.grad, toks_copy.grad, atol=self.tol, rtol=self.tol
+        # )
+
+    def test_titan_gemm_diff_alignments(self) -> None:
+        from torchtitan.experiments.kernels.triton_mg_group_gemm.torchao_pr import (
+            ALIGN_SIZE_M,
+            grouped_gemm_forward,
+        )
+
+        # Tok alignments need to be rounded to ALIGN_SIZE_M, and it seems like we need d_model >=
+        # 256? Also maybe needs to be a power of 2.
+        n_experts = 2
+        d_model = 512
+        d_out = 4 * d_model
+        n_toks_expert_0 = ALIGN_SIZE_M
+        n_toks_expert_1 = 2 * ALIGN_SIZE_M
+
+        toks = torch.randn(
+            n_toks_expert_0 + n_toks_expert_1,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        weight = torch.randn(
+            n_experts,
+            d_out,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+
+        # Send equal numbers of toks to each expert. Note: grouped_gemm_forward uses the sizes, not
+        # offsets.
+        sizes = torch.tensor(
+            [n_toks_expert_0, n_toks_expert_1], device=self.device, dtype=torch.int32
+        )
+
+        out = grouped_gemm_forward(toks, weight.view(-1, d_model), sizes)
+        assert out.shape == torch.Size([n_toks_expert_0 + n_toks_expert_1, d_out])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        weight_copy = deepcopy(weight)
+        out_alt_list = []
+        for tok_chunk, exp_weight in zip(
+            toks_copy.chunk(3), (weight_copy[0], weight_copy[1], weight_copy[1])
+        ):
+            out_alt_list.append(tok_chunk @ exp_weight.t())
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(out, out_alt)
+
+        # Backwards. Not yet working (April 18):
+        # - titan unit tests failing on shape assertions
+        # - misplaced autograd.Function args in GroupedGEMM_mg
+
+        # # For some reason, out.sum().backward() errors out?
+        # grad = torch.randn_like(out)
+        # out.backward(grad)
+        # out_alt.backward(grad)
+        #
+        # torch.testing.assert_close(
+        #     weight.grad, weight_copy.grad, atol=self.tol, rtol=self.tol
+        # )
+        # torch.testing.assert_close(
+        #     toks.grad, toks_copy.grad, atol=self.tol, rtol=self.tol
+        # )
 
 
 class TestMoeImpls(_TestBase):
@@ -352,4 +543,4 @@ class TestMoeImpls(_TestBase):
         z_alt = z_alt.reshape(*(weights.shape + z_alt.shape[-1:]))
         z_alt = torch.bmm(weights[:, None], z_alt).squeeze(1)
 
-        torch.testing.assert_close(z_ds, z_alt, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(z_ds, z_alt, atol=self.tol, rtol=self.tol)
