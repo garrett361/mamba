@@ -8,7 +8,7 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.moe import Gate, MoE
+from mamba_ssm.modules.moe import Gate, MoE, NoEPRoutedExpertsNaive
 
 
 class _TestBase:
@@ -112,6 +112,39 @@ class TestGate(_TestBase):
         assert indices.shape == inputs.shape[:1] + torch.Size(
             [self.n_activated_experts]
         )
+
+
+class TestRoutedExperts(_TestBase):
+    def get_inputs_weights_indices(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        model = Gate(
+            in_features=self.in_features,
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            n_expert_groups=4,
+            n_limited_groups=2,
+            **self.factory_kwargs,
+        )
+        inputs = self.get_inputs().view(-1, self.in_features)
+        weights, indices = model(inputs)
+        return inputs, weights, indices
+
+    def test_no_ep_naive(self) -> None:
+        inputs, weights, indices = self.get_inputs_weights_indices()
+        experts = NoEPRoutedExpertsNaive(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            **self.factory_kwargs,
+        )
+        outputs = experts(inputs, weights, indices)
+        assert outputs.shape == inputs.shape
 
 
 class TestMoE(_TestBase):
