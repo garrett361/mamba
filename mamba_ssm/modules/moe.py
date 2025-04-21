@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from typing import Literal, Optional
 
 import torch
@@ -55,7 +56,7 @@ class Gate(nn.Module):
             else None
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.LongTensor]:
         """
         Forward pass for the gating mechanism.
 
@@ -160,15 +161,6 @@ class MoE(nn.Module):
 
         factory_kwargs = {"device": device, "dtype": dtype}
 
-        self.ep_mesh_size = 1 if ep_mesh is None else ep_mesh.size()
-        self.n_local_experts = self.n_routed_experts // (
-            self.ep_mesh.size() if self.ep_mesh is not None else 1
-        )
-
-        self.experts_start_idx = (
-            0 if ep_mesh is None else ep_mesh.get_local_rank() * self.n_local_experts
-        )
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(
             in_features=self.in_features,
             n_routed_experts=self.n_routed_experts,
@@ -214,14 +206,7 @@ class MoE(nn.Module):
         x = x.view(-1, self.in_features)
 
         weights, indices = self.gate(x)
-        # counts[e] = num tokens this rank sends to expert e. Tiny optimization: counts doesn't need
-        # grad, as it is only used for meta-indexing.
-        with torch.no_grad():
-            counts = indices.new_zeros((indices.shape[0], self.n_routed_experts))
-            counts.scatter_(1, indices, 1)
-            counts = counts.sum(dim=0)
-            if self._force_equal_loads:
-                counts = torch.full_like(counts, counts.sum() // counts.numel())
+        z = self.experts(x, weights, indices)
 
         if self.ep_mesh is None:
             z = self._get_routed_expert_outputs(x, weights, indices, counts)
@@ -344,61 +329,103 @@ class MoE(nn.Module):
         return x_send
 
 
-class _RoutedExperts(nn.Module):
+def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.LongTensor:
+    """
+    Turns the `indices` tensor into a sorted count of the number of tokens per expert.
+    """
+    with torch.no_grad():
+        counts = indices.new_zeros((indices.shape[0], n_routed_experts))
+        counts.scatter_(1, indices, 1)
+        counts = counts.sum(dim=0)
+    return counts
+
+
+class _RoutedExperts(nn.Module, ABC):
     def __init__(
         self,
         in_features: int,
-        n_local_routed_experts: int,
-        hidden_features=None,
-        out_features=None,
+        d_intermediate: int,
+        n_routed_experts: int,
+        n_activated_experts: int,
+        multiple_of: int = 1,
         activation=F.silu,
-        multiple_of=128,
+        ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
+        _force_equal_loads: bool = False,
+        _moe_kernel: Literal["torch", "torch_gemm", "torchao"] = "torch",
     ):
         """
         Analogous to a set of GatedMLP layers, but with single combined weights.
+
+        TODO: @goon - state dict hooks so that the expert weights are individually saved and loadable?
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        out_features = out_features if out_features is not None else in_features
 
-        hidden_features = (
-            hidden_features if hidden_features is not None else int(8 * in_features / 3)
-        )
-        hidden_features = (
-            (hidden_features + multiple_of - 1) // multiple_of * multiple_of
-        )
-
-        self.n_local_routed_experts = n_local_routed_experts
         self.in_features = in_features
-        self.out_features = out_features
-        self.hidden_features = hidden_features
+        self.d_intermediate = (
+            (d_intermediate + multiple_of - 1) // multiple_of * multiple_of
+        )
+        self.n_routed_experts = n_routed_experts
+        self.n_activated_experts = n_activated_experts
+        self.multiple_of = multiple_of
+        self.activation = activation
+        self.ep_mesh = ep_mesh
+
+        self.n_local_experts = self.n_routed_experts // (
+            self.ep_mesh.size() if self.ep_mesh is not None else 1
+        )
+        self.experts_start_idx = (
+            0 if ep_mesh is None else ep_mesh.get_local_rank() * self.n_local_experts
+        )
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
         self.fc1_weights = nn.Parameter(
             torch.empty(
-                self.n_local_routed_experts,
-                2 * hidden_features,
+                self.n_local_experts,
+                2 * d_intermediate,
                 in_features,
-                device=device,
-                dtype=dtype,
+                **factory_kwargs,
             )
         )
         self.fc2_weights = nn.Parameter(
             torch.empty(
-                self.n_local_routed_experts,
-                hidden_features,
-                in_features,
-                device=device,
-                dtype=dtype,
+                self.n_local_experts,
+                self.in_features,
+                self.d_intermediate,
+                **factory_kwargs,
             )
         )
 
-        self.activation = activation
+    @abstractmethod
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
-    def forward(self, x):
-        y = self.fc1(x)
+
+class NoEPRoutedExpertsNaive(_RoutedExperts):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        assert self.ep_mesh is None
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        z = torch.zeros_like(x)
+        for exp_idx in range(self.n_local_experts):
+            # TODO: @goon - handle no-tokens edge case
+            # NOTE: @goon - torch.where incurs a CUDA sync.
+            idx, top = torch.where(indices == exp_idx)
+            z[idx] += self._get_exp_output(exp_idx, x[idx]) * weights[idx, top, None]
+        return z
+
+    def _get_exp_output(self, exp_idx: int, x: torch.Tensor) -> torch.Tensor:
+        weight_1 = self.fc1_weights[exp_idx]
+        weight_2 = self.fc2_weights[exp_idx]
+        y = F.linear(x, weight_1)
         y, gate = y.chunk(2, dim=-1)
         y = y * self.activation(gate)
-        y = self.fc2(y)
+        y = F.linear(y, weight_2)
         return y
