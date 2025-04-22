@@ -12,7 +12,7 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import (
     MoE,
-    RoutedExpertsNoEPNaive,
+    RoutedExpertsNoEPTorch,
     RoutedExpertsTorchEPNaive,
     _RoutedExperts,
 )
@@ -211,7 +211,7 @@ class TestRoutedExperts(_TestBase):
             n_routed_experts=self.n_routed_experts,
             **self.factory_kwargs,
         )
-        model = RoutedExpertsNoEPNaive(**model_kwargs)
+        model = RoutedExpertsNoEPTorch(**model_kwargs)
         model_ep = RoutedExpertsTorchEPNaive(**model_kwargs, ep_mesh=ep_mesh)
 
         # Set weights equal
@@ -236,7 +236,7 @@ class TestRoutedExperts(_TestBase):
             n_routed_experts=self.n_routed_experts,
             **self.factory_kwargs,
         )
-        model = RoutedExpertsNoEPNaive(**model_kwargs)
+        model = RoutedExpertsNoEPTorch(**model_kwargs)
         model_ep = RoutedExpertsTorchEPNaive(**model_kwargs, ep_mesh=ep_mesh)
 
         # Force models equal
