@@ -10,7 +10,7 @@ from torch.distributed.tensor import DTensor
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.modules.moe import MoE
+from mamba_ssm.modules.moe import MoE, RoutedExpertsNaiveTorchEP
 
 
 def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
@@ -120,6 +120,109 @@ class _TestBase(DTest):
         return torch.randint(
             self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
         )
+
+    def get_inputs_weights_indices(self) -> torch.Tensor:
+        """
+        Returns the flattened inputs, weights, and indices used by routed experts.
+        """
+        inputs = torch.randn(
+            self.batch_size * self.seqlen, self.in_features, **self.factory_kwargs
+        )
+        weights = torch.randn(
+            self.batch_size * self.seqlen,
+            self.n_activated_experts,
+            **self.factory_kwargs,
+        )
+        # Even spread of indices:
+        indices = (
+            torch.arange(
+                self.batch_size * self.seqlen * self.n_activated_experts,
+                device=self.device,
+            ).reshape(self.batch_size * self.seqlen, self.n_activated_experts)
+            % self.n_routed_experts
+        )
+        return inputs, weights, indices
+
+
+class TestRoutedExperts(_TestBase):
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_fwd(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model_kwargs = dict(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            **self.factory_kwargs,
+        )
+        # model = RoutedExpertsNaiveTorchEP(**model_kwargs)
+        torch.manual_seed(42 + self.rank)
+        model_ep = RoutedExpertsNaiveTorchEP(**model_kwargs, ep_mesh=ep_mesh)
+
+        # Force models equal
+        # _copy_params(model, model_ep)
+
+        torch.manual_seed(42 + self.rank)
+        inputs, weights, indices = self.get_inputs_weights_indices()
+        # outputs = model(inputs)
+        outputs_ep = model_ep(inputs, weights, indices)
+        outputs_ep
+
+        # torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_bwd(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model_kwargs = dict(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            **self.factory_kwargs,
+        )
+        model = MoE(**model_kwargs)
+        model_ep = MoE(**model_kwargs, ep_mesh=ep_mesh)
+
+        # Force models equal
+        _copy_params(model, model_ep)
+
+        fully_shard(model_ep.gate, mesh=ep_mesh)
+        if model_ep.shared_experts is not None:
+            fully_shard(model_ep.shared_experts, mesh=ep_mesh)
+
+        # The ignored_params arg requires torch nightly (> 2.6.0)
+        fully_shard(
+            model_ep, mesh=ep_mesh, ignored_params=set(model_ep.experts.parameters())
+        )
+
+        inputs = self.get_inputs()
+        outputs = model(inputs)
+
+        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+        outputs_ep = model_ep(inputs_ep)
+
+        # Grads should match with an aver-over-batches type loss
+        outputs.pow(2).mean().backward()
+        outputs_ep.pow(2).mean().backward()
+
+        _test_grads(model, model_ep, tol=self.tol)
+        # Verify the routed experts are not sharded and everything else is
+        try:
+            for n, p in model_ep.named_parameters():
+                if n.startswith("experts"):
+                    assert not isinstance(p, DTensor)
+                else:
+                    assert isinstance(p, DTensor)
+        except Exception as e:
+            raise RuntimeError(f"Failed on {n=}, {p=}") from e
 
 
 class TestMoEEP(_TestBase):

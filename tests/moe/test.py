@@ -8,7 +8,7 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.moe import Gate, MoE, NoEPRoutedExpertsNaive
+from mamba_ssm.modules.moe import Gate, MoE, RoutedExpertsNoEPNaive
 
 
 class _TestBase:
@@ -136,7 +136,7 @@ class TestRoutedExperts(_TestBase):
 
     def test_no_ep_naive(self) -> None:
         inputs, weights, indices = self.get_inputs_weights_indices()
-        experts = NoEPRoutedExpertsNaive(
+        experts = RoutedExpertsNoEPNaive(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
