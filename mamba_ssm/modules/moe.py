@@ -260,7 +260,6 @@ class _RoutedExperts(nn.Module, ABC):
 
         self.ep_mesh_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
         self.n_local_experts = self.n_routed_experts // (self.ep_mesh_size)
-        # TODO: @goon -  remove experts_{start,end}_idx? Not sure we need them
         self.experts_start_idx = (
             0 if ep_mesh is None else ep_mesh.get_local_rank() * self.n_local_experts
         )
@@ -355,7 +354,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         return x_recv, send_counts, recv_counts, tokens_per_expert_group
 
 
-def _get_exp_output(
+def _get_single_exp_output(
     x: torch.Tensor,
     fc1_weights: torch.Tensor,
     fc2_weights: torch.Tensor,
@@ -383,7 +382,7 @@ class RoutedExpertsNoEPNaive(_RoutedExpertsNoEP):
             fc1_weight = self.fc1_weights[exp_idx]
             fc2_weight = self.fc2_weights[exp_idx]
             z[idx] += (
-                _get_exp_output(x[idx], fc1_weight, fc2_weight, self.activation)
+                _get_single_exp_output(x[idx], fc1_weight, fc2_weight, self.activation)
                 * weights[idx, top, None]
             )
         return z
@@ -422,7 +421,7 @@ class RoutedExpertsNaiveTorchEP(_RoutedExpertsTorchEP):
         ):
             idxs = local_expert_idxs == exp_idx
             # TODO: @goon - handle no-tokens edge case
-            x_send[idxs] = _get_exp_output(
+            x_send[idxs] = _get_single_exp_output(
                 x_recv[idxs], fc1_weight, fc2_weight, self.activation
             )
 

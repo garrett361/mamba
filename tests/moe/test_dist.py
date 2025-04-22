@@ -10,38 +10,85 @@ from torch.distributed.tensor import DTensor
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.modules.moe import MoE, RoutedExpertsNaiveTorchEP
+from mamba_ssm.modules.moe import (
+    MoE,
+    RoutedExpertsNaiveTorchEP,
+    RoutedExpertsNoEPNaive,
+    _RoutedExperts,
+)
+
+
+def _copy_params_routed_experts(experts: _RoutedExperts, experts_ep: _RoutedExperts) -> None:
+    with torch.no_grad():
+        experts_ep.fc1_weights.data.copy_(
+            experts.fc1_weights.data[
+                experts_ep.experts_start_idx : experts_ep.experts_end_idx
+            ]
+        )
+        experts_ep.fc2_weights.data.copy_(
+            experts.fc2_weights.data[
+                experts_ep.experts_start_idx : experts_ep.experts_end_idx
+            ]
+        )
 
 
 def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
     for n, m_fsdp in model_fsdp.named_modules():
         m = model.get_submodule(n)
-        with torch.no_grad():
-            for p_dest, p_src in zip(
-                m_fsdp.parameters(recurse=False), m.parameters(recurse=False)
-            ):
-                p_dest.data.copy_(p_src.data)
+        if isinstance(m, _RoutedExperts):
+            _copy_params_routed_experts(m, m_fsdp)
+        else:
+            with torch.no_grad():
+                for p_dest, p_src in zip(
+                    m_fsdp.parameters(recurse=False), m.parameters(recurse=False)
+                ):
+                    p_dest.data.copy_(p_src.data)
+
+
+def _test_grads_routed_experts(
+    experts: _RoutedExperts, experts_ep: _RoutedExperts, tol: float
+) -> None:
+    for p, p_ep in zip(
+        (experts.fc1_weights, experts_ep.fc1_weights),
+        (experts.fc1_weights, experts_ep.fc2_weights),
+    ):
+        if p.grad is None:
+            assert p_ep.grad is None
+            return
+        grad = p.grad
+        grad_ep = p_ep.grad
+        if isinstance(grad_ep, DTensor):
+            grad_ep = grad_ep.full_tensor()
+            torch.testing.assert_close(
+                grad[experts_ep.experts_start_idx : experts_ep.experts_end_idx],
+                grad_ep,
+                atol=tol,
+                rtol=tol,
+            )
 
 
 def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
     with torch.no_grad():
         for n, m_fsdp in model_fsdp.named_modules():
             m = model.get_submodule(n)
-            for (n, p), (_, p_fsdp) in zip(
-                m.named_parameters(recurse=False),
-                m_fsdp.named_parameters(recurse=False),
-            ):
-                if p.grad is None:
-                    assert p_fsdp.grad is None
-                    return
-                grad = p.grad
-                grad_fsdp = p_fsdp.grad
-                if isinstance(grad_fsdp, DTensor):
-                    grad_fsdp = grad_fsdp.full_tensor()
-                try:
-                    torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
-                except Exception as e:
-                    raise RuntimeError(f"Failed on {n=}") from e
+            if isinstance(m, _RoutedExperts):
+                _test_grads_routed_experts(m, m_fsdp, tol)
+            else:
+                for (n, p), (_, p_fsdp) in zip(
+                    m.named_parameters(recurse=False),
+                    m_fsdp.named_parameters(recurse=False),
+                ):
+                    if p.grad is None:
+                        assert p_fsdp.grad is None
+                        return
+                    grad = p.grad
+                    grad_fsdp = p_fsdp.grad
+                    if isinstance(grad_fsdp, DTensor):
+                        grad_fsdp = grad_fsdp.full_tensor()
+                    try:
+                        torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed on {n=}") from e
 
 
 class _TestBase(DTest):
@@ -147,7 +194,7 @@ class _TestBase(DTest):
 class TestRoutedExperts(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_fwd(self) -> None:
+    def test_naive_torch_fwd(self) -> None:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -159,24 +206,21 @@ class TestRoutedExperts(_TestBase):
             n_activated_experts=self.n_activated_experts,
             **self.factory_kwargs,
         )
-        # model = RoutedExpertsNaiveTorchEP(**model_kwargs)
-        torch.manual_seed(42 + self.rank)
+        model = RoutedExpertsNoEPNaive(**model_kwargs)
         model_ep = RoutedExpertsNaiveTorchEP(**model_kwargs, ep_mesh=ep_mesh)
 
-        # Force models equal
-        # _copy_params(model, model_ep)
+        # Set weights equal
+        _copy_params_routed_experts(model, model_ep)
 
-        torch.manual_seed(42 + self.rank)
         inputs, weights, indices = self.get_inputs_weights_indices()
-        # outputs = model(inputs)
+        outputs = model(inputs, weights, indices)
         outputs_ep = model_ep(inputs, weights, indices)
-        outputs_ep
 
-        # torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_bwd(self) -> None:
+    def test_naive_torch_bwd(self) -> None:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -188,42 +232,25 @@ class TestRoutedExperts(_TestBase):
             n_activated_experts=self.n_activated_experts,
             **self.factory_kwargs,
         )
-        model = MoE(**model_kwargs)
-        model_ep = MoE(**model_kwargs, ep_mesh=ep_mesh)
+        model = RoutedExpertsNoEPNaive(**model_kwargs)
+        model_ep = RoutedExpertsNaiveTorchEP(**model_kwargs, ep_mesh=ep_mesh)
 
         # Force models equal
         _copy_params(model, model_ep)
 
-        fully_shard(model_ep.gate, mesh=ep_mesh)
-        if model_ep.shared_experts is not None:
-            fully_shard(model_ep.shared_experts, mesh=ep_mesh)
-
-        # The ignored_params arg requires torch nightly (> 2.6.0)
-        fully_shard(
-            model_ep, mesh=ep_mesh, ignored_params=set(model_ep.experts.parameters())
-        )
-
-        inputs = self.get_inputs()
-        outputs = model(inputs)
+        inputs, weights, indices = self.get_inputs_weights_indices()
+        outputs = model(inputs, weights, indices)
 
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep)
+        weights_ep = weights.tensor_split(self.world_size, dim=0)[self.rank]
+        indices_ep = indices.tensor_split(self.world_size, dim=0)[self.rank]
+        outputs_ep = model_ep(inputs_ep, weights_ep, indices_ep)
 
         # Grads should match with an aver-over-batches type loss
         outputs.pow(2).mean().backward()
         outputs_ep.pow(2).mean().backward()
 
         _test_grads(model, model_ep, tol=self.tol)
-        # Verify the routed experts are not sharded and everything else is
-        try:
-            for n, p in model_ep.named_parameters():
-                if n.startswith("experts"):
-                    assert not isinstance(p, DTensor)
-                else:
-                    assert isinstance(p, DTensor)
-        except Exception as e:
-            raise RuntimeError(f"Failed on {n=}, {p=}") from e
-
 
 class TestMoEEP(_TestBase):
     @pytest.mark.world_size(4)
