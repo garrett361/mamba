@@ -126,7 +126,6 @@ class MoE(nn.Module):
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
-        _force_equal_loads: bool = False,
         _moe_kernel: Literal["torch", "torch_gemm", "torchao"] = "torch",
     ):
         """
@@ -157,7 +156,6 @@ class MoE(nn.Module):
         self.ep_mesh = ep_mesh
         self.n_activated_experts = n_activated_experts
         self._tok_count = 0
-        self._force_equal_loads = _force_equal_loads
 
         factory_kwargs = {"device": device, "dtype": dtype}
 
@@ -237,7 +235,6 @@ class _RoutedExperts(nn.Module, ABC):
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
-        _force_equal_loads: bool = False,
         _moe_kernel: Literal["torch", "torch_gemm", "torchao"] = "torch",
     ):
         """
