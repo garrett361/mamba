@@ -1,11 +1,66 @@
 from argparse import ArgumentParser
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from timing_utils import CUDATimer
 
+from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import RoutedExpertsNoEPGroupedMM, RoutedExpertsNoEPTorch
 
-expert_clases = (RoutedExpertsNoEPTorch, RoutedExpertsNoEPGroupedMM)
+
+class SimpleRoutedExperts(nn.Module):
+    """
+    Simple routed experts class mirroring the public DeepSeekv3 impl.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        d_intermediate: int,
+        n_routed_experts: int,
+        multiple_of: int = 1,
+        activation=F.silu,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.n_routed_experts = n_routed_experts
+        self.experts = nn.ModuleList(
+            [
+                GatedMLP(
+                    in_features=in_features,
+                    hidden_features=d_intermediate,
+                    multiple_of=multiple_of,
+                    activation=activation,
+                    device=device,
+                    dtype=dtype,
+                )
+                for i in range(n_routed_experts)
+            ]
+        )
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        y = torch.zeros_like(x)
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
+        for i in range(self.n_routed_experts):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        return y
+
+
+expert_classes = (
+    SimpleRoutedExperts,
+    RoutedExpertsNoEPTorch,
+    RoutedExpertsNoEPGroupedMM,
+)
 
 
 if __name__ == "__main__":
@@ -38,7 +93,6 @@ if __name__ == "__main__":
         args.n_activated_experts,
         **factory_kwargs,
     )
-    # Even spread of indices:
     indices = (
         torch.randn(
             args.bsz * args.seqlen,
@@ -49,7 +103,7 @@ if __name__ == "__main__":
         .indices
     )
     results = {}
-    for model_cls in (RoutedExpertsNoEPTorch, RoutedExpertsNoEPGroupedMM):
+    for model_cls in expert_classes:
         model = model_cls(
             in_features=args.in_features,
             d_intermediate=args.d_intermediate,
@@ -72,10 +126,10 @@ if __name__ == "__main__":
             cache.zero_()
         time_s = timer.get_mean_time_s()
         time_std_s = timer.get_std_time_s()
-        print(f"{model_cls.__name__}: {time_s=}, {time_std_s=}")
+        print(f"{model_cls.__name__}: {time_s=:.2e}, {time_std_s=:.2e}, {time_std_s/time_s=:.2e}")
         results[model_cls.__name__] = time_s
 
     print("Relative times:")
     min_time = min(results.values())
     for cls, time_s in results.items():
-        print(f"\t{cls}: {time_s / min_time}")
+        print(f"\t{cls}: {time_s / min_time:.2e}")
