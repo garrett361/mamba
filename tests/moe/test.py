@@ -4,6 +4,7 @@ from typing import Literal
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
@@ -11,9 +12,20 @@ from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     Gate,
     MoE,
+    RoutedExpertsNoEPGroupedMM,
     RoutedExpertsNoEPNaive,
+    _get_exp_outputs_grouped_mm,
     _get_single_exp_output,
+    _RoutedExpertsNoEP,
 )
+
+
+def _copy_params_routed_experts(
+    exp: _RoutedExpertsNoEP, exp_other: _RoutedExpertsNoEP
+) -> None:
+    with torch.no_grad():
+        exp_other.fc1_weights.data.copy_(exp.fc1_weights.data)
+        exp_other.fc2_weights.data.copy_(exp.fc2_weights.data)
 
 
 class _TestBase:
@@ -27,7 +39,8 @@ class _TestBase:
     tie_embeddings = False
 
     batch_size = 2
-    seqlen = 32
+    # ~16 toks/expert
+    seqlen = int(16 * n_routed_experts / n_activated_experts / batch_size)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16
     factory_kwargs = {"device": device, "dtype": dtype}
@@ -76,6 +89,32 @@ class _TestBase:
             self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
         )
 
+    def get_inputs_weights_indices(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.LongTensor]:
+        """
+        Returns the flattened inputs, weights, and indices used by routed experts.
+        """
+        inputs = torch.randn(
+            self.batch_size * self.seqlen, self.in_features, **self.factory_kwargs
+        )
+        weights = torch.randn(
+            self.batch_size * self.seqlen,
+            self.n_activated_experts,
+            **self.factory_kwargs,
+        )
+        # Even spread of indices:
+        indices = (
+            torch.randn(
+                self.batch_size * self.seqlen,
+                self.n_routed_experts,
+                device=self.device,
+            )
+            .topk(self.n_activated_experts, dim=-1)
+            .indices
+        )
+        return inputs, weights, indices
+
 
 class TestGate(_TestBase):
     @pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
@@ -120,25 +159,6 @@ class TestGate(_TestBase):
 
 
 class TestRoutedExperts(_TestBase):
-    def get_inputs_weights_indices(
-        self,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        model = Gate(
-            in_features=self.in_features,
-            n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
-            n_expert_groups=4,
-            n_limited_groups=2,
-            **self.factory_kwargs,
-        )
-        inputs = self.get_inputs().view(-1, self.in_features)
-        weights, indices = model(inputs)
-        return inputs, weights, indices
-
     def test_no_ep_naive(self) -> None:
         inputs, weights, indices = self.get_inputs_weights_indices()
         experts = RoutedExpertsNoEPNaive(
@@ -150,6 +170,33 @@ class TestRoutedExperts(_TestBase):
         )
         outputs = experts(inputs, weights, indices)
         assert outputs.shape == inputs.shape
+
+    def test_fwd_equivalence(self) -> None:
+        inputs, weights, indices = self.get_inputs_weights_indices()
+        kwargs = dict(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            **self.factory_kwargs,
+        )
+        expert_classes = (RoutedExpertsNoEPNaive, RoutedExpertsNoEPGroupedMM)
+        experts = [cls(**kwargs) for cls in expert_classes]
+
+        for exp_other in experts[1:]:
+            _copy_params_routed_experts(experts[0], exp_other)
+        outputs = [e(inputs, weights, indices) for e in experts]
+
+        for o in outputs:
+            assert o.shape == inputs.shape
+
+        cls, o = expert_classes[0], outputs[0]
+        try:
+            for cls_other, o_other in zip(expert_classes[1:], outputs[1:]):
+                # Allow for slightly higher tol
+                torch.testing.assert_close(o, o_other, atol=1e-2, rtol=1e-2)
+        except AssertionError as e:
+            raise RuntimeError(f"Failed for {cls=}, {cls_other=}") from e
 
 
 class TestMoE(_TestBase):
@@ -412,10 +459,12 @@ class TestTitan(_TestBase):
         )
         try:
             for exp_idx in range(n_experts):
-                exp_grad=weight.grad[exp_idx]
-                exp_grad_copy=weight_copy.grad[exp_idx]
+                exp_grad = weight.grad[exp_idx]
+                exp_grad_copy = weight_copy.grad[exp_idx]
                 # Fails on the uneven weights. Would pass with 0.1 tolerances.
-                torch.testing.assert_close(exp_grad, exp_grad_copy, atol=self.tol, rtol=self.tol)
+                torch.testing.assert_close(
+                    exp_grad, exp_grad_copy, atol=self.tol, rtol=self.tol
+                )
 
                 print(f"Grad check passed for {exp_idx=} weights")
         except AssertionError as e:
@@ -623,3 +672,69 @@ class TestMoeImpls(_TestBase):
             inputs, mlp.fc1.weight, mlp.fc2.weight, mlp.activation
         )
         torch.testing.assert_close(outputs, outputs_alt)
+
+    def test_get_single_exp_output(self):
+        # Matmul dims all need to be divisible by 16 (everything but n_groups)
+        n_experts = 2
+        d_model = 16
+        d_intermediate = 4 * d_model
+        n_toks_expert_0 = 16
+        n_toks_expert_1 = 2 * n_toks_expert_0
+
+        toks = torch.randn(
+            n_toks_expert_0 + n_toks_expert_1,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        fc1_weight = torch.randn(
+            n_experts,
+            2 * d_intermediate,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        fc2_weight = torch.randn(
+            n_experts,
+            d_model,
+            d_intermediate,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+
+        offs = torch.tensor(
+            [n_toks_expert_0, n_toks_expert_1], device=self.device
+        ).cumsum(dim=0, dtype=torch.int32)
+
+        out = _get_exp_outputs_grouped_mm(
+            toks, fc1_weight, fc2_weight, offs=offs, activation=F.silu
+        )
+        assert out.shape == torch.Size([n_toks_expert_0 + n_toks_expert_1, d_model])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        fc1_weight_copy = deepcopy(fc1_weight)
+        fc2_weight_copy = deepcopy(fc2_weight)
+        out_alt_list = []
+        for tok_chunk, (fc1, fc2) in zip(
+            toks_copy.chunk(3),
+            zip(
+                (fc1_weight_copy[0], fc1_weight_copy[1], fc1_weight_copy[1]),
+                (fc2_weight_copy[0], fc2_weight_copy[1], fc2_weight_copy[1]),
+            ),
+        ):
+            out_alt_list.append(_get_single_exp_output(tok_chunk, fc1, fc2, F.silu))
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(
+            out,
+            out_alt,
+            atol=self.tol,
+            rtol=self.tol,
+        )
+
+        # Backwards: just test that the _grouped_mm bwd doesn't error out for now.
+        # TODO: @goon - test correctness.
+        out.pow(2).sum().backward()

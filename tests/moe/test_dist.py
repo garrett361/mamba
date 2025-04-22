@@ -1,4 +1,4 @@
-from typing import Any
+f. indices.shaperom typing import Any
 
 import pytest
 import torch
@@ -12,7 +12,7 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import (
     MoE,
-    RoutedExpertsNaiveTorchEP,
+    RoutedExpertsTorchEPNaive,
     RoutedExpertsNoEPNaive,
     _RoutedExperts,
 )
@@ -168,7 +168,9 @@ class _TestBase(DTest):
             self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
         )
 
-    def get_inputs_weights_indices(self) -> torch.Tensor:
+    def get_inputs_weights_indices(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.LongTensor]:
         """
         Returns the flattened inputs, weights, and indices used by routed experts.
         """
@@ -182,11 +184,13 @@ class _TestBase(DTest):
         )
         # Even spread of indices:
         indices = (
-            torch.arange(
-                self.batch_size * self.seqlen * self.n_activated_experts,
+            torch.randn(
+                self.batch_size * self.seqlen,
+                self.n_routed_experts,
                 device=self.device,
-            ).reshape(self.batch_size * self.seqlen, self.n_activated_experts)
-            % self.n_routed_experts
+            )
+            .topk(self.n_activated_experts, dim=-1)
+            .indices
         )
         return inputs, weights, indices
 
@@ -207,7 +211,7 @@ class TestRoutedExperts(_TestBase):
             **self.factory_kwargs,
         )
         model = RoutedExpertsNoEPNaive(**model_kwargs)
-        model_ep = RoutedExpertsNaiveTorchEP(**model_kwargs, ep_mesh=ep_mesh)
+        model_ep = RoutedExpertsTorchEPNaive(**model_kwargs, ep_mesh=ep_mesh)
 
         # Set weights equal
         _copy_params_routed_experts(model, model_ep)
@@ -233,7 +237,7 @@ class TestRoutedExperts(_TestBase):
             **self.factory_kwargs,
         )
         model = RoutedExpertsNoEPNaive(**model_kwargs)
-        model_ep = RoutedExpertsNaiveTorchEP(**model_kwargs, ep_mesh=ep_mesh)
+        model_ep = RoutedExpertsTorchEPNaive(**model_kwargs, ep_mesh=ep_mesh)
 
         # Force models equal
         _copy_params(model, model_ep)

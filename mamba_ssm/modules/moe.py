@@ -9,6 +9,8 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from mamba_ssm.modules.mlp import GatedMLP
 
+_GROUPED_MM_ALIGNMENT = 16
+
 
 class Gate(nn.Module):
     """
@@ -173,7 +175,7 @@ class MoE(nn.Module):
         routed_experts_cls = (
             RoutedExpertsNoEPNaive
             if self.ep_mesh is None
-            else RoutedExpertsNaiveTorchEP
+            else RoutedExpertsTorchEPNaive
         )
         self.experts = routed_experts_cls(
             in_features=self.in_features,
@@ -231,6 +233,43 @@ def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.LongT
     return counts
 
 
+def _get_single_exp_output(
+    x: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    activation: Callable[torch.Tensor, torch.Tensor],
+):
+    """
+    Compute the outputs from a single expert.
+    """
+    y = F.linear(x, fc1_weights)
+    y, gate = y.chunk(2, dim=-1)
+    y = y * activation(gate)
+    y = F.linear(y, fc2_weights)
+    return y
+
+
+def _get_exp_outputs_grouped_mm(
+    x: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    offs: torch.IntTensor,
+    activation: Callable[torch.Tensor, torch.Tensor],
+):
+    """
+    Compute the outputs from all experts using torch._grouped_mm
+    """
+    y = torch._grouped_mm(
+        x, fc1_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
+    )
+    y, gate = y.chunk(2, dim=-1)
+    y = y * activation(gate)
+    y = torch._grouped_mm(
+        y, fc2_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
+    )
+    return y
+
+
 class _RoutedExperts(nn.Module, ABC):
     def __init__(
         self,
@@ -276,6 +315,7 @@ class _RoutedExperts(nn.Module, ABC):
                 in_features,
                 **factory_kwargs,
             )
+            / self.in_features ** (0.5)
         )
         self.fc2_weights = nn.Parameter(
             torch.randn(
@@ -284,6 +324,7 @@ class _RoutedExperts(nn.Module, ABC):
                 self.d_intermediate,
                 **factory_kwargs,
             )
+            / self.d_intermediate ** (0.5)
         )
 
     @abstractmethod
@@ -359,22 +400,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         return x_recv, send_counts, recv_counts, tokens_per_expert_group
 
 
-def _get_single_exp_output(
-    x: torch.Tensor,
-    fc1_weights: torch.Tensor,
-    fc2_weights: torch.Tensor,
-    activation: Callable[torch.Tensor, torch.Tensor],
-):
-    """
-    Compute the outputs from a single expert.
-    """
-    y = F.linear(x, fc1_weights)
-    y, gate = y.chunk(2, dim=-1)
-    y = y * activation(gate)
-    y = F.linear(y, fc2_weights)
-    return y
-
-
 class RoutedExpertsNoEPNaive(_RoutedExpertsNoEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
@@ -393,7 +418,46 @@ class RoutedExpertsNoEPNaive(_RoutedExpertsNoEP):
         return z
 
 
-class RoutedExpertsNaiveTorchEP(_RoutedExpertsTorchEP):
+class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        # Sort tokens by the expert they are indexed to.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
+
+        counts = _get_counts(indices, self.n_routed_experts)
+
+        # Alignment requirements:
+        counts_aligned = (
+            (counts + _GROUPED_MM_ALIGNMENT - 1) // _GROUPED_MM_ALIGNMENT
+        ) * _GROUPED_MM_ALIGNMENT
+        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
+        # Expand the tokens to an appropriately aligned tensor.
+        z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+
+        # Build the aligned index map
+        idxs_offs_align = (counts_aligned - counts).roll(1)
+        idxs_offs_align[0] = 0
+        idxs_offs_align = idxs_offs_align.cumsum(dim=0)
+        idxs_align = torch.arange(counts.sum(), device=counts.device)
+        idxs_align = idxs_align + idxs_offs_align.repeat_interleave(counts)
+
+        z[idxs_align] = x_by_expert
+        z = _get_exp_outputs_grouped_mm(
+            z, self.fc1_weights, self.fc2_weights, offs, self.activation
+        )
+
+        # Remove the alignment and return the tokens to their original ordering
+        x_by_expert[flat_sorted_indices] = z[idxs_align]
+
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
+
+
+class RoutedExpertsTorchEPNaive(_RoutedExpertsTorchEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
