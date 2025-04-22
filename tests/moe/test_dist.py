@@ -1,4 +1,4 @@
-f. indices.shaperom typing import Any
+from typing import Any
 
 import pytest
 import torch
@@ -12,13 +12,15 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import (
     MoE,
-    RoutedExpertsTorchEPNaive,
     RoutedExpertsNoEPNaive,
+    RoutedExpertsTorchEPNaive,
     _RoutedExperts,
 )
 
 
-def _copy_params_routed_experts(experts: _RoutedExperts, experts_ep: _RoutedExperts) -> None:
+def _copy_params_routed_experts(
+    experts: _RoutedExperts, experts_ep: _RoutedExperts
+) -> None:
     with torch.no_grad():
         experts_ep.fc1_weights.data.copy_(
             experts.fc1_weights.data[
@@ -207,7 +209,6 @@ class TestRoutedExperts(_TestBase):
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
             **self.factory_kwargs,
         )
         model = RoutedExpertsNoEPNaive(**model_kwargs)
@@ -233,7 +234,6 @@ class TestRoutedExperts(_TestBase):
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
             **self.factory_kwargs,
         )
         model = RoutedExpertsNoEPNaive(**model_kwargs)
@@ -255,6 +255,7 @@ class TestRoutedExperts(_TestBase):
         outputs_ep.pow(2).mean().backward()
 
         _test_grads(model, model_ep, tol=self.tol)
+
 
 class TestMoEEP(_TestBase):
     @pytest.mark.world_size(4)
@@ -354,7 +355,10 @@ class TestModelEP(_TestBase):
         print(f"{model_ep=}")
         for m, m_ep in zip(model.modules(), model_ep.modules()):
             if isinstance(m, MoE):
-                assert m_ep.experts.n_local_experts == m.experts.n_local_experts // self.world_size
+                assert (
+                    m_ep.experts.n_local_experts
+                    == m.experts.n_local_experts // self.world_size
+                )
 
         # Force models equal
         _copy_params(model, model_ep)

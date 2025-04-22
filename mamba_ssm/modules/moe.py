@@ -129,7 +129,7 @@ class MoE(nn.Module):
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
-        _moe_kernel: Literal["torch", "torch_gemm", "torchao"] = "torch",
+        moe_impl: Literal["torch", "torch_gemm"] = "torch",
     ):
         """
         Initializes the MoE module.
@@ -171,17 +171,23 @@ class MoE(nn.Module):
             route_scale=self.route_scale,
             **factory_kwargs,
         )
+
         # TODO: @goon - better config for which routed experts impl to use.
+        NON_EP_EXPERT_CLASSES = {
+            "torch": RoutedExpertsNoEPTorch,
+            "torch_gemm": RoutedExpertsNoEPGroupedMM,
+        }
+        EP_EXPERT_CLASSES = {"torch": RoutedExpertsTorchEPNaive}
+
         routed_experts_cls = (
-            RoutedExpertsNoEPNaive
-            if self.ep_mesh is None
-            else RoutedExpertsTorchEPNaive
+            NON_EP_EXPERT_CLASSES[moe_impl]
+            if ep_mesh is None
+            else EP_EXPERT_CLASSES[moe_impl]
         )
         self.experts = routed_experts_cls(
             in_features=self.in_features,
             d_intermediate=self.d_intermediate,
             n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
             multiple_of=self.multiple_of,
             activation=self.activation,
             ep_mesh=self.ep_mesh,
@@ -276,7 +282,6 @@ class _RoutedExperts(nn.Module, ABC):
         in_features: int,
         d_intermediate: int,
         n_routed_experts: int,
-        n_activated_experts: int,
         multiple_of: int = 1,
         activation=F.silu,
         ep_mesh: Optional[DeviceMesh] = None,
@@ -296,7 +301,6 @@ class _RoutedExperts(nn.Module, ABC):
             (d_intermediate + multiple_of - 1) // multiple_of * multiple_of
         )
         self.n_routed_experts = n_routed_experts
-        self.n_activated_experts = n_activated_experts
         self.multiple_of = multiple_of
         self.activation = activation
         self.ep_mesh = ep_mesh
@@ -400,7 +404,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         return x_recv, send_counts, recv_counts, tokens_per_expert_group
 
 
-class RoutedExpertsNoEPNaive(_RoutedExpertsNoEP):
+class RoutedExpertsNoEPTorch(_RoutedExpertsNoEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -424,7 +428,8 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
     ) -> torch.Tensor:
         # Sort tokens by the expert they are indexed to.
         flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
 
         counts = _get_counts(indices, self.n_routed_experts)
 
@@ -463,7 +468,8 @@ class RoutedExpertsTorchEPNaive(_RoutedExpertsTorchEP):
     ) -> torch.Tensor:
         # Sort tokens by the expert they are indexed to.
         flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
 
         x_recv, send_counts, recv_counts, tokens_per_expert_group = (
             self._get_ep_toks_and_routing_data(x_by_expert, indices)

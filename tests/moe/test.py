@@ -13,7 +13,7 @@ from mamba_ssm.modules.moe import (
     Gate,
     MoE,
     RoutedExpertsNoEPGroupedMM,
-    RoutedExpertsNoEPNaive,
+    RoutedExpertsNoEPTorch,
     _get_exp_outputs_grouped_mm,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
@@ -161,11 +161,10 @@ class TestGate(_TestBase):
 class TestRoutedExperts(_TestBase):
     def test_no_ep_naive(self) -> None:
         inputs, weights, indices = self.get_inputs_weights_indices()
-        experts = RoutedExpertsNoEPNaive(
+        experts = RoutedExpertsNoEPTorch(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
             **self.factory_kwargs,
         )
         outputs = experts(inputs, weights, indices)
@@ -177,10 +176,9 @@ class TestRoutedExperts(_TestBase):
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
             **self.factory_kwargs,
         )
-        expert_classes = (RoutedExpertsNoEPNaive, RoutedExpertsNoEPGroupedMM)
+        expert_classes = (RoutedExpertsNoEPTorch, RoutedExpertsNoEPGroupedMM)
         experts = [cls(**kwargs) for cls in expert_classes]
 
         for exp_other in experts[1:]:
@@ -467,7 +465,6 @@ class TestTitan(_TestBase):
                 torch.testing.assert_close(
                     exp_grad, exp_grad_copy, atol=self.tol, rtol=self.tol
                 )
-
                 print(f"Grad check passed for {exp_idx=} weights")
         except AssertionError as e:
             raise RuntimeError(f"Grad check failed for {exp_idx=} weights") from e
