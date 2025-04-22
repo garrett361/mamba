@@ -122,7 +122,6 @@ if __name__ == "__main__":
                             ep_mesh=ep_mesh if ep else None,
                             device="cuda",
                             dtype=dtype,
-                            _force_equal_loads=args.force_equal_loads,
                         )
                         for _ in range(n_layers)
                     ]
