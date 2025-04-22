@@ -408,15 +408,15 @@ class RoutedExpertsNoEPTorch(_RoutedExpertsNoEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
-        z = torch.zeros_like(x)
-        for exp_idx in range(self.n_local_experts):
+        z = torch.empty_like(x)
+        # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
+        # self.fc1_weights[exp_idx], results in super-slow CUDA syncs during the backwards pass.
+        for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1_weights, self.fc2_weights)):
             # TODO: @goon - handle no-tokens edge case
             # NOTE: @goon - torch.where incurs a CUDA sync.
             idx, top = torch.where(indices == exp_idx)
-            fc1_weight = self.fc1_weights[exp_idx]
-            fc2_weight = self.fc2_weights[exp_idx]
             z[idx] += (
-                _get_single_exp_output(x[idx], fc1_weight, fc2_weight, self.activation)
+                _get_single_exp_output(x[idx], fc1, fc2, self.activation)
                 * weights[idx, top, None]
             )
         return z
