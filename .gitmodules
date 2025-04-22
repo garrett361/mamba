@@ -3,4 +3,4 @@
 	url = https://github.com/EleutherAI/lm-evaluation-harness/
 [submodule "dtest"]
 	path = dtest
-	url = git@github.com:garrett361/dtest
+	url = https://github.com/garrett361/dtest/
