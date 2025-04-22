@@ -103,7 +103,6 @@ class _TestBase:
             self.n_activated_experts,
             **self.factory_kwargs,
         )
-        # Even spread of indices:
         indices = (
             torch.randn(
                 self.batch_size * self.seqlen,
