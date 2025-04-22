@@ -267,7 +267,10 @@ class TestTitan(_TestBase):
         local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
         local_expert_idxs_argsort = local_expert_idxs.argsort()
         torch.testing.assert_close(
-            local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
+            local_expert_idxs_argsort.to(permuted_indices_gpu),
+            permuted_indices_gpu,
+            atol=self.tol,
+            rtol=self.tol,
         )
 
     def test_grouped_mm_equal(self) -> None:
@@ -318,10 +321,15 @@ class TestTitan(_TestBase):
         for tok_chunk, exp_weight in zip(toks_copy.chunk(n_experts), weight_copy):
             out_alt_list.append(tok_chunk @ exp_weight.t())
         out_alt = torch.cat(out_alt_list, dim=0)
-        torch.testing.assert_close(out, out_alt)
+        torch.testing.assert_close(
+            out,
+            out_alt,
+            atol=self.tol,
+            rtol=self.tol,
+        )
 
         # Backwards
-        # # For some reason, out.sum().backward() errors out?
+        # # For some reason, out.sum().backward() errors out?  Most other ops are fine, though.
         # out.sum().backward()
         # out_alt.sum().backward()
         grad = torch.randn_like(out)
@@ -367,7 +375,7 @@ class TestTitan(_TestBase):
         ).cumsum(dim=0, dtype=torch.int32)
 
         out = torch._grouped_mm(
-            toks, weight.transpose(-2, -1), offs=offs, out_dtype=torch.bfloat16
+            toks, weight.transpose(-2, -1), offs=offs, out_dtype=toks.dtype
         )
         assert out.shape == torch.Size([n_toks_expert_0 + n_toks_expert_1, d_out])
 
@@ -380,18 +388,38 @@ class TestTitan(_TestBase):
         ):
             out_alt_list.append(tok_chunk @ exp_weight.t())
         out_alt = torch.cat(out_alt_list, dim=0)
-        torch.testing.assert_close(out, out_alt)
+        torch.testing.assert_close(
+            out,
+            out_alt,
+            atol=self.tol,
+            rtol=self.tol,
+        )
 
         # Backwards
-        # # For some reason, out.sum().backward() errors out?
+        # # For some reason, out.sum().backward() errors out? Other ops like mean() or pow(2).sum()
+        # # are fine.
         # out.sum().backward()
         # out_alt.sum().backward()
         grad = torch.randn_like(out)
         out.backward(grad)
         out_alt.backward(grad)
 
-        torch.testing.assert_close(weight.grad, weight_copy.grad)
-        torch.testing.assert_close(toks.grad, toks_copy.grad)
+        torch.testing.assert_close(
+            toks.grad,
+            toks_copy.grad,
+            atol=self.tol,
+            rtol=self.tol,
+        )
+        try:
+            for exp_idx in range(n_experts):
+                exp_grad=weight.grad[exp_idx]
+                exp_grad_copy=weight_copy.grad[exp_idx]
+                # Fails on the uneven weights. Would pass with 0.1 tolerances.
+                torch.testing.assert_close(exp_grad, exp_grad_copy, atol=self.tol, rtol=self.tol)
+
+                print(f"Grad check passed for {exp_idx=} weights")
+        except AssertionError as e:
+            raise RuntimeError(f"Grad check failed for {exp_idx=} weights") from e
 
     def test_titan_gemm_equal(self) -> None:
         """
