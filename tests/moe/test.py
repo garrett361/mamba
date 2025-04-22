@@ -8,7 +8,12 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.moe import Gate, MoE, RoutedExpertsNoEPNaive
+from mamba_ssm.modules.moe import (
+    Gate,
+    MoE,
+    RoutedExpertsNoEPNaive,
+    _get_single_exp_output,
+)
 
 
 class _TestBase:
@@ -577,3 +582,16 @@ class TestMoeImpls(_TestBase):
         z_alt = torch.bmm(weights[:, None], z_alt).squeeze(1)
 
         torch.testing.assert_close(z_ds, z_alt, atol=self.tol, rtol=self.tol)
+
+    def test_get_single_exp_output(self):
+        mlp = GatedMLP(
+            in_features=self.in_features,
+            hidden_features=self.d_intermediate,
+            **self.factory_kwargs,
+        )
+        inputs = self.get_inputs()
+        outputs = mlp(inputs)
+        outputs_alt = _get_single_exp_output(
+            inputs, mlp.fc1.weight, mlp.fc2.weight, mlp.activation
+        )
+        torch.testing.assert_close(outputs, outputs_alt)
