@@ -319,7 +319,7 @@ class TestMoEEP(_TestBase):
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep)
 
-        # Grads should match with an aver-over-batches type loss
+        # Grads should match with an average-over-batches type loss
         outputs.pow(2).mean().backward()
         outputs_ep.pow(2).mean().backward()
 
@@ -350,7 +350,7 @@ class TestModelEP(_TestBase):
         print(f"{model_ep=}")
         for m, m_ep in zip(model.modules(), model_ep.modules()):
             if isinstance(m, MoE):
-                assert len(m_ep.experts) == len(m.experts) // self.world_size
+                assert m_ep.experts.n_local_experts == m.experts.n_local_experts // self.world_size
 
         # Force models equal
         _copy_params(model, model_ep)

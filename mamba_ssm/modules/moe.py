@@ -121,6 +121,7 @@ class MoE(nn.Module):
         n_shared_experts: int,
         n_activated_experts: int,
         multiple_of: int = 1,
+        activation=F.silu,
         score_func: Literal["sigmoid", "softmax"] = "softmax",
         route_scale: float = 1.0,
         ep_mesh: Optional[DeviceMesh] = None,
@@ -151,6 +152,7 @@ class MoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.multiple_of = multiple_of
+        self.activation = activation
         self.score_func = score_func
         self.route_scale = route_scale
         self.ep_mesh = ep_mesh
@@ -167,22 +169,28 @@ class MoE(nn.Module):
             route_scale=self.route_scale,
             **factory_kwargs,
         )
-        self.experts = nn.ModuleDict(
-            {
-                str(i): GatedMLP(
-                    self.in_features,
-                    self.d_intermediate,
-                    multiple_of=self.multiple_of,
-                    **factory_kwargs,
-                )
-                for i in range(self.experts_start_idx, self.experts_end_idx)
-            }
+        # TODO: @goon - better config for which routed experts impl to use.
+        routed_experts_cls = (
+            RoutedExpertsNoEPNaive
+            if self.ep_mesh is None
+            else RoutedExpertsNaiveTorchEP
+        )
+        self.experts = routed_experts_cls(
+            in_features=self.in_features,
+            d_intermediate=self.d_intermediate,
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            multiple_of=self.multiple_of,
+            activation=self.activation,
+            ep_mesh=self.ep_mesh,
+            **factory_kwargs,
         )
         self.shared_experts = (
             GatedMLP(
                 self.in_features,
                 self.n_shared_experts * self.d_intermediate,
                 multiple_of=self.multiple_of,
+                activation=self.activation,
                 **factory_kwargs,
             )
             if self.n_shared_experts
@@ -235,7 +243,6 @@ class _RoutedExperts(nn.Module, ABC):
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
-        _moe_kernel: Literal["torch", "torch_gemm", "torchao"] = "torch",
     ):
         """
         Analogous to a set of GatedMLP layers, but with single combined weights.
@@ -344,6 +351,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
         # Receive toks from other workers
         import torch.distributed as dist
+
         dist.barrier()
         x_recv = funcol.all_to_all_single_autograd(
             x_by_expert, recv_counts, send_counts, group=self.ep_mesh
