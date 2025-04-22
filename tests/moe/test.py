@@ -189,6 +189,8 @@ class TestRoutedExperts(_TestBase):
 
         for o in outputs:
             assert o.shape == inputs.shape
+            # Just test that backwards doesn't error. TODO: @goon - correctness tests.
+            o.pow(2).sum().backward()
 
         cls, o = expert_classes[0], outputs[0]
         try:
