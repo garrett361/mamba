@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -208,125 +208,10 @@ class MoE(nn.Module):
         weights, indices = self.gate(x)
         z = self.experts(x, weights, indices)
 
-        if self.ep_mesh is None:
-            z = self._get_routed_expert_outputs(x, weights, indices, counts)
-        else:
-            z = self._get_ep_routed_expert_outputs(x, weights, indices, counts)
-
         if self.shared_experts is None:
             return z.view(x_shape)
 
         return (z + self.shared_experts(x)).view(x_shape)
-
-    def _get_routed_expert_outputs(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-        counts: torch.Tensor,
-    ) -> torch.Tensor:
-        z = torch.zeros_like(x)
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            # TODO: @goon - handle no-tokens edge case
-            expert = self.experts[str(i)]
-            # TODO: @goon - torch.where incurs a CUDA sync. Can we avoid it? Not sure how, due to
-            # shape-dependent outputs.
-            idx, top = torch.where(indices == i)
-            z[idx] += expert(x[idx]) * weights[idx, top, None]
-        return z
-
-    def _get_ep_routed_expert_outputs(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-        counts: torch.Tensor,
-    ) -> torch.Tensor:
-        # [EP Routing and Indexing]
-        # To perform EP routing with torch comms primitives, each EP rank needs to know how many
-        # tokens EP rank `r` will be sending to its local expert `l`. This can be done by exchanging
-        # information about each rank's `counts`.
-        #
-        # Each rank then sorts their tokens in order of their global expert idx and sends as
-        # appropriate. The received tokens are **not** in expert order: they are first ordered by
-        # the sending rank, and then by local order. Schematically: recv ~ cat([recv_from_rank_0] +
-        # [recv_from_rank_1] + ...) where recv_from_rank_r will contain the tokens for each of the
-        # L local experts sorted by local expert order.
-        #
-        # In order to use GEMM kernels, the received tokens must be re-sorted in local expert
-        # order, so that tokens belonging to the same local expert are all contiguous. This is a
-        # data-dependent resorting and not easy to rewrite without CUDA syncs.
-
-        # Sort tokens by the expert they are indexed to. Tokens belonging to the same expert are
-        # contiguous in x_by_expert and in expert order
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
-
-        assert self.ep_mesh is not None  # mypy
-        # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
-        # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
-        tokens_per_expert_group = funcol.all_to_all_single(
-            counts, None, None, group=self.ep_mesh
-        )
-
-        # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
-        # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
-        send_counts = (
-            counts.reshape(self.ep_mesh_size, self.n_local_experts).sum(dim=1).tolist()
-        )
-        recv_counts = (
-            tokens_per_expert_group.reshape(self.ep_mesh_size, self.n_local_experts)
-            .sum(dim=1)
-            .tolist()
-        )
-        self._tok_count += sum(recv_counts)
-
-        # Receive toks from other workers
-        x_recv = funcol.all_to_all_single_autograd(
-            x_by_expert, recv_counts, send_counts, group=self.ep_mesh
-        )
-
-        x_send = self._get_ep_send_toks_torch(x_recv, tokens_per_expert_group)
-
-        # Send results back to original ranks (reversed send/recv count data)
-        x_out = funcol.all_to_all_single_autograd(
-            x_send, send_counts, recv_counts, group=self.ep_mesh
-        )
-
-        # Store the unsorted results back in x_by_expert
-        x_by_expert[flat_sorted_indices] = x_out
-        # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
-        return z
-
-    def _get_ep_send_toks_torch(
-        self, x_recv: torch.Tensor, tokens_per_expert_group: torch.Tensor
-    ) -> torch.Tensor:
-        # Prepare outputs
-        x_send = torch.empty_like(x_recv)
-
-        # Need to know which idxs in x_recv correspond to which local experts. Can derive from
-        # tokens_per_expert_group.
-        local_expert_idxs = (
-            torch.arange(
-                tokens_per_expert_group.numel(),
-                device=tokens_per_expert_group.device,
-            )
-            % self.n_local_experts
-        )
-        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
-        # the CUDA tensor tokens_per_expert_group to know the output shape
-        local_expert_idxs = (
-            local_expert_idxs.repeat_interleave(tokens_per_expert_group)
-            + self.experts_start_idx
-        )
-
-        for exp_idx in range(self.experts_start_idx, self.experts_end_idx):
-            idxs = local_expert_idxs == exp_idx
-            # TODO: @goon - handle no-tokens edge case
-            x_send[idxs] = self.experts[str(exp_idx)](x_recv[idxs])
-        return x_send
 
 
 def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.LongTensor:
@@ -373,16 +258,16 @@ class _RoutedExperts(nn.Module, ABC):
         self.activation = activation
         self.ep_mesh = ep_mesh
 
-        self.n_local_experts = self.n_routed_experts // (
-            self.ep_mesh.size() if self.ep_mesh is not None else 1
-        )
+        self.ep_mesh_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
+        self.n_local_experts = self.n_routed_experts // (self.ep_mesh_size)
+        # TODO: @goon -  remove experts_{start,end}_idx? Not sure we need them
         self.experts_start_idx = (
             0 if ep_mesh is None else ep_mesh.get_local_rank() * self.n_local_experts
         )
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
         self.fc1_weights = nn.Parameter(
-            torch.empty(
+            torch.randn(
                 self.n_local_experts,
                 2 * d_intermediate,
                 in_features,
@@ -390,7 +275,7 @@ class _RoutedExperts(nn.Module, ABC):
             )
         )
         self.fc2_weights = nn.Parameter(
-            torch.empty(
+            torch.randn(
                 self.n_local_experts,
                 self.in_features,
                 self.d_intermediate,
@@ -405,11 +290,88 @@ class _RoutedExperts(nn.Module, ABC):
         raise NotImplementedError
 
 
-class NoEPRoutedExpertsNaive(_RoutedExperts):
+class _RoutedExpertsNoEP(_RoutedExperts):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         assert self.ep_mesh is None
 
+
+class _RoutedExpertsTorchEP(_RoutedExperts):
+    """
+    Adds torch all-to-all EP routing.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        assert self.ep_mesh is not None
+        self._tok_count = 0  # for testing
+
+    def _get_ep_toks_and_routing_data(
+        self, x_by_expert: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        # [EP Routing and Indexing]
+        # To perform EP routing with torch comms primitives, each EP rank needs to know how many
+        # tokens EP rank `r` will be sending to its local expert `l`. This can be done by exchanging
+        # information about each rank's `counts`.
+        #
+        # Each rank then sorts their tokens in order of global expert idx (x_by_expert) and sends as
+        # appropriate. The received tokens are **not** in expert order: they are first ordered by
+        # the sending rank, and then by local order. Schematically: recv ~ cat([recv_from_rank_0] +
+        # [recv_from_rank_1] + ...) where recv_from_rank_r will contain the tokens for each of the L
+        # local experts sorted by local expert order.
+        #
+        # In order to use GEMM kernels, the received tokens must be re-sorted in local expert
+        # order, so that tokens belonging to the same local expert are all contiguous. This is a
+        # data-dependent resorting and it does not appear possible to implement this with torch
+        # primitives without incurring a CUDA sync.
+
+        assert self.ep_mesh is not None  # mypy
+        # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
+        # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
+
+        counts = _get_counts(indices, self.n_routed_experts)
+        tokens_per_expert_group = funcol.all_to_all_single(
+            counts, None, None, group=self.ep_mesh
+        )
+
+        # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
+        # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
+        send_counts = (
+            counts.reshape(self.ep_mesh_size, self.n_local_experts).sum(dim=1).tolist()
+        )
+        recv_counts = (
+            tokens_per_expert_group.reshape(self.ep_mesh_size, self.n_local_experts)
+            .sum(dim=1)
+            .tolist()
+        )
+        self._tok_count += sum(recv_counts)  # testing
+
+        # Receive toks from other workers
+        import torch.distributed as dist
+        dist.barrier()
+        x_recv = funcol.all_to_all_single_autograd(
+            x_by_expert, recv_counts, send_counts, group=self.ep_mesh
+        )
+        return x_recv, send_counts, recv_counts, tokens_per_expert_group
+
+
+def _get_exp_output(
+    x: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    activation: Callable[torch.Tensor, torch.Tensor],
+):
+    """
+    Compute the outputs from a single expert.
+    """
+    y = F.linear(x, fc1_weights)
+    y, gate = y.chunk(2, dim=-1)
+    y = y * activation(gate)
+    y = F.linear(y, fc2_weights)
+    return y
+
+
+class RoutedExpertsNoEPNaive(_RoutedExpertsNoEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -418,14 +380,60 @@ class NoEPRoutedExpertsNaive(_RoutedExperts):
             # TODO: @goon - handle no-tokens edge case
             # NOTE: @goon - torch.where incurs a CUDA sync.
             idx, top = torch.where(indices == exp_idx)
-            z[idx] += self._get_exp_output(exp_idx, x[idx]) * weights[idx, top, None]
+            fc1_weight = self.fc1_weights[exp_idx]
+            fc2_weight = self.fc2_weights[exp_idx]
+            z[idx] += (
+                _get_exp_output(x[idx], fc1_weight, fc2_weight, self.activation)
+                * weights[idx, top, None]
+            )
         return z
 
-    def _get_exp_output(self, exp_idx: int, x: torch.Tensor) -> torch.Tensor:
-        weight_1 = self.fc1_weights[exp_idx]
-        weight_2 = self.fc2_weights[exp_idx]
-        y = F.linear(x, weight_1)
-        y, gate = y.chunk(2, dim=-1)
-        y = y * self.activation(gate)
-        y = F.linear(y, weight_2)
-        return y
+
+class RoutedExpertsNaiveTorchEP(_RoutedExpertsTorchEP):
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        # Sort tokens by the expert they are indexed to.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        x_by_expert = x[flat_sorted_indices // self.n_activated_experts]
+
+        x_recv, send_counts, recv_counts, tokens_per_expert_group = (
+            self._get_ep_toks_and_routing_data(x_by_expert, indices)
+        )
+
+        # Prepare outputs
+        x_send = torch.empty_like(x_recv)
+
+        # Need to know which idxs in x_recv correspond to which local experts. Can derive from
+        # tokens_per_expert_group.
+        local_expert_idxs = (
+            torch.arange(
+                tokens_per_expert_group.numel(),
+                device=tokens_per_expert_group.device,
+            )
+            % self.n_local_experts
+        )
+        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
+        # the CUDA tensor tokens_per_expert_group to know the output shape
+        local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
+
+        for exp_idx, (fc1_weight, fc2_weight) in enumerate(
+            zip(self.fc1_weights, self.fc2_weights)
+        ):
+            idxs = local_expert_idxs == exp_idx
+            # TODO: @goon - handle no-tokens edge case
+            x_send[idxs] = _get_exp_output(
+                x_recv[idxs], fc1_weight, fc2_weight, self.activation
+            )
+
+        # Send results back to original ranks (reversed send/recv count data)
+        x_out = funcol.all_to_all_single_autograd(
+            x_send, send_counts, recv_counts, group=self.ep_mesh
+        )
+
+        # Save an allocation: store the unsorted results back in x_by_expert.
+        x_by_expert[flat_sorted_indices] = x_out
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
