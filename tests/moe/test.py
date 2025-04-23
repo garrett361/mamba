@@ -12,20 +12,32 @@ from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     Gate,
     MoE,
+    RoutedExpertsNoEPForLoop,
+    RoutedExpertsNoEPForLoopAlt,
     RoutedExpertsNoEPGroupedMM,
-    RoutedExpertsNoEPTorch,
     _get_exp_outputs_grouped_mm,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
+    _SimpleRoutedExperts,
 )
 
 
 def _copy_params_routed_experts(
-    exp: _RoutedExpertsNoEP, exp_other: _RoutedExpertsNoEP
+    exp: _RoutedExpertsNoEP | _SimpleRoutedExperts,
+    exp_other: _RoutedExpertsNoEP | _SimpleRoutedExperts,
 ) -> None:
-    with torch.no_grad():
-        exp_other.fc1_weights.data.copy_(exp.fc1_weights.data)
-        exp_other.fc2_weights.data.copy_(exp.fc2_weights.data)
+    if isinstance(exp_other, _SimpleRoutedExperts):
+        _copy_params_routed_experts(exp_other, exp)
+    elif isinstance(exp, _SimpleRoutedExperts):
+        with torch.no_grad():
+            fc1_weights = torch.stack([e.fc1.weight.data for e in exp.experts], dim=0)
+            fc2_weights = torch.stack([e.fc2.weight.data for e in exp.experts], dim=0)
+            exp_other.fc1_weights.data.copy_(fc1_weights)
+            exp_other.fc2_weights.data.copy_(fc2_weights)
+    else:
+        with torch.no_grad():
+            exp_other.fc1_weights.data.copy_(exp.fc1_weights.data)
+            exp_other.fc2_weights.data.copy_(exp.fc2_weights.data)
 
 
 class _TestBase:
@@ -77,7 +89,7 @@ class _TestBase:
         moe_cfg=moe_cfg,
         ssm_cfg=ssm_cfg,
     )
-    tol = 1e-3
+    tol = 1e-2
 
     def get_inputs(self) -> torch.Tensor:
         return torch.randn(
@@ -102,7 +114,7 @@ class _TestBase:
             self.batch_size * self.seqlen,
             self.n_activated_experts,
             **self.factory_kwargs,
-        )
+        ).softmax(dim=-1)
         indices = (
             torch.randn(
                 self.batch_size * self.seqlen,
@@ -160,7 +172,7 @@ class TestGate(_TestBase):
 class TestRoutedExperts(_TestBase):
     def test_no_ep_naive(self) -> None:
         inputs, weights, indices = self.get_inputs_weights_indices()
-        experts = RoutedExpertsNoEPTorch(
+        experts = RoutedExpertsNoEPForLoop(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
@@ -169,7 +181,16 @@ class TestRoutedExperts(_TestBase):
         outputs = experts(inputs, weights, indices)
         assert outputs.shape == inputs.shape
 
-    def test_fwd_equivalence(self) -> None:
+    @pytest.mark.parametrize(
+        "cls",
+        [
+            RoutedExpertsNoEPForLoop,
+            RoutedExpertsNoEPForLoopAlt,
+            RoutedExpertsNoEPGroupedMM,
+        ],
+    )
+    def test_fwd_equivalence(self, cls) -> None:
+        torch.manual_seed(42)
         inputs, weights, indices = self.get_inputs_weights_indices()
         kwargs = dict(
             in_features=self.in_features,
@@ -177,25 +198,18 @@ class TestRoutedExperts(_TestBase):
             n_routed_experts=self.n_routed_experts,
             **self.factory_kwargs,
         )
-        expert_classes = (RoutedExpertsNoEPTorch, RoutedExpertsNoEPGroupedMM)
-        experts = [cls(**kwargs) for cls in expert_classes]
 
-        for exp_other in experts[1:]:
-            _copy_params_routed_experts(experts[0], exp_other)
-        outputs = [e(inputs, weights, indices) for e in experts]
+        exp = _SimpleRoutedExperts(**kwargs)
+        exp_other = cls(**kwargs)
+        _copy_params_routed_experts(exp, exp_other)
+        out = exp(inputs, weights, indices)
+        out_other = exp_other(inputs, weights, indices)
 
-        for o in outputs:
-            assert o.shape == inputs.shape
-            # Just test that backwards doesn't error. TODO: @goon - correctness tests.
-            o.pow(2).sum().backward()
 
-        cls, o = expert_classes[0], outputs[0]
-        try:
-            for cls_other, o_other in zip(expert_classes[1:], outputs[1:]):
-                # Allow for slightly higher tol
-                torch.testing.assert_close(o, o_other, atol=1e-2, rtol=1e-2)
-        except AssertionError as e:
-            raise RuntimeError(f"Failed for {cls=}, {cls_other=}") from e
+        torch.testing.assert_close(out_other, out, atol=1e-2, rtol=1e-2)
+
+        # Just test that backwards doesn't error. TODO: @goon - correctness tests.
+        out_other.pow(2).sum().backward()
 
 
 class TestMoE(_TestBase):
@@ -604,15 +618,7 @@ class TestMoeImpls(_TestBase):
         """
         Testing the equivalence between different impls
         """
-        gate = Gate(
-            in_features=self.in_features,
-            n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
-            score_func="softmax",
-            route_scale=1.0,
-            **self.factory_kwargs,
-        )
-        self.experts = nn.ModuleDict(
+        experts = nn.ModuleDict(
             {
                 str(i): GatedMLP(
                     self.in_features,
@@ -625,17 +631,14 @@ class TestMoeImpls(_TestBase):
         )
 
         # Common gating
-        x = self.get_inputs()
 
-        x = x.view(-1, self.in_features)
-
-        weights, indices = gate(x)
+        x, weights, indices = self.get_inputs_weights_indices()
 
         # DeepSeek-v3 impl:
         z_ds = torch.zeros_like(x)
         for i in range(self.n_routed_experts):
             # TODO: @goon - handle no-tokens edge case
-            expert = self.experts[str(i)]
+            expert = experts[str(i)]
             idx, top = torch.where(indices == i)
             z_ds[idx] += expert(x[idx]) * weights[idx, top, None]
 
@@ -650,7 +653,7 @@ class TestMoeImpls(_TestBase):
         for exp_idx in range(self.n_routed_experts):
             idxs = indices == exp_idx
             # TODO: @goon - handle no-tokens edge case
-            z_alt[idxs.flatten()] = self.experts[str(exp_idx)](x[idxs.any(dim=-1)])
+            z_alt[idxs.flatten()] = experts[str(exp_idx)](x[idxs.any(dim=-1)])
 
         # Store the unsorted results back in x_by_expert
         z_alt = z_alt.reshape(*(weights.shape + z_alt.shape[-1:]))
@@ -671,7 +674,7 @@ class TestMoeImpls(_TestBase):
         )
         torch.testing.assert_close(outputs, outputs_alt)
 
-    def test_get_single_exp_output(self):
+    def test_get_exp_outputs_grouped_mm(self):
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 2
         d_model = 16

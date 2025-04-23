@@ -1,64 +1,19 @@
 from argparse import ArgumentParser
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from timing_utils import CUDATimer
 
-from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.moe import RoutedExpertsNoEPGroupedMM, RoutedExpertsNoEPTorch
-
-
-class SimpleRoutedExperts(nn.Module):
-    """
-    Simple routed experts class mirroring the public DeepSeekv3 impl.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        d_intermediate: int,
-        n_routed_experts: int,
-        multiple_of: int = 1,
-        activation=F.silu,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__()
-        self.n_routed_experts = n_routed_experts
-        self.experts = nn.ModuleList(
-            [
-                GatedMLP(
-                    in_features=in_features,
-                    hidden_features=d_intermediate,
-                    multiple_of=multiple_of,
-                    activation=activation,
-                    device=device,
-                    dtype=dtype,
-                )
-                for i in range(n_routed_experts)
-            ]
-        )
-
-    def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
-    ) -> torch.Tensor:
-        y = torch.zeros_like(x)
-        counts = torch.bincount(
-            indices.flatten(), minlength=self.n_routed_experts
-        ).tolist()
-        for i in range(self.n_routed_experts):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
-        return y
-
+from mamba_ssm.modules.moe import (
+    RoutedExpertsNoEPForLoop,
+    RoutedExpertsNoEPForLoopAlt,
+    RoutedExpertsNoEPGroupedMM,
+    _SimpleRoutedExperts,
+)
 
 expert_classes = (
-    SimpleRoutedExperts,
-    RoutedExpertsNoEPTorch,
+    _SimpleRoutedExperts,
+    RoutedExpertsNoEPForLoop,
+    RoutedExpertsNoEPForLoopAlt,
     RoutedExpertsNoEPGroupedMM,
 )
 
@@ -126,7 +81,9 @@ if __name__ == "__main__":
             cache.zero_()
         time_s = timer.get_mean_time_s()
         time_std_s = timer.get_std_time_s()
-        print(f"{model_cls.__name__}: {time_s=:.2e}, {time_std_s=:.2e}, {time_std_s/time_s=:.2e}")
+        print(
+            f"{model_cls.__name__}: {time_s=:.2e}, {time_std_s=:.2e}, {time_std_s/time_s=:.2e}"
+        )
         results[model_cls.__name__] = time_s
 
     print("Relative times:")

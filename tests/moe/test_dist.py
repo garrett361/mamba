@@ -12,8 +12,8 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import (
     MoE,
-    RoutedExpertsNoEPTorch,
-    RoutedExpertsTorchEPNaive,
+    RoutedExpertsNoEPForLoop,
+    RoutedExpertsTorchEPForLoop,
     _RoutedExperts,
 )
 
@@ -183,7 +183,7 @@ class _TestBase(DTest):
             self.batch_size * self.seqlen,
             self.n_activated_experts,
             **self.factory_kwargs,
-        )
+        ).softmax(dim=-1)
         indices = (
             torch.randn(
                 self.batch_size * self.seqlen,
@@ -210,8 +210,8 @@ class TestRoutedExperts(_TestBase):
             n_routed_experts=self.n_routed_experts,
             **self.factory_kwargs,
         )
-        model = RoutedExpertsNoEPTorch(**model_kwargs)
-        model_ep = RoutedExpertsTorchEPNaive(**model_kwargs, ep_mesh=ep_mesh)
+        model = RoutedExpertsNoEPForLoop(**model_kwargs)
+        model_ep = RoutedExpertsTorchEPForLoop(**model_kwargs, ep_mesh=ep_mesh)
 
         # Set weights equal
         _copy_params_routed_experts(model, model_ep)
@@ -235,8 +235,8 @@ class TestRoutedExperts(_TestBase):
             n_routed_experts=self.n_routed_experts,
             **self.factory_kwargs,
         )
-        model = RoutedExpertsNoEPTorch(**model_kwargs)
-        model_ep = RoutedExpertsTorchEPNaive(**model_kwargs, ep_mesh=ep_mesh)
+        model = RoutedExpertsNoEPForLoop(**model_kwargs)
+        model_ep = RoutedExpertsTorchEPForLoop(**model_kwargs, ep_mesh=ep_mesh)
 
         # Force models equal
         _copy_params(model, model_ep)
