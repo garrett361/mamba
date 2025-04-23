@@ -655,7 +655,6 @@ class TestMoeImpls(_TestBase):
             # TODO: @goon - handle no-tokens edge case
             z_alt[idxs.flatten()] = experts[str(exp_idx)](x[idxs.any(dim=-1)])
 
-        # Store the unsorted results back in x_by_expert
         z_alt = z_alt.reshape(*(weights.shape + z_alt.shape[-1:]))
         z_alt = torch.bmm(weights[:, None], z_alt).squeeze(1)
 

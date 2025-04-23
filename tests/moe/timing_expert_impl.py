@@ -29,7 +29,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_shared_experts", type=int, default=0)
     parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=4096)
-    parser.add_argument("--bwd", action="store_true")
+    parser.add_argument("--no_bwd", action="store_true")
 
     args = parser.parse_args()
     print(f"{args=}")
@@ -68,7 +68,7 @@ if __name__ == "__main__":
 
         for _ in range(args.warmups):
             out = model(inputs, weights, indices)
-            if args.bwd:
+            if not args.no_bwd:
                 out.pow(2).sum().backward()
             cache.zero_()
 
@@ -76,7 +76,7 @@ if __name__ == "__main__":
         for _ in range(args.reps):
             with timer:
                 out = model(inputs, weights, indices)
-                if args.bwd:
+                if not args.no_bwd:
                     out.pow(2).sum().backward()
             cache.zero_()
         time_s = timer.get_mean_time_s()
