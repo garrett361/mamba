@@ -6,7 +6,6 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPForLoopAlt,
     RoutedExpertsNoEPGroupedMM,
     _SimpleRoutedExperts,
 )
@@ -14,7 +13,6 @@ from mamba_ssm.modules.moe import (
 EXP_CLASSES = {
     "simple": _SimpleRoutedExperts,
     "torch": RoutedExpertsNoEPForLoop,
-    "torch_alt": RoutedExpertsNoEPForLoopAlt,
     "torch_gemm": RoutedExpertsNoEPGroupedMM,
 }
 

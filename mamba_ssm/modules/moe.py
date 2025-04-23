@@ -422,38 +422,6 @@ class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
         return z
 
 
-class RoutedExpertsNoEPForLoopAlt(_RoutedExpertsNoEP):
-    def forward(
-        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
-    ) -> torch.Tensor:
-        # Sort tokens by the expert they are indexed to so that later reads are contiguous.
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        n_activated_experts = indices.shape[-1]
-        x_by_expert = x[flat_sorted_indices // n_activated_experts].contiguous()
-        z = torch.empty_like(x_by_expert)
-        counts = _get_counts(indices, self.n_routed_experts)
-
-        # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
-        # self.fc1_weights[exp_idx], results in super-slow CUDA syncs during the backwards pass.
-        start = torch.tensor(0, device=counts.device)
-        for count, fc1, fc2 in zip(counts, self.fc1_weights, self.fc2_weights):
-            # TODO: @goon - handle no-tokens edge case
-            idxs = torch.arange(start, start + count, device=z.device)
-            z[idxs] = _get_single_exp_output(
-                x_by_expert[idxs],
-                fc1,
-                fc2,
-                self.activation,
-            )
-            start = start + count
-
-        # Restore original order, putting
-        x_by_expert[flat_sorted_indices] = z
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
-        return z
-
-
 class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
