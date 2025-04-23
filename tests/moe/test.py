@@ -13,7 +13,6 @@ from mamba_ssm.modules.moe import (
     Gate,
     MoE,
     RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPForLoopAlt,
     RoutedExpertsNoEPGroupedMM,
     _get_exp_outputs_grouped_mm,
     _get_single_exp_output,
@@ -185,7 +184,6 @@ class TestRoutedExperts(_TestBase):
         "cls",
         [
             RoutedExpertsNoEPForLoop,
-            RoutedExpertsNoEPForLoopAlt,
             RoutedExpertsNoEPGroupedMM,
         ],
     )

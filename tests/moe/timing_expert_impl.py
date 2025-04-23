@@ -5,7 +5,6 @@ from timing_utils import CUDATimer
 
 from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPForLoopAlt,
     RoutedExpertsNoEPGroupedMM,
     _SimpleRoutedExperts,
 )
@@ -13,7 +12,6 @@ from mamba_ssm.modules.moe import (
 expert_classes = (
     _SimpleRoutedExperts,
     RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPForLoopAlt,
     RoutedExpertsNoEPGroupedMM,
 )
 
