@@ -4,18 +4,7 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from mamba_ssm.modules.moe import (
-    RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPGroupedMM,
-    _SimpleRoutedExperts,
-)
-
-EXP_CLASSES = {
-    "simple": _SimpleRoutedExperts,
-    "torch": RoutedExpertsNoEPForLoop,
-    "torch_gemm": RoutedExpertsNoEPGroupedMM,
-}
-
+from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES
 
 if __name__ == "__main__":
     # some setups
@@ -27,45 +16,42 @@ if __name__ == "__main__":
     parser.add_argument("--n_routed_experts", type=int, default=64)
     parser.add_argument("--n_activated_experts", type=int, default=8)
     parser.add_argument("--warmups", type=int, default=3)
-    parser.add_argument("--trace_dir", default="prof")
-    parser.add_argument("--impls", type=str, default=",".join(EXP_CLASSES))
+    parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--trace_dir", default="prof/experts_one_gpu")
+    parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES))
     parser.add_argument("--no_bwd", action="store_true")
 
     args = parser.parse_args()
 
     print(f"{args=}")
     impls = args.impls.split(",")
+    torch.cuda.manual_seed(42)
+    dtype = torch.bfloat16
+    device = "cuda"
+    factory_kwargs = {"dtype": dtype, "device": device}
+    inputs = torch.randn(
+        args.batch_size * args.seqlen, args.in_features, **factory_kwargs
+    )
+    weights = torch.randn(
+        args.batch_size * args.seqlen,
+        args.n_activated_experts,
+        **factory_kwargs,
+    )
+    indices = (
+        torch.randn(
+            args.batch_size * args.seqlen,
+            args.n_routed_experts,
+            device=device,
+        )
+        .topk(args.n_activated_experts, dim=-1)
+        .indices
+    )
     for impl in impls:
-        torch.cuda.manual_seed(42)
-        dtype = torch.bfloat16
-        device = "cuda"
-        factory_kwargs = {"dtype": dtype, "device": device}
-
-        model = EXP_CLASSES[impl](
+        model = NON_EP_EXPERT_CLASSES[impl](
             in_features=args.in_features,
             d_intermediate=args.d_intermediate,
             n_routed_experts=args.n_routed_experts,
             **factory_kwargs,
-        )
-        # print(f"{model=}")
-        # print(f"{sum(p.numel() for p in model.parameters())/2**30=}")
-
-        inputs = torch.randn(
-            args.batch_size * args.seqlen, args.in_features, **factory_kwargs
-        )
-        weights = torch.randn(
-            args.batch_size * args.seqlen,
-            args.n_activated_experts,
-            **factory_kwargs,
-        )
-        indices = (
-            torch.randn(
-                args.batch_size * args.seqlen,
-                args.n_routed_experts,
-                device=device,
-            )
-            .topk(args.n_activated_experts, dim=-1)
-            .indices
         )
 
         for _ in range(args.warmups):
@@ -78,12 +64,13 @@ if __name__ == "__main__":
             activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
             record_shapes=True,
         ) as prof:
-            with record_function("fwd"):
-                out = model(inputs, weights, indices)
-            if not args.no_bwd:
-                with record_function("bwd"):
-                    out.pow(2).sum().backward()
-                model.zero_grad()
+            for _ in range(args.reps):
+                with record_function("fwd"):
+                    out = model(inputs, weights, indices)
+                if not args.no_bwd:
+                    with record_function("bwd"):
+                        out.pow(2).sum().backward()
+                    model.zero_grad()
 
         print(
             prof.key_averages().table(

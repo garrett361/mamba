@@ -11,10 +11,12 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     _GROUPED_MM_ALIGNMENT,
+    NON_EP_EXPERT_CLASSES,
     Gate,
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsNoEPGroupedMM,
+    RoutedExpertsNoEPGroupedMMTriton,
     _get_counts,
     _get_exp_outputs_grouped_mm,
     _get_single_exp_output,
@@ -191,6 +193,7 @@ class TestRoutedExperts(_TestBase):
         [
             RoutedExpertsNoEPForLoop,
             RoutedExpertsNoEPGroupedMM,
+            RoutedExpertsNoEPGroupedMMTriton,
         ],
     )
     def test_fwd_equivalence(self, cls) -> None:
@@ -234,9 +237,12 @@ class TestMoE(_TestBase):
 
 
 class TestMoEModel(_TestBase):
-    def test_fwd(self) -> None:
+    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
+    def test_fwd(self, moe_impl) -> None:
         torch.manual_seed(42)
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
+        cfg = deepcopy(self.cfg)
+        cfg.moe_cfg["moe_impl"] = moe_impl
+        model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         for layer_idx in sorted(model.backbone.layers):
             mlp = model.backbone.layers[layer_idx].mlp
             if int(layer_idx) in self.moe_layer_idx:
@@ -791,7 +797,10 @@ class TestTriton(_TestBase):
 
         # Triton impl:
         idxs_alt, offs_alt = pad_sorted_idxs(
-            counts, n_routed_experts, seqlen * n_activated_experts, _GROUPED_MM_ALIGNMENT
+            counts,
+            n_routed_experts,
+            seqlen * n_activated_experts,
+            _GROUPED_MM_ALIGNMENT,
         )
         torch.testing.assert_close(offs, offs_alt.to(offs))
         torch.testing.assert_close(idxs, idxs_alt.to(idxs))

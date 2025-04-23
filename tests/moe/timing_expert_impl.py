@@ -3,17 +3,9 @@ from argparse import ArgumentParser
 import torch
 from timing_utils import CUDATimer
 
-from mamba_ssm.modules.moe import (
-    RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPGroupedMM,
-    _SimpleRoutedExperts,
-)
+from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES
 
-expert_classes = (
-    _SimpleRoutedExperts,
-    RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPGroupedMM,
-)
+expert_classes = list(NON_EP_EXPERT_CLASSES.values())
 
 
 if __name__ == "__main__":

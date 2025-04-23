@@ -20,6 +20,9 @@ def pad_sorted_idxs(
 
     `idxs.shape = x.shape[:1]`
 
+    This removes various cudaStreamSynchronizes compared to a pure torch impl using
+    `repeat_interleave`. NOTE: @goon - though it doesn't end up having much e2e perf impact.
+
     """
     counts_aligned = ((counts + alignment - 1) // alignment) * alignment
     offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
