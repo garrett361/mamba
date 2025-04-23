@@ -335,6 +335,9 @@ class _RoutedExperts(nn.Module, ABC):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(in_features={self.in_features}, d_intermediate={self.d_intermediate}, n_routed_experts={self.n_routed_experts})"
+
 
 class _RoutedExpertsNoEP(_RoutedExperts):
     def __init__(self, *args, **kwargs) -> None:
