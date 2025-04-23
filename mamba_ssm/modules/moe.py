@@ -174,10 +174,10 @@ class MoE(nn.Module):
 
         # TODO: @goon - better config for which routed experts impl to use.
         NON_EP_EXPERT_CLASSES = {
-            "torch": RoutedExpertsNoEPTorch,
+            "torch": RoutedExpertsNoEPForLoop,
             "torch_gemm": RoutedExpertsNoEPGroupedMM,
         }
-        EP_EXPERT_CLASSES = {"torch": RoutedExpertsTorchEPNaive}
+        EP_EXPERT_CLASSES = {"torch": RoutedExpertsTorchEPForLoop}
 
         routed_experts_cls = (
             NON_EP_EXPERT_CLASSES[moe_impl]
@@ -404,11 +404,12 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         return x_recv, send_counts, recv_counts, tokens_per_expert_group
 
 
-class RoutedExpertsNoEPTorch(_RoutedExpertsNoEP):
+class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
-        z = torch.empty_like(x)
+        # TODO: @goon - Why does this have to be zeros?
+        z = torch.zeros_like(x)
         # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
         # self.fc1_weights[exp_idx], results in super-slow CUDA syncs during the backwards pass.
         for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1_weights, self.fc2_weights)):
@@ -419,6 +420,33 @@ class RoutedExpertsNoEPTorch(_RoutedExpertsNoEP):
                 _get_single_exp_output(x[idx], fc1, fc2, self.activation)
                 * weights[idx, top, None]
             )
+        return z
+
+
+class RoutedExpertsNoEPForLoopAlt(_RoutedExpertsNoEP):
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        n_activated_experts = indices.shape[-1]
+        z = torch.empty(
+            x.shape[0] * n_activated_experts,
+            x.shape[-1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
+        # self.fc1_weights[exp_idx], results in super-slow CUDA syncs during the backwards pass.
+        for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1_weights, self.fc2_weights)):
+            idxs = indices == exp_idx
+            # TODO: @goon - handle no-tokens edge case
+
+            z[idxs.flatten()] = _get_single_exp_output(
+                x[idxs.any(dim=-1)], fc1, fc2, self.activation
+            )
+
+        # Store the unsorted results back in x_by_expert
+        z = z.reshape(*(weights.shape + z.shape[-1:]))
+        z = torch.bmm(weights[:, None], z).squeeze(1)
         return z
 
 
@@ -457,12 +485,12 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
         x_by_expert[flat_sorted_indices] = z[idxs_align]
 
         # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
         z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
         return z
 
 
-class RoutedExpertsTorchEPNaive(_RoutedExpertsTorchEP):
+class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -511,3 +539,51 @@ class RoutedExpertsTorchEPNaive(_RoutedExpertsTorchEP):
         x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
         z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
         return z
+
+
+
+class _SimpleRoutedExperts(nn.Module):
+    """
+    Simple routed experts class mirroring the public DeepSeekv3 impl. Just for testing.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        d_intermediate: int,
+        n_routed_experts: int,
+        multiple_of: int = 1,
+        activation=F.silu,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.n_routed_experts = n_routed_experts
+        self.experts = nn.ModuleList(
+            [
+                GatedMLP(
+                    in_features=in_features,
+                    hidden_features=d_intermediate,
+                    multiple_of=multiple_of,
+                    activation=activation,
+                    device=device,
+                    dtype=dtype,
+                )
+                for i in range(n_routed_experts)
+            ]
+        )
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        y = torch.zeros_like(x)
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
+        for i in range(self.n_routed_experts):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        return y
