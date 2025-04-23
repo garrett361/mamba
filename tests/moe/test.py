@@ -10,15 +10,18 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
+    _GROUPED_MM_ALIGNMENT,
     Gate,
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsNoEPGroupedMM,
+    _get_counts,
     _get_exp_outputs_grouped_mm,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
 )
+from mamba_ssm.ops.triton.moe import pad_sorted_idxs
 
 
 def _copy_params_routed_experts(
@@ -129,6 +132,7 @@ class _TestBase:
 class TestGate(_TestBase):
     @pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
     def test_fwd(self, score_func: Literal["sigmoid", "softmax"]) -> None:
+        torch.manual_seed(42)
         model = Gate(
             in_features=self.in_features,
             n_routed_experts=self.n_routed_experts,
@@ -149,6 +153,7 @@ class TestGate(_TestBase):
     def test_fwd_with_exp_groups(
         self, score_func: Literal["sigmoid", "softmax"]
     ) -> None:
+        torch.manual_seed(42)
         model = Gate(
             in_features=self.in_features,
             n_routed_experts=self.n_routed_experts,
@@ -170,6 +175,7 @@ class TestGate(_TestBase):
 
 class TestRoutedExperts(_TestBase):
     def test_no_ep_naive(self) -> None:
+        torch.manual_seed(42)
         inputs, weights, indices = self.get_inputs_weights_indices()
         experts = RoutedExpertsNoEPForLoop(
             in_features=self.in_features,
@@ -203,7 +209,6 @@ class TestRoutedExperts(_TestBase):
         out = exp(inputs, weights, indices)
         out_other = exp_other(inputs, weights, indices)
 
-
         torch.testing.assert_close(out_other, out, atol=1e-2, rtol=1e-2)
 
         # Just test that backwards doesn't error. TODO: @goon - correctness tests.
@@ -213,6 +218,7 @@ class TestRoutedExperts(_TestBase):
 class TestMoE(_TestBase):
     @pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
     def test_fwd(self, score_func: Literal["sigmoid", "softmax"]) -> None:
+        torch.manual_seed(42)
         model = MoE(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
@@ -229,6 +235,7 @@ class TestMoE(_TestBase):
 
 class TestMoEModel(_TestBase):
     def test_fwd(self) -> None:
+        torch.manual_seed(42)
         model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
         for layer_idx in sorted(model.backbone.layers):
             mlp = model.backbone.layers[layer_idx].mlp
@@ -246,6 +253,7 @@ def test_bincount_impl_equiv():
     The DeepSeek-v3 repo uses `torch.bincount` which incurs a CUDA sync. Test equivalence with the
     code from torchtitan
     """
+    torch.manual_seed(42)
     seqlen = 4096
     n_routed_experts = 64
     n_activated_experts = 8
@@ -293,6 +301,8 @@ class TestTitan(_TestBase):
         """
         from torchtitan.experiments.kernels.moe.indices import generate_permute_indices
 
+        torch.manual_seed(42)
+
         experts_per_rank = 2
         num_ranks = 8
         # tokens_per_expert_group = torch.arange(
@@ -339,6 +349,7 @@ class TestTitan(_TestBase):
         matmuls.
 
         """
+        torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 4
         d_model = 16
@@ -405,6 +416,7 @@ class TestTitan(_TestBase):
         """
         Two experts, give the second expert twice the number of toks
         """
+        torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 2
         d_model = 16
@@ -489,6 +501,8 @@ class TestTitan(_TestBase):
             grouped_gemm_forward,
         )
 
+        torch.manual_seed(42)
+
         # Tok alignments need to be rounded to ALIGN_SIZE_M, and it seems like we need d_model >=
         # 256? Also maybe needs to be a power of 2.
         n_experts = 4
@@ -549,6 +563,8 @@ class TestTitan(_TestBase):
             ALIGN_SIZE_M,
             grouped_gemm_forward,
         )
+
+        torch.manual_seed(42)
 
         # Tok alignments need to be rounded to ALIGN_SIZE_M, and it seems like we need d_model >=
         # 256? Also maybe needs to be a power of 2.
@@ -616,6 +632,7 @@ class TestMoeImpls(_TestBase):
         """
         Testing the equivalence between different impls
         """
+        torch.manual_seed(42)
         experts = nn.ModuleDict(
             {
                 str(i): GatedMLP(
@@ -659,6 +676,7 @@ class TestMoeImpls(_TestBase):
         torch.testing.assert_close(z_ds, z_alt, atol=self.tol, rtol=self.tol)
 
     def test_get_single_exp_output(self):
+        torch.manual_seed(42)
         mlp = GatedMLP(
             in_features=self.in_features,
             hidden_features=self.d_intermediate,
@@ -672,6 +690,7 @@ class TestMoeImpls(_TestBase):
         torch.testing.assert_close(outputs, outputs_alt)
 
     def test_get_exp_outputs_grouped_mm(self):
+        torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 2
         d_model = 16
@@ -736,3 +755,43 @@ class TestMoeImpls(_TestBase):
         # Backwards: just test that the _grouped_mm bwd doesn't error out for now.
         # TODO: @goon - test correctness.
         out.pow(2).sum().backward()
+
+
+class TestTriton(_TestBase):
+    @pytest.mark.parametrize("seqlen", [128, 1024, 8192, 32768])
+    @pytest.mark.parametrize("n_routed_experts", [64, 256])
+    @pytest.mark.parametrize("n_activated_experts", [8, 16])
+    def test_pad_sorted_idxs(
+        self, seqlen: int, n_routed_experts: int, n_activated_experts: int
+    ) -> None:
+        torch.manual_seed(42)
+        indices = (
+            torch.randn(
+                seqlen,
+                n_routed_experts,
+                device=self.device,
+            )
+            .topk(n_activated_experts, dim=-1)
+            .indices
+        )
+        counts = _get_counts(indices, n_routed_experts)
+
+        # Torch impl:
+        counts_aligned = (
+            (counts + _GROUPED_MM_ALIGNMENT - 1) // _GROUPED_MM_ALIGNMENT
+        ) * _GROUPED_MM_ALIGNMENT
+        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
+
+        # Build the aligned index map
+        idxs_offs_align = (counts_aligned - counts).roll(1)
+        idxs_offs_align[0] = 0
+        idxs_offs_align = idxs_offs_align.cumsum(dim=0)
+        idxs = torch.arange(counts.sum(), device=counts.device)
+        idxs = idxs + idxs_offs_align.repeat_interleave(counts)
+
+        # Triton impl:
+        idxs_alt, offs_alt = pad_sorted_idxs(
+            counts, n_routed_experts, seqlen * n_activated_experts, _GROUPED_MM_ALIGNMENT
+        )
+        torch.testing.assert_close(offs, offs_alt.to(offs))
+        torch.testing.assert_close(idxs, idxs_alt.to(idxs))
