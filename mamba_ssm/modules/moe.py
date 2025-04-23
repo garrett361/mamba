@@ -8,6 +8,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from mamba_ssm.modules.mlp import GatedMLP
+from mamba_ssm.ops.triton.moe import pad_sorted_idxs
 
 _GROUPED_MM_ALIGNMENT = 16
 
@@ -129,7 +130,9 @@ class MoE(nn.Module):
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
-        moe_impl: Literal["torch", "torch_gemm"] = "torch",
+        moe_impl: Literal[
+            "torch", "torch_gemm", "torch_gemm_triton", "_simple"
+        ] = "torch",
     ):
         """
         Initializes the MoE module.
@@ -173,11 +176,6 @@ class MoE(nn.Module):
         )
 
         # TODO: @goon - better config for which routed experts impl to use.
-        NON_EP_EXPERT_CLASSES = {
-            "torch": RoutedExpertsNoEPForLoop,
-            "torch_gemm": RoutedExpertsNoEPGroupedMM,
-        }
-        EP_EXPERT_CLASSES = {"torch": RoutedExpertsTorchEPForLoop}
 
         routed_experts_cls = (
             NON_EP_EXPERT_CLASSES[moe_impl]
@@ -439,6 +437,9 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
         ) * _GROUPED_MM_ALIGNMENT
         offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
         # Expand the tokens to an appropriately aligned tensor.
+
+        # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # sized, empirically tuned to be large enough to handle the routed tokens.
         z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
 
         # Build the aligned index map
@@ -447,6 +448,45 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
         idxs_offs_align = idxs_offs_align.cumsum(dim=0)
         idxs_align = torch.arange(counts.sum(), device=counts.device)
         idxs_align = idxs_align + idxs_offs_align.repeat_interleave(counts)
+
+        z[idxs_align] = x_by_expert
+        z = _get_exp_outputs_grouped_mm(
+            z, self.fc1_weights, self.fc2_weights, offs, self.activation
+        )
+
+        # Remove the alignment and return the tokens to their original ordering
+        x_by_expert[flat_sorted_indices] = z[idxs_align]
+
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
+
+
+class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        # Sort tokens by the expert they are indexed to.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
+
+        counts = _get_counts(indices, self.n_routed_experts)
+
+        # Expand the tokens to an appropriately aligned tensor.
+        idxs_align, offs = pad_sorted_idxs(
+            counts, self.n_routed_experts, indices.numel(), _GROUPED_MM_ALIGNMENT
+        )
+        # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # sized, empirically tuned to be large enough to handle the routed tokens.
+        z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        # z = torch.empty(
+        #     ((int(1.5 * indices.numel()) + 31) // 32) * 32,
+        #     x.shape[-1],
+        #     dtype=x.dtype,
+        #     device=x.device,
+        # )
 
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
@@ -525,6 +565,7 @@ class _SimpleRoutedExperts(nn.Module):
         n_routed_experts: int,
         multiple_of: int = 1,
         activation=F.silu,
+        ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
     ):
@@ -558,3 +599,12 @@ class _SimpleRoutedExperts(nn.Module):
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         return y
+
+
+NON_EP_EXPERT_CLASSES = {
+    "_simple": _SimpleRoutedExperts,
+    "torch": RoutedExpertsNoEPForLoop,
+    "torch_gemm": RoutedExpertsNoEPGroupedMM,
+    "torch_gemm_triton": RoutedExpertsNoEPGroupedMMTriton,
+}
+EP_EXPERT_CLASSES = {"torch": RoutedExpertsTorchEPForLoop}

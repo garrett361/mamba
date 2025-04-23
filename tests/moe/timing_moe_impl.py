@@ -1,173 +1,11 @@
 from argparse import ArgumentParser
-from typing import Literal, Optional
 
 import torch
-import torch.nn as nn
 from timing_utils import CUDATimer
-from torch.distributed.device_mesh import DeviceMesh
 
-from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.moe import Gate
+from mamba_ssm.modules.moe import MoE, NON_EP_EXPERT_CLASSES
 
-
-class MoEBase(nn.Module):
-    """
-    Base impl from Deepseek (more or less)
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        d_intermediate: int,
-        n_routed_experts: int,
-        n_shared_experts: int,
-        n_activated_experts: int,
-        multiple_of: int = 1,
-        score_func: Literal["sigmoid", "softmax"] = "softmax",
-        route_scale: float = 1.0,
-        ep_mesh: Optional[DeviceMesh] = None,
-        device=None,
-        dtype=None,
-    ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
-        if ep_mesh is not None and n_routed_experts % ep_mesh.size():
-            # TODO: @goon - shouldn't be a necessary constraint. Move to torch.chunk semantics for
-            # placements.
-            raise ValueError(
-                f"{self.n_routed_experts=} must be divisible by {ep_mesh.size()=}"
-            )
-        if ep_mesh is not None and ep_mesh.ndim != 1:
-            raise ValueError(
-                f"The expert parallel mesh must be one-dimensional: {ep_mesh.ndim=}"
-            )
-
-        super().__init__()
-        self.in_features = in_features
-        self.d_intermediate = d_intermediate
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.multiple_of = multiple_of
-        self.score_func = score_func
-        self.route_scale = route_scale
-        self.ep_mesh = ep_mesh
-        self.n_activated_experts = n_activated_experts
-
-        factory_kwargs = {"device": device, "dtype": dtype}
-
-        self.ep_mesh_size = 1 if ep_mesh is None else ep_mesh.size()
-        self.n_local_experts = self.n_routed_experts // (
-            self.ep_mesh.size() if self.ep_mesh is not None else 1
-        )
-
-        self.experts_start_idx = (
-            0 if ep_mesh is None else ep_mesh.get_local_rank() * self.n_local_experts
-        )
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(
-            in_features=self.in_features,
-            n_routed_experts=self.n_routed_experts,
-            n_activated_experts=self.n_activated_experts,
-            score_func=self.score_func,
-            route_scale=self.route_scale,
-            **factory_kwargs,
-        )
-        self.experts = nn.ModuleDict(
-            {
-                str(i): GatedMLP(
-                    self.in_features,
-                    self.d_intermediate,
-                    multiple_of=self.multiple_of,
-                    **factory_kwargs,
-                )
-                for i in range(self.experts_start_idx, self.experts_end_idx)
-            }
-        )
-        self.shared_experts = (
-            GatedMLP(
-                self.in_features,
-                self.n_shared_experts * self.d_intermediate,
-                multiple_of=self.multiple_of,
-                **factory_kwargs,
-            )
-            if self.n_shared_experts
-            else None
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
-
-        x_shape = x.size()
-        x = x.view(-1, self.in_features)
-
-        weights, indices = self.gate(x)
-
-        z = torch.zeros_like(x)
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            # TODO: @goon - handle no-tokens edge case
-            expert = self.experts[str(i)]
-            idx, top = torch.where(indices == i)
-            z[idx] += expert(x[idx]) * weights[idx, top, None]
-
-        if self.shared_experts is None:
-            return z.view(x_shape)
-
-        return (z + self.shared_experts(x)).view(x_shape)
-
-
-class MoEAlt(MoEBase):
-    """
-    Alt fwd impl
-    """
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
-
-        x_shape = x.size()
-        x = x.view(-1, self.in_features)
-
-        weights, indices = self.gate(x)
-
-        z = torch.empty(
-            x.shape[0] * self.n_activated_experts,
-            x.shape[-1],
-            dtype=x.dtype,
-            device=x.device,
-        )
-
-        for exp_idx in range(self.n_routed_experts):
-            idxs = indices == exp_idx
-            # TODO: @goon - handle no-tokens edge case
-            z[idxs.flatten()] = self.experts[str(exp_idx)](x[idxs.any(dim=-1)])
-
-        # Store the unsorted results back in x_by_expert
-        z = z.reshape(*(weights.shape + z.shape[-1:]))
-        z = torch.bmm(weights[:, None], z).squeeze(1)
-
-        if self.shared_experts is None:
-            return z.view(x_shape)
-
-        return (z + self.shared_experts(x)).view(x_shape)
+moe_impls = list(NON_EP_EXPERT_CLASSES)
 
 
 if __name__ == "__main__":
@@ -181,45 +19,51 @@ if __name__ == "__main__":
     parser.add_argument("--n_shared_experts", type=int, default=0)
     parser.add_argument("--bsz", type=int, default=4)
     parser.add_argument("--seqlen", type=int, default=4096)
-    parser.add_argument("--bwd", action="store_true")
+    parser.add_argument("--no_bwd", action="store_true")
 
     args = parser.parse_args()
     print(f"{args=}")
 
     dtype = torch.bfloat16
     device = "cuda"
+    factory_kwargs = {"dtype": dtype, "device": device}
 
     # Clear cache, like triton do_bench
     cache_size_bytes = 512 * 2**20  # 512k
     cache = torch.empty(int(cache_size_bytes // 4), dtype=torch.int, device="cuda")
 
-    for model_cls in (MoEBase, MoEAlt):
-        model = model_cls(
+    inputs = torch.randn(args.bsz, args.seqlen, args.in_features, **factory_kwargs)
+    results = {}
+    for moe_impl in moe_impls:
+        model = MoE(
             in_features=args.in_features,
             d_intermediate=args.d_intermediate,
             n_routed_experts=args.n_routed_experts,
             n_shared_experts=args.n_shared_experts,
             n_activated_experts=args.n_activated_experts,
-            dtype=dtype,
-            device=device,
-        )
-        inputs = torch.randn(
-            args.bsz, args.seqlen, args.in_features, dtype=dtype, device=device
+            moe_impl=moe_impl,
+            **factory_kwargs,
         )
 
         for _ in range(args.warmups):
             out = model(inputs)
-            if args.bwd:
-                out.sum().backward()
+            if not args.no_bwd:
+                out.pow(2).sum().backward()
             cache.zero_()
 
         timer = CUDATimer()
         for _ in range(args.reps):
             with timer:
                 out = model(inputs)
-                if args.bwd:
-                    out.sum().backward()
+                if not args.no_bwd:
+                    out.pow(2).sum().backward()
             cache.zero_()
         time_s = timer.get_mean_time_s()
         time_std_s = timer.get_std_time_s()
-        print(f"{model_cls.__name__}: {time_s=}, {time_std_s=}")
+        print(f"{moe_impl}: {time_s=:.2e}, {time_std_s=:.2e}, {time_std_s/time_s=:.2e}")
+        results[moe_impl] = time_s
+
+    print("Relative times:")
+    min_time = min(results.values())
+    for cls, time_s in results.items():
+        print(f"\t{cls}: {time_s / min_time:.2e}")
