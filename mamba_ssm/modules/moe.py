@@ -99,6 +99,16 @@ class Gate(nn.Module):
         weights *= self.route_scale
         return weights.type_as(x), indices
 
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f" n_routed_experts={self.n_routed_experts},"
+            f" n_activated_experts={self.n_activated_experts},"
+            f" n_expert_groups={self.n_expert_groups},"
+            f" n_limited_groups={self.n_limited_groups},"
+            f" score_func={self.score_func})"
+        )
+
 
 class MoE(nn.Module):
     """
@@ -224,6 +234,15 @@ class MoE(nn.Module):
             return z.view(x_shape)
 
         return (z + self.shared_experts(x)).view(x_shape)
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f" d_intermediate={self.d_intermediate},"
+            f" n_routed_experts={self.n_routed_experts},"
+            f" n_activated_experts={self.n_activated_experts},"
+            f" n_shared_experts={self.n_shared_experts})"
+        )
 
 
 def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.LongTensor:
