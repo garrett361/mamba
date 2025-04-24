@@ -284,7 +284,11 @@ class TestRoutedExperts(_TestBase):
 class TestMoEEP(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_fwd(self) -> None:
+    @pytest.mark.parametrize("moe_impl", ["torch", "torch_gemm"])
+    def test_fwd(self, moe_impl: str) -> None:
+        # Some classes have dtype constraints:
+        if "gemm" in moe_impl :
+            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -296,6 +300,7 @@ class TestMoEEP(_TestBase):
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,
             score_func="sigmoid",
+            moe_impl=moe_impl,
             **self.factory_kwargs,
         )
         model = MoE(**model_kwargs)
@@ -313,7 +318,11 @@ class TestMoEEP(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_bwd(self) -> None:
+    @pytest.mark.parametrize("moe_impl", ["torch", "torch_gemm"])
+    def test_bwd(self, moe_impl: str) -> None:
+        # Some classes have dtype constraints:
+        if "gemm" in moe_impl :
+            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -325,6 +334,7 @@ class TestMoEEP(_TestBase):
             n_activated_experts=self.n_activated_experts,
             n_shared_experts=self.n_shared_experts,
             score_func="sigmoid",
+            moe_impl=moe_impl,
             **self.factory_kwargs,
         )
         model = MoE(**model_kwargs)
