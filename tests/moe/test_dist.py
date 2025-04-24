@@ -131,7 +131,7 @@ class _TestBase(DTest):
 
     @property
     def n_routed_experts(self) -> int:
-        return 2 * self.world_size
+        return 2 * self.n_activated_experts * self.world_size
 
     @property
     def batch_size(self) -> int:
