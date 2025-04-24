@@ -118,7 +118,6 @@ class MoE(nn.Module):
         in_features (int): Dimensionality of input features.
         d_intermediate (int): Dimensionality of hidden features of each expert.
         n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
         n_activated_experts (int): Number of experts activated for each input.
         gate (nn.Module): Gating mechanism to route inputs to experts.
         experts (nn.ModuleList): List of expert modules.
@@ -282,7 +281,6 @@ def _get_exp_outputs_grouped_mm(
     """
     Compute the outputs from all experts using torch._grouped_mm
     """
-    print(f"{x.shape=}, {offs.shape=}, {fc1_weights.shape=}, {fc2_weights.shape=}")
     y = torch._grouped_mm(
         x, fc1_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
     )
@@ -394,11 +392,12 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         # data-dependent resorting and it does not appear possible to implement this with torch
         # primitives without incurring a CUDA sync.
 
-        assert self.ep_mesh is not None  # mypy
+
         # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
         # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
 
         counts = _get_counts(indices, self.n_routed_experts)
+        assert self.ep_mesh is not None  # mypy
         tokens_per_expert_group = funcol.all_to_all_single(
             counts, None, None, group=self.ep_mesh
         )
@@ -606,7 +605,7 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         recv_sorted_indices = local_expert_idxs.argsort(dim=-1)
         x_recv_sorted = x_recv[recv_sorted_indices]
         idxs_align, offs = pad_sorted_idxs(
-            tokens_per_expert_group.view(-1, 2).sum(dim=0),
+            tokens_per_expert_group.view(-1, self.n_local_experts).sum(dim=0),
             x_recv.shape[0],
             _GROUPED_MM_ALIGNMENT,
         )
