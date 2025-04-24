@@ -1,6 +1,8 @@
 import torch
 import triton
 import triton.language as tl
+from torch.profiler import record_function
+
 
 
 def pad_sorted_idxs(
@@ -23,24 +25,25 @@ def pad_sorted_idxs(
     `repeat_interleave`. NOTE: @goon - though it doesn't end up having much e2e perf impact.
 
     """
-    counts_aligned = ((counts + alignment - 1) // alignment) * alignment
-    offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
-    counts_cumsum = counts.cumsum(dim=0, dtype=torch.int32)
-    idxs = torch.arange(n_toks, dtype=torch.int32, device=counts.device)
+    with record_function("triton::moe::pad_sorted_idxs"):
+        counts_aligned = ((counts + alignment - 1) // alignment) * alignment
+        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
+        counts_cumsum = counts.cumsum(dim=0, dtype=torch.int32)
+        idxs = torch.arange(n_toks, dtype=torch.int32, device=counts.device)
 
-    # No action is needed for the zeroth expert
-    num_blocks = min(counts.numel() - 1, max_blocks)
-    # grid = one block per expert unless capped and then we loop...
-    grid = (num_blocks,)
-    _pad_sorted_idxs_kernel[grid](
-        counts,
-        counts_cumsum,
-        offs,
-        idxs,
-        counts.numel(),
-        BLOCK_SIZE=block_size,
-    )
-    return idxs, offs
+        # No action is needed for the zeroth expert
+        num_blocks = min(counts.numel() - 1, max_blocks)
+        # grid = one block per expert unless capped and then we loop...
+        grid = (num_blocks,)
+        _pad_sorted_idxs_kernel[grid](
+            counts,
+            counts_cumsum,
+            offs,
+            idxs,
+            counts.numel(),
+            BLOCK_SIZE=block_size,
+        )
+        return idxs, offs
 
 
 @triton.jit
