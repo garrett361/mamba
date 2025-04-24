@@ -5,7 +5,6 @@ import triton.language as tl
 
 def pad_sorted_idxs(
     counts: torch.LongTensor,
-    n_routed_experts: int,
     n_toks: int,
     alignment: int,
     block_size: int = 128,
@@ -30,7 +29,7 @@ def pad_sorted_idxs(
     idxs = torch.arange(n_toks, dtype=torch.int32, device=counts.device)
 
     # No action is needed for the zeroth expert
-    num_blocks = min(n_routed_experts - 1, max_blocks)
+    num_blocks = min(counts.numel() - 1, max_blocks)
     # grid = one block per expert unless capped and then we loop...
     grid = (num_blocks,)
     _pad_sorted_idxs_kernel[grid](
@@ -38,7 +37,7 @@ def pad_sorted_idxs(
         counts_cumsum,
         offs,
         idxs,
-        n_routed_experts,
+        counts.numel(),
         BLOCK_SIZE=block_size,
     )
     return idxs, offs
@@ -50,14 +49,14 @@ def _pad_sorted_idxs_kernel(
     counts_cumsum_ptr,
     offs_ptr,
     idxs_ptr,
-    n_routed_experts: tl.constexpr,
+    n_local_experts: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # Number of threads per block
 ):
     pid = tl.program_id(axis=0)
     num_programs = tl.num_programs(axis=0)
 
     # No action needed for the first expert's idxs.
-    for exp_idx in range(pid + 1, n_routed_experts, num_programs):
+    for exp_idx in range(pid + 1, n_local_experts, num_programs):
         # Load the idx range and derive the offset we need to add.
 
         count = tl.load(counts_ptr + exp_idx)

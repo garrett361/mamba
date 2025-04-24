@@ -798,7 +798,6 @@ class TestTriton(_TestBase):
         # Triton impl:
         idxs_alt, offs_alt = pad_sorted_idxs(
             counts,
-            n_routed_experts,
             seqlen * n_activated_experts,
             _GROUPED_MM_ALIGNMENT,
         )
