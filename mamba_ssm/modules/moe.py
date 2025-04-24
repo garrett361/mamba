@@ -173,7 +173,6 @@ class MoE(nn.Module):
         self.n_activated_experts = n_activated_experts
         self._tok_count = 0
 
-
         self.ep_mesh_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
         self.n_local_experts = self.n_routed_experts // (self.ep_mesh_size)
 
@@ -237,16 +236,6 @@ class MoE(nn.Module):
             return z.view(x_shape)
 
         return (z + self.shared_experts(x)).view(x_shape)
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(in_features={self.in_features},"
-            f" d_intermediate={self.d_intermediate},"
-            f" n_routed_experts={self.n_routed_experts},"
-            f" n_local_experts={self.n_local_experts},"
-            f" n_activated_experts={self.n_activated_experts},"
-            f" n_shared_experts={self.n_shared_experts})"
-        )
 
 
 def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.LongTensor:
@@ -359,7 +348,12 @@ class _RoutedExperts(nn.Module, ABC):
         raise NotImplementedError
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(in_features={self.in_features}, d_intermediate={self.d_intermediate}, n_routed_experts={self.n_routed_experts})"
+        return (
+            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f" d_intermediate={self.d_intermediate},"
+            f" n_routed_experts={self.n_routed_experts},"
+            f" n_local_experts={self.n_local_experts})"
+        )
 
 
 class _RoutedExpertsNoEP(_RoutedExperts):
@@ -396,7 +390,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         # order, so that tokens belonging to the same local expert are all contiguous. This is a
         # data-dependent resorting and it does not appear possible to implement this with torch
         # primitives without incurring a CUDA sync.
-
 
         # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
         # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
