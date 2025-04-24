@@ -685,4 +685,7 @@ NON_EP_EXPERT_CLASSES = {
     "torch_gemm": RoutedExpertsNoEPGroupedMM,
     "torch_gemm_triton": RoutedExpertsNoEPGroupedMMTriton,
 }
-EP_EXPERT_CLASSES = {"torch": RoutedExpertsTorchEPForLoop}
+EP_EXPERT_CLASSES = {
+    "torch": RoutedExpertsTorchEPForLoop,
+    "torch_gemm": RoutedExpertsTorchEPGroupedMM,
+}
