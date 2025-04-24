@@ -23,7 +23,7 @@ from mamba_ssm.modules.moe import (
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
 )
-from mamba_ssm.ops.triton.moe import pad_sorted_idxs
+from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 
 
 def _copy_params_routed_experts(
@@ -783,23 +783,13 @@ class TestTriton(_TestBase):
         counts = _get_counts(indices, n_routed_experts)
 
         # Torch impl:
-        counts_aligned = (
-            (counts + _GROUPED_MM_ALIGNMENT - 1) // _GROUPED_MM_ALIGNMENT
-        ) * _GROUPED_MM_ALIGNMENT
-        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
-
-        # Build the aligned index map
-        idxs_offs_align = (counts_aligned - counts).roll(1)
-        idxs_offs_align[0] = 0
-        idxs_offs_align = idxs_offs_align.cumsum(dim=0)
-        idxs = torch.arange(counts.sum(), device=counts.device)
-        idxs = idxs + idxs_offs_align.repeat_interleave(counts)
+        idxs, offs = pad_sorted_idxs_torch(
+            counts, seqlen * n_activated_experts, _GROUPED_MM_ALIGNMENT
+        )
 
         # Triton impl:
         idxs_alt, offs_alt = pad_sorted_idxs(
-            counts,
-            seqlen * n_activated_experts,
-            _GROUPED_MM_ALIGNMENT,
+            counts, seqlen * n_activated_experts, _GROUPED_MM_ALIGNMENT
         )
         torch.testing.assert_close(offs, offs_alt.to(offs))
         torch.testing.assert_close(idxs, idxs_alt.to(idxs))

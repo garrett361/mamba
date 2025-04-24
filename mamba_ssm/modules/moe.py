@@ -8,7 +8,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.ops.triton.moe import pad_sorted_idxs
+from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 
 _GROUPED_MM_ALIGNMENT = 16
 
@@ -451,24 +451,12 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
 
         counts = _get_counts(indices, self.n_routed_experts)
 
-        # Alignment requirements:
-        counts_aligned = (
-            (counts + _GROUPED_MM_ALIGNMENT - 1) // _GROUPED_MM_ALIGNMENT
-        ) * _GROUPED_MM_ALIGNMENT
-        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
-        # Expand the tokens to an appropriately aligned tensor.
-
+        idxs_align, offs = pad_sorted_idxs_torch(
+            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
+        )
         # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
         # sized, empirically tuned to be large enough to handle the routed tokens.
         z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
-
-        # Build the aligned index map
-        idxs_offs_align = (counts_aligned - counts).roll(1)
-        idxs_offs_align[0] = 0
-        idxs_offs_align = idxs_offs_align.cumsum(dim=0)
-        idxs_align = torch.arange(counts.sum(), device=counts.device)
-        idxs_align = idxs_align + idxs_offs_align.repeat_interleave(counts)
-
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
             z, self.fc1_weights, self.fc2_weights, offs, self.activation

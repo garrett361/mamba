@@ -4,7 +4,6 @@ import triton.language as tl
 from torch.profiler import record_function
 
 
-
 def pad_sorted_idxs(
     counts: torch.LongTensor,
     n_toks: int,
@@ -74,3 +73,24 @@ def _pad_sorted_idxs_kernel(
             dest_indices = chunk_offsets + count_cs
             mask = chunk_offsets < count
             tl.store(idxs_ptr + dest_indices, values, mask=mask)
+
+
+def pad_sorted_idxs_torch(
+    counts: torch.LongTensor,
+    n_toks: int,
+    alignment: int,
+) -> tuple[torch.IntTensor, torch.IntTensor]:
+    """
+    Reference impl.
+    """
+    with record_function("torch::moe::pad_sorted_idxs"):
+        # Alignment requirements:
+        counts_aligned = ((counts + alignment - 1) // alignment) * alignment
+        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
+        # Build the aligned index map
+        idxs_offs_align = (counts_aligned - counts).roll(1)
+        idxs_offs_align[0] = 0
+        idxs_offs_align = idxs_offs_align.cumsum(dim=0)
+        idxs = torch.arange(n_toks, device=counts.device)
+        idxs = idxs + idxs_offs_align.repeat_interleave(counts)
+        return idxs, offs
