@@ -173,6 +173,10 @@ class MoE(nn.Module):
         self.n_activated_experts = n_activated_experts
         self._tok_count = 0
 
+
+        self.ep_mesh_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
+        self.n_local_experts = self.n_routed_experts // (self.ep_mesh_size)
+
         factory_kwargs = {"device": device, "dtype": dtype}
 
         self.gate = Gate(
@@ -239,6 +243,7 @@ class MoE(nn.Module):
             f"{self.__class__.__name__}(in_features={self.in_features},"
             f" d_intermediate={self.d_intermediate},"
             f" n_routed_experts={self.n_routed_experts},"
+            f" n_local_experts={self.n_local_experts},"
             f" n_activated_experts={self.n_activated_experts},"
             f" n_shared_experts={self.n_shared_experts})"
         )
