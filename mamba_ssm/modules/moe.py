@@ -479,7 +479,7 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
 
         # Expand the tokens to an appropriately aligned tensor.
         idxs_align, offs = pad_sorted_idxs(
-            counts, self.n_routed_experts, indices.numel(), _GROUPED_MM_ALIGNMENT
+            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
         )
         # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
         # sized, empirically tuned to be large enough to handle the routed tokens.
@@ -546,6 +546,62 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
         # Send results back to original ranks (reversed send/recv count data)
         x_out = funcol.all_to_all_single_autograd(
             x_send, send_counts, recv_counts, group=self.ep_mesh
+        )
+
+        # Save an allocation: store the unsorted results back in x_by_expert.
+        x_by_expert[flat_sorted_indices] = x_out
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
+
+
+class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        # Sort tokens by the expert they are indexed to.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
+
+        x_recv, send_counts, recv_counts, tokens_per_expert_group = (
+            self._get_ep_toks_and_routing_data(x_by_expert, indices)
+        )
+
+        # Need to know which idxs in x_recv correspond to which local experts. Can derive from
+        # tokens_per_expert_group.
+        local_expert_idxs = (
+            torch.arange(
+                tokens_per_expert_group.numel(),
+                device=tokens_per_expert_group.device,
+            )
+            % self.n_local_experts
+        )
+        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
+        # the CUDA tensor tokens_per_expert_group to know the output shape
+        local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
+
+        # Sort and pad to use grouped GEMM
+        recv_sorted_indices = local_expert_idxs.argsort(dim=-1)
+        x_recv_sorted = x_recv[recv_sorted_indices]
+        idxs_align, offs = pad_sorted_idxs(
+            tokens_per_expert_group.view(-1, 2).sum(dim=0),
+            x_recv.shape[0],
+            _GROUPED_MM_ALIGNMENT,
+        )
+        z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        z[idxs_align] = x_recv_sorted
+        z = _get_exp_outputs_grouped_mm(
+            z, self.fc1_weights, self.fc2_weights, offs, self.activation
+        )
+        # Remove the alignment and return the tokens to their original ordering. Re-use
+        # x_recv_sorted and avoid a new allocation.
+        x_recv_sorted[recv_sorted_indices] = z[idxs_align]
+
+        # Send results back to original ranks (reversed send/recv count data)
+        x_out = funcol.all_to_all_single_autograd(
+            x_recv_sorted, send_counts, recv_counts, group=self.ep_mesh
         )
 
         # Save an allocation: store the unsorted results back in x_by_expert.

@@ -15,6 +15,7 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPForLoop,
     _RoutedExperts,
+    RoutedExpertsTorchEPGroupedMM,
 )
 
 
@@ -104,8 +105,8 @@ class _TestBase(DTest):
 
     seqlen = 32
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Uniform FSDP2 dtype issues with bfloat32 b/c the dt_bias doesn't respect factory_kwargs
-    dtype = torch.float32
+    # Uniform FSDP2 dtype issues with bfloat16 b/c the dt_bias doesn't respect factory_kwargs
+    dtype = torch.bfloat16
     factory_kwargs = {"device": device, "dtype": dtype}
     ssm_cfg = {"layer": "Mamba2"}
     attn_layer_idx = [n_layer - 1]
@@ -199,7 +200,14 @@ class _TestBase(DTest):
 class TestRoutedExperts(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_naive_torch_fwd(self) -> None:
+    @pytest.mark.parametrize(
+        "cls",
+        [
+            RoutedExpertsTorchEPForLoop,
+            RoutedExpertsTorchEPGroupedMM,
+        ],
+    )
+    def test_fwd(self, cls) -> None:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -211,7 +219,7 @@ class TestRoutedExperts(_TestBase):
             **self.factory_kwargs,
         )
         model = RoutedExpertsNoEPForLoop(**model_kwargs)
-        model_ep = RoutedExpertsTorchEPForLoop(**model_kwargs, ep_mesh=ep_mesh)
+        model_ep = cls(**model_kwargs, ep_mesh=ep_mesh)
 
         # Set weights equal
         _copy_params_routed_experts(model, model_ep)
@@ -224,7 +232,13 @@ class TestRoutedExperts(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_naive_torch_bwd(self) -> None:
+    @pytest.mark.parametrize(
+        "cls",
+        [
+            RoutedExpertsTorchEPForLoop,
+        ],
+    )
+    def test_bwd(self, cls) -> None:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -236,7 +250,7 @@ class TestRoutedExperts(_TestBase):
             **self.factory_kwargs,
         )
         model = RoutedExpertsNoEPForLoop(**model_kwargs)
-        model_ep = RoutedExpertsTorchEPForLoop(**model_kwargs, ep_mesh=ep_mesh)
+        model_ep = cls(**model_kwargs, ep_mesh=ep_mesh)
 
         # Force models equal
         _copy_params(model, model_ep)
