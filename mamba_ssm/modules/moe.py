@@ -260,7 +260,7 @@ def _get_single_exp_output(
     x: torch.Tensor,
     fc1_weights: torch.Tensor,
     fc2_weights: torch.Tensor,
-    activation: Callable[torch.Tensor, torch.Tensor],
+    activation: Callable[[torch.Tensor], torch.Tensor],
 ):
     """
     Compute the outputs from a single expert.
@@ -277,11 +277,12 @@ def _get_exp_outputs_grouped_mm(
     fc1_weights: torch.Tensor,
     fc2_weights: torch.Tensor,
     offs: torch.IntTensor,
-    activation: Callable[torch.Tensor, torch.Tensor],
+    activation: Callable[[torch.Tensor], torch.Tensor],
 ):
     """
     Compute the outputs from all experts using torch._grouped_mm
     """
+    print(f"{x.shape=}, {offs.shape=}")
     y = torch._grouped_mm(
         x, fc1_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
     )
