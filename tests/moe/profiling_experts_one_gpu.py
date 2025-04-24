@@ -6,6 +6,32 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES
 
+
+def trace_handler(prof):
+    global impl
+    global args
+    global model
+
+    print(
+        prof.key_averages().table(
+            sort_by="cuda_time_total",
+            row_limit=20,
+            header=f"{model.__class__.__name__}",
+        )
+    )
+    if args.trace_dir is not None:
+        trace_dir = Path(args.trace_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+
+        import json
+
+        with open(trace_dir.joinpath(f"args_{impl}.json"), "w") as fp:
+            json.dump(vars(args), fp)
+        prof.export_chrome_trace(
+            str(trace_dir.joinpath(f"trace_{impl}_step_{prof.step_num}.json"))
+        )
+
+
 if __name__ == "__main__":
     # some setups
     parser = ArgumentParser()
@@ -15,8 +41,10 @@ if __name__ == "__main__":
     parser.add_argument("--d_intermediate", type=int, default=1344)
     parser.add_argument("--n_routed_experts", type=int, default=64)
     parser.add_argument("--n_activated_experts", type=int, default=8)
-    parser.add_argument("--warmups", type=int, default=3)
-    parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--wait", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument("--active", type=int, default=2)
     parser.add_argument("--trace_dir", default="prof/experts_one_gpu")
     parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES))
     parser.add_argument("--no_bwd", action="store_true")
@@ -29,16 +57,23 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     device = "cuda"
     factory_kwargs = {"dtype": dtype, "device": device}
+    iters_per_impl = args.repeat * (args.active + args.wait + args.warmup)
+
     inputs = torch.randn(
-        args.batch_size * args.seqlen, args.in_features, **factory_kwargs
+        iters_per_impl,
+        args.batch_size * args.seqlen,
+        args.in_features,
+        **factory_kwargs,
     )
     weights = torch.randn(
+        iters_per_impl,
         args.batch_size * args.seqlen,
         args.n_activated_experts,
         **factory_kwargs,
     )
     indices = (
         torch.randn(
+            iters_per_impl,
             args.batch_size * args.seqlen,
             args.n_routed_experts,
             device=device,
@@ -54,37 +89,22 @@ if __name__ == "__main__":
             **factory_kwargs,
         )
 
-        for _ in range(args.warmups):
-            out = model(inputs, weights, indices)
-            if not args.no_bwd:
-                out.pow(2).sum().backward()
-                model.zero_grad()
-
         with profile(
             activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
-            record_shapes=True,
+            # record_shapes=True,
+            schedule=torch.profiler.schedule(
+                wait=args.wait,
+                warmup=args.warmup,
+                active=args.active,
+                repeat=args.repeat,
+            ),
+            on_trace_ready=trace_handler,
         ) as prof:
-            for _ in range(args.reps):
+            for idx in range(iters_per_impl):
                 with record_function("fwd"):
-                    out = model(inputs, weights, indices)
+                    out = model(inputs[idx], weights[idx], indices[idx])
                 if not args.no_bwd:
                     with record_function("bwd"):
                         out.pow(2).sum().backward()
                     model.zero_grad()
-
-        print(
-            prof.key_averages().table(
-                sort_by="cuda_time_total",
-                row_limit=20,
-                header=f"{model.__class__.__name__}",
-            )
-        )
-        if args.trace_dir is not None:
-            trace_dir = Path(args.trace_dir)
-            trace_dir.mkdir(parents=True, exist_ok=True)
-
-            import json
-
-            with open(trace_dir.joinpath(f"args_{impl}.json"), "w") as fp:
-                json.dump(vars(args), fp)
-            prof.export_chrome_trace(str(trace_dir.joinpath(f"trace_{impl}.json")))
+                prof.step()
