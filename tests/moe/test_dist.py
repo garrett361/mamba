@@ -11,6 +11,7 @@ from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import (
+    EP_EXPERT_CLASSES,
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPForLoop,
@@ -204,13 +205,7 @@ class _TestBase(DTest):
 class TestRoutedExperts(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    @pytest.mark.parametrize(
-        "cls",
-        [
-            RoutedExpertsTorchEPForLoop,
-            RoutedExpertsTorchEPGroupedMM,
-        ],
-    )
+    @pytest.mark.parametrize("cls", list(EP_EXPERT_CLASSES.values()))
     def test_fwd(self, cls) -> None:
         # Some classes have dtype constraints:
         if cls == RoutedExpertsTorchEPGroupedMM:
@@ -239,13 +234,7 @@ class TestRoutedExperts(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    @pytest.mark.parametrize(
-        "cls",
-        [
-            RoutedExpertsTorchEPForLoop,
-            RoutedExpertsTorchEPGroupedMM,
-        ],
-    )
+    @pytest.mark.parametrize("cls", list(EP_EXPERT_CLASSES.values()))
     def test_bwd(self, cls) -> None:
         # Some classes have dtype constraints:
         if cls == RoutedExpertsTorchEPGroupedMM:
@@ -284,10 +273,10 @@ class TestRoutedExperts(_TestBase):
 class TestMoEEP(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    @pytest.mark.parametrize("moe_impl", ["torch", "torch_gemm"])
+    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_fwd(self, moe_impl: str) -> None:
         # Some classes have dtype constraints:
-        if "gemm" in moe_impl :
+        if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
@@ -318,10 +307,10 @@ class TestMoEEP(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    @pytest.mark.parametrize("moe_impl", ["torch", "torch_gemm"])
+    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_bwd(self, moe_impl: str) -> None:
         # Some classes have dtype constraints:
-        if "gemm" in moe_impl :
+        if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
