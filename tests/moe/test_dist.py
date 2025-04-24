@@ -14,8 +14,8 @@ from mamba_ssm.modules.moe import (
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPForLoop,
-    _RoutedExperts,
     RoutedExpertsTorchEPGroupedMM,
+    _RoutedExperts,
 )
 
 
@@ -105,9 +105,8 @@ class _TestBase(DTest):
 
     seqlen = 32
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Uniform FSDP2 dtype issues with bfloat16 b/c the dt_bias doesn't respect factory_kwargs
-    dtype = torch.bfloat16
-    factory_kwargs = {"device": device, "dtype": dtype}
+    # Uniform FSDP2 dtype issues with bfloat16 b/c the dt_bias doesn't respect factory_kwargs.
+    dtype = torch.float32
     ssm_cfg = {"layer": "Mamba2"}
     attn_layer_idx = [n_layer - 1]
     head_dim = 64
@@ -124,6 +123,11 @@ class _TestBase(DTest):
     moe_layer_idx = list(range(1, n_layer))
 
     tol = 1e-2
+
+    @property
+    def factory_kwargs(self) -> int:
+        # Make this a property so that we can change dtype for certain tests.
+        return {"device": self.device, "dtype": self.dtype}
 
     @property
     def n_routed_experts(self) -> int:
@@ -208,6 +212,9 @@ class TestRoutedExperts(_TestBase):
         ],
     )
     def test_fwd(self, cls) -> None:
+        # Some classes have dtype constraints:
+        if cls == RoutedExpertsTorchEPGroupedMM:
+            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -236,9 +243,13 @@ class TestRoutedExperts(_TestBase):
         "cls",
         [
             RoutedExpertsTorchEPForLoop,
+            RoutedExpertsTorchEPGroupedMM,
         ],
     )
     def test_bwd(self, cls) -> None:
+        # Some classes have dtype constraints:
+        if cls == RoutedExpertsTorchEPGroupedMM:
+            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
