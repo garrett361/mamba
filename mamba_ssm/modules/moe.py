@@ -282,7 +282,7 @@ def _get_exp_outputs_grouped_mm(
     """
     Compute the outputs from all experts using torch._grouped_mm
     """
-    print(f"{x.shape=}, {offs.shape=}")
+    print(f"{x.shape=}, {offs.shape=}, {fc1_weights.shape=}, {fc2_weights.shape=}")
     y = torch._grouped_mm(
         x, fc1_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
     )
