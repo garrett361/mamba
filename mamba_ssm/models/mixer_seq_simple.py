@@ -344,9 +344,13 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         with open(config_path, 'w') as f:
             json.dump(self.config.__dict__, f, indent=4)
 
-    def _get_tok_counts(self)->int:
+    def _get_tok_counts(self) -> int:
+        """
+        Get, and reset, the total token counts received by all experts.
+        """
         tok_count = 0
         for mod in self.modules():
-            if isinstance(mod, MoE):
-                tok_count += mod._tok_count
+            if isinstance(mod, MoE) and hasattr(mod.experts, "_tok_count"):
+                tok_count += mod.experts._tok_count
+                mod.experts._tok_count=0
         return tok_count

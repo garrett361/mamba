@@ -172,7 +172,6 @@ class MoE(nn.Module):
         self.route_scale = route_scale
         self.ep_mesh = ep_mesh
         self.n_activated_experts = n_activated_experts
-        self._tok_count = 0
 
         self.ep_mesh_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
         self.n_local_experts = self.n_routed_experts // (self.ep_mesh_size)
