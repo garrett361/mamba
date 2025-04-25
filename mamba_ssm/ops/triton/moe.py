@@ -5,12 +5,12 @@ from torch.profiler import record_function
 
 
 def pad_sorted_idxs(
-    counts: torch.LongTensor,
+    counts: torch.IntTensor,
     n_toks: int,
     alignment: int,
     block_size: int = 128,
     max_blocks: int = 1024,
-) -> tuple[torch.IntTensor, torch.IntTensor]:
+) -> tuple[torch.IntTensor, torch.IntTensor, torch.IntTensor]:
     """
     Given the counts of tokens-per-expert, create the 1D index into a padded-out version of the
     tensor where each expert's index range fits into a block whose length is a multiple of
@@ -19,14 +19,10 @@ def pad_sorted_idxs(
     Example: if `x` is unpadded, then we fill `x_padded` by `x_padded[idxs] = x`.
 
     `idxs.shape = x.shape[:1]`
-
-    This removes various cudaStreamSynchronizes compared to a pure torch impl using
-    `repeat_interleave`. NOTE: @goon - though it doesn't end up having much e2e perf impact.
-
     """
     with record_function("triton::moe::pad_sorted_idxs"):
-        counts_aligned = ((counts + alignment - 1) // alignment) * alignment
-        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
+        sizes = ((counts + alignment - 1) // alignment) * alignment
+        offsets = sizes.cumsum(dim=0, dtype=torch.int32)
         counts_cumsum = counts.cumsum(dim=0, dtype=torch.int32)
         idxs = torch.arange(n_toks, dtype=torch.int32, device=counts.device)
 
@@ -37,12 +33,12 @@ def pad_sorted_idxs(
         _pad_sorted_idxs_kernel[grid](
             counts,
             counts_cumsum,
-            offs,
+            offsets,
             idxs,
             counts.numel(),
             BLOCK_SIZE=block_size,
         )
-        return idxs, offs
+        return idxs, sizes, offsets
 
 
 @triton.jit
@@ -76,21 +72,21 @@ def _pad_sorted_idxs_kernel(
 
 
 def pad_sorted_idxs_torch(
-    counts: torch.LongTensor,
+    counts: torch.IntTensor,
     n_toks: int,
     alignment: int,
-) -> tuple[torch.IntTensor, torch.IntTensor]:
+) -> tuple[torch.IntTensor, torch.IntTensor, torch.IntTensor]:
     """
     Reference impl.
     """
     with record_function("torch::moe::pad_sorted_idxs"):
         # Alignment requirements:
-        counts_aligned = ((counts + alignment - 1) // alignment) * alignment
-        offs = counts_aligned.cumsum(dim=0, dtype=torch.int32)
+        sizes = ((counts + alignment - 1) // alignment) * alignment
+        offsets = sizes.cumsum(dim=0, dtype=torch.int32)
         # Build the aligned index map
-        idxs_offs_align = (counts_aligned - counts).roll(1)
+        idxs_offs_align = (sizes - counts).roll(1)
         idxs_offs_align[0] = 0
         idxs_offs_align = idxs_offs_align.cumsum(dim=0)
-        idxs = torch.arange(n_toks, device=counts.device)
-        idxs = idxs + idxs_offs_align.repeat_interleave(counts)
-        return idxs, offs
+        idxs = torch.arange(n_toks, device=counts.device, dtype=torch.int32)
+        idxs = idxs + idxs_offs_align.repeat_interleave(counts, output_size=n_toks)
+        return idxs.to(torch.int32), sizes, offsets
