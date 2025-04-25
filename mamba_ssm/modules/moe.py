@@ -238,14 +238,14 @@ class MoE(nn.Module):
         return (z + self.shared_experts(x)).view(x_shape)
 
 
-def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.LongTensor:
+def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.IntTensor:
     """
     Turns the `indices` tensor into a sorted count of the number of tokens per expert.
     """
     with torch.no_grad():
         counts = indices.new_zeros((indices.shape[0], n_routed_experts))
         counts.scatter_(1, indices, 1)
-        counts = counts.sum(dim=0)
+        counts = counts.sum(dim=0, dtype=torch.int32)
     return counts
 
 
@@ -286,7 +286,9 @@ def _get_exp_outputs_grouped_mm(
     return y
 
 
-def _get_local_expert_idxs(tokens_per_expert_group: torch.Tensor, n_local_experts: int) -> torch.Tensor:
+def _get_local_expert_idxs(
+    tokens_per_expert_group: torch.Tensor, n_local_experts: int
+) -> torch.IntTensor:
     """
     Convert the routing information in tokens_per_expert_group to a tensor which maps token position
     to local expert idx.
@@ -295,6 +297,7 @@ def _get_local_expert_idxs(tokens_per_expert_group: torch.Tensor, n_local_expert
         torch.arange(
             tokens_per_expert_group.numel(),
             device=tokens_per_expert_group.device,
+            dtype=torch.int32,
         )
         % n_local_experts
     )
@@ -471,7 +474,7 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
 
         counts = _get_counts(indices, self.n_routed_experts)
 
-        idxs_align, offs = pad_sorted_idxs_torch(
+        idxs_align, _, offs = pad_sorted_idxs_torch(
             counts, indices.numel(), _GROUPED_MM_ALIGNMENT
         )
         # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
@@ -503,7 +506,7 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
         counts = _get_counts(indices, self.n_routed_experts)
 
         # Expand the tokens to an appropriately aligned tensor.
-        idxs_align, offs = pad_sorted_idxs(
+        idxs_align, _, offs = pad_sorted_idxs(
             counts, indices.numel(), _GROUPED_MM_ALIGNMENT
         )
         # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
@@ -547,7 +550,9 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
         x_send = torch.empty_like(x_recv)
 
         # Map from token position to local expert idx
-        local_expert_idxs = _get_local_expert_idxs(tokens_per_expert_group, self.n_local_experts)
+        local_expert_idxs = _get_local_expert_idxs(
+            tokens_per_expert_group, self.n_local_experts
+        )
 
         for exp_idx, (fc1_weight, fc2_weight) in enumerate(
             zip(self.fc1_weights, self.fc2_weights)
@@ -586,12 +591,14 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         )
 
         # Map from token position to local expert idx
-        local_expert_idxs = _get_local_expert_idxs(tokens_per_expert_group, self.n_local_experts)
+        local_expert_idxs = _get_local_expert_idxs(
+            tokens_per_expert_group, self.n_local_experts
+        )
 
         # Sort and pad to use grouped GEMM
         recv_sorted_indices = local_expert_idxs.argsort(dim=-1)
         x_recv_sorted = x_recv[recv_sorted_indices]
-        idxs_align, offs = pad_sorted_idxs(
+        idxs_align, _, offs = pad_sorted_idxs(
             tokens_per_expert_group.view(-1, self.n_local_experts).sum(dim=0),
             x_recv.shape[0],
             _GROUPED_MM_ALIGNMENT,

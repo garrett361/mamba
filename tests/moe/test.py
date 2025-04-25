@@ -279,7 +279,11 @@ def test_bincount_impl_equiv():
 
 
 class TestTitan(_TestBase):
-    def test_generate_permute_indices(self) -> None:
+    @pytest.mark.parametrize("num_ranks", [8, 64])
+    @pytest.mark.parametrize("experts_per_rank", [4, 8])
+    def test_generate_permute_indices(
+        self, num_ranks: int, experts_per_rank: int
+    ) -> None:
         """
         Working through understanding generate_permute_indices. The purpose of this function is that
         it takes the toks received from the all-to-all and makes them contiguous by local expert
@@ -310,41 +314,61 @@ class TestTitan(_TestBase):
 
         torch.manual_seed(42)
 
-        experts_per_rank = 2
-        num_ranks = 8
         # tokens_per_expert_group = torch.arange(
-        #     num_ranks * experts_per_rank, dtype=torch.int32, device="cuda"
+        #     num_ranks * experts_per_rank, dtype=torch.int32, device=self.device
         # )
-        tokens_per_expert_group = torch.arange(
-            1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device="cuda"
+        # tokens_per_expert_group = torch.arange(
+        #     1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device=self.device
+        # )
+        tokens_per_expert_group = torch.randint(
+            16,
+            size=(num_ranks * experts_per_rank,),
+            dtype=torch.int32,
+            device=self.device,
         )
-        # Here we know exactly how many elements are received, and hence the size of the tensor,
-        # which sets max_len. This can be unknown in other comms setups.
-        max_len = tokens_per_expert_group.sum().item()
+
+        # The tokens will be scattered into a tensor of size max_len which can accommodate them.
         alignment = 16
+        # Set max_len to twice the number of tokens. Should be big enough
+        max_len = 2 * tokens_per_expert_group.sum().item()
+
         permuted_indices_gpu, m_sizes, m_offsets = generate_permute_indices(
             tokens_per_expert_group,
             experts_per_rank,
             num_ranks,
-            max_len,
+            2 * max_len,
             alignment,
         )
 
         # permuted_indices_gpu should be equivalent to the below.
+
+        # 1) Get the tok-to-local-exp-idx map
         local_expert_idxs = _get_local_expert_idxs(
             tokens_per_expert_group, experts_per_rank
         )
-        local_expert_idxs_argsort = local_expert_idxs.argsort()
+        # 2) Sort
+        local_expert_idxs_argsort = local_expert_idxs.argsort().to(torch.int32)
+        # The non-filler indices of permuted_indices_gpu should match the sorted idxs already
+        non_filler_idxs = torch.where(permuted_indices_gpu != -1)[0]
         torch.testing.assert_close(
-            local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
+            local_expert_idxs_argsort, permuted_indices_gpu[non_filler_idxs]
         )
-        # And m_offsets is what we compute in pad_sorted_idxs
-        idxs_align, offs = pad_sorted_idxs(
-            tokens_per_expert_group.view(-1, experts_per_rank).sum(dim=0),
+
+        # 3) Build the full tensor by padding out to the alignment criteria.
+        idxs_align, sizes, offsets = pad_sorted_idxs_torch(
+            tokens_per_expert_group.view(-1, experts_per_rank).sum(
+                dim=0, dtype=torch.int32
+            ),
             tokens_per_expert_group.sum(),
             alignment,
         )
-        torch.testing.assert_close(offs, m_offsets)
+        permuted_indices_gpu_alt = torch.full_like(permuted_indices_gpu, -1)
+        permuted_indices_gpu_alt[idxs_align] = local_expert_idxs_argsort
+
+        # The non-filler values should match
+        torch.testing.assert_close(offsets, m_offsets)
+        torch.testing.assert_close(sizes, m_sizes)
+        torch.testing.assert_close(permuted_indices_gpu_alt, permuted_indices_gpu)
 
     def test_grouped_mm_equal(self) -> None:
         """
@@ -782,13 +806,16 @@ class TestTriton(_TestBase):
         counts = _get_counts(indices, n_routed_experts)
 
         # Torch impl:
-        idxs, offs = pad_sorted_idxs_torch(
+        idxs, sizes, offsets = pad_sorted_idxs_torch(
             counts, seqlen * n_activated_experts, _GROUPED_MM_ALIGNMENT
         )
 
         # Triton impl:
-        idxs_alt, offs_alt = pad_sorted_idxs(
+        idxs_alt, sizes_alt, offsets_alt = pad_sorted_idxs(
             counts, seqlen * n_activated_experts, _GROUPED_MM_ALIGNMENT
         )
-        torch.testing.assert_close(offs, offs_alt.to(offs))
-        torch.testing.assert_close(idxs, idxs_alt.to(idxs))
+        for t in (sizes, sizes_alt, offsets, offsets_alt, idxs, idxs_alt):
+            assert t.dtype == torch.int32
+        torch.testing.assert_close(sizes, sizes_alt)
+        torch.testing.assert_close(offsets, offsets_alt)
+        torch.testing.assert_close(idxs, idxs_alt)
