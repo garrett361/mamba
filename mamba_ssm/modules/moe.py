@@ -1,12 +1,12 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Literal, Optional
-from torch.profiler import ProfilerActivity, profile, record_function
 
 import torch
 import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.profiler import record_function
 
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
@@ -286,6 +286,24 @@ def _get_exp_outputs_grouped_mm(
     return y
 
 
+def _get_local_expert_idxs(tokens_per_expert_group: torch.Tensor, n_local_experts: int) -> torch.Tensor:
+    """
+    Convert the routing information in tokens_per_expert_group to a tensor which maps token position
+    to local expert idx.
+    """
+    local_expert_idxs = (
+        torch.arange(
+            tokens_per_expert_group.numel(),
+            device=tokens_per_expert_group.device,
+        )
+        % n_local_experts
+    )
+    # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
+    # the CUDA tensor tokens_per_expert_group to know the output shape
+    local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
+    return local_expert_idxs
+
+
 class _RoutedExperts(nn.Module, ABC):
     def __init__(
         self,
@@ -528,18 +546,8 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
         # Prepare outputs
         x_send = torch.empty_like(x_recv)
 
-        # Need to know which idxs in x_recv correspond to which local experts. Can derive from
-        # tokens_per_expert_group.
-        local_expert_idxs = (
-            torch.arange(
-                tokens_per_expert_group.numel(),
-                device=tokens_per_expert_group.device,
-            )
-            % self.n_local_experts
-        )
-        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
-        # the CUDA tensor tokens_per_expert_group to know the output shape
-        local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
+        # Map from token position to local expert idx
+        local_expert_idxs = _get_local_expert_idxs(tokens_per_expert_group, self.n_local_experts)
 
         for exp_idx, (fc1_weight, fc2_weight) in enumerate(
             zip(self.fc1_weights, self.fc2_weights)
@@ -577,18 +585,8 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
             self._get_ep_toks_and_routing_data(x_by_expert, indices)
         )
 
-        # Need to know which idxs in x_recv correspond to which local experts. Can derive from
-        # tokens_per_expert_group.
-        local_expert_idxs = (
-            torch.arange(
-                tokens_per_expert_group.numel(),
-                device=tokens_per_expert_group.device,
-            )
-            % self.n_local_experts
-        )
-        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
-        # the CUDA tensor tokens_per_expert_group to know the output shape
-        local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
+        # Map from token position to local expert idx
+        local_expert_idxs = _get_local_expert_idxs(tokens_per_expert_group, self.n_local_experts)
 
         # Sort and pad to use grouped GEMM
         recv_sorted_indices = local_expert_idxs.argsort(dim=-1)
