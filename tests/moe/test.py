@@ -318,8 +318,8 @@ class TestTitan(_TestBase):
         tokens_per_expert_group = torch.arange(
             1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device="cuda"
         )
-        # Here we know exactly how many elements are received, which sets max_len. This can be
-        # unknown in other comms frameworks.
+        # Here we know exactly how many elements are received, and hence the size of the tensor,
+        # which sets max_len. This can be unknown in other comms setups.
         max_len = tokens_per_expert_group.sum().item()
         alignment = 16
         permuted_indices_gpu, m_sizes, m_offsets = generate_permute_indices(
@@ -338,6 +338,13 @@ class TestTitan(_TestBase):
         torch.testing.assert_close(
             local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
         )
+        # And m_offsets is what we compute in pad_sorted_idxs
+        idxs_align, offs = pad_sorted_idxs(
+            tokens_per_expert_group.view(-1, experts_per_rank).sum(dim=0),
+            tokens_per_expert_group.sum(),
+            alignment,
+        )
+        torch.testing.assert_close(offs, m_offsets)
 
     def test_grouped_mm_equal(self) -> None:
         """
