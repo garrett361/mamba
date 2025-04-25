@@ -609,7 +609,7 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         x_recv_sorted[recv_sorted_indices] = z[idxs_align]
 
         # Send results back to original ranks (reversed send/recv count data)
-        print(f"{self.ep_mesh.get_local_rank()=}:\t{x_recv_sorted.shape=}\n\t{send_counts=}\n\t{sum(send_counts)=}\n\t{recv_counts=}\n\t{sum(recv_counts)=}")
+        # print(f"{self.ep_mesh.get_local_rank()=}:\t{x_recv_sorted.shape=}\n\t{send_counts=}\n\t{sum(send_counts)=}\n\t{recv_counts=}\n\t{sum(recv_counts)=}")
         with record_function("all2all::send1"):
             x_out = funcol.all_to_all_single_autograd(
                 x_recv_sorted, send_counts, recv_counts, group=self.ep_mesh
