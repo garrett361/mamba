@@ -19,6 +19,7 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPGroupedMMTriton,
     _get_counts,
     _get_exp_outputs_grouped_mm,
+    _get_local_expert_idxs,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
@@ -330,21 +331,12 @@ class TestTitan(_TestBase):
         )
 
         # permuted_indices_gpu should be equivalent to the below.
-        local_expert_idxs = (
-            torch.arange(
-                tokens_per_expert_group.numel(), device=tokens_per_expert_group.device
-            )
-            % experts_per_rank
+        local_expert_idxs = _get_local_expert_idxs(
+            tokens_per_expert_group, experts_per_rank
         )
-        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
-        # the CUDA tensor tokens_per_expert_group to know the output shape
-        local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
         local_expert_idxs_argsort = local_expert_idxs.argsort()
         torch.testing.assert_close(
-            local_expert_idxs_argsort.to(permuted_indices_gpu),
-            permuted_indices_gpu,
-            atol=self.tol,
-            rtol=self.tol,
+            local_expert_idxs_argsort.to(permuted_indices_gpu), permuted_indices_gpu
         )
 
     def test_grouped_mm_equal(self) -> None:
