@@ -19,17 +19,16 @@ def trace_handler(prof):
             header=f"{model.__class__.__name__}",
         )
     )
-    if args.trace_dir is not None:
-        trace_dir = Path(args.trace_dir)
-        trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir = Path(args.trace_dir)
+    trace_dir.mkdir(parents=True, exist_ok=True)
 
-        import json
+    import json
 
-        with open(trace_dir.joinpath(f"args_{impl}.json"), "w") as fp:
-            json.dump(vars(args), fp)
-        prof.export_chrome_trace(
-            str(trace_dir.joinpath(f"trace_{impl}_step_{prof.step_num}.json"))
-        )
+    with open(trace_dir.joinpath(f"args_{impl}.json"), "w") as fp:
+        json.dump(vars(args), fp)
+    prof.export_chrome_trace(
+        str(trace_dir.joinpath(f"trace_{impl}_step_{prof.step_num}.json"))
+    )
 
 
 if __name__ == "__main__":
@@ -45,7 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--active", type=int, default=2)
-    parser.add_argument("--trace_dir", default="prof/experts_one_gpu")
+    parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/one_gpu")
     parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES))
     parser.add_argument("--no_bwd", action="store_true")
 
@@ -92,6 +91,8 @@ if __name__ == "__main__":
         with profile(
             activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
             # record_shapes=True,
+            # with_stack=True,
+            # profile_memory=True,
             schedule=torch.profiler.schedule(
                 wait=args.wait,
                 warmup=args.warmup,
@@ -108,3 +109,4 @@ if __name__ == "__main__":
                         out.pow(2).sum().backward()
                     model.zero_grad()
                 prof.step()
+        del model
