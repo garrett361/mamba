@@ -3,100 +3,20 @@ from argparse import ArgumentParser
 from datetime import timedelta
 
 import torch
-import torch.nn as nn
-from timing_utils import CUDATimer
+from timing_utils import (
+    CUDATimer,
+    SequentialProfileModule,
+    get_ep_mesh,
+    shard_sequential_model,
+)
 from torch import distributed as dist
 from torch.distributed import init_device_mesh
-from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.profiler import record_function
 
 from mamba_ssm.modules.moe import EP_EXPERT_CLASSES, MoE
-
-
-def get_ep_mesh(ep_degree: int, world_size: int) -> DeviceMesh:
-    # Cases:
-    # 1. ep_degree = 1: full replication, no ep_mesh
-    # 2. ep_degree = world_size: ep_mesh is the world
-    # 3. world_size > ep_degree > world_size: 2D mesh, experts distributed along slice .
-    if ep_degree == 1:
-        ep_mesh = None
-    elif ep_degree == world_size:
-        ep_mesh = init_device_mesh(
-            "cuda",
-            (world_size,),
-            mesh_dim_names=("inner",),
-        )
-    else:
-        ep_mesh = init_device_mesh(
-            "cuda",
-            (world_size // ep_degree, ep_degree),
-            mesh_dim_names=("outer", "inner"),
-        )
-    return ep_mesh
-
-
-def shard_model(
-    model: nn.Module,
-    ep_degree: int,
-    world_size: int,
-    ep_mesh: DeviceMesh,
-    mp_policy: MixedPrecisionPolicy,
-) -> None:
-    for moe in model.layers:
-        # Cases:
-        # 1. ep_degree = 1: full replication, fully shard with the fsdp_mesh
-        # 2. ep_degree = world_size: no expert replication at all. Ignore experts in fully_shard
-        # 3. world_size > ep_degree > world_size: world_size // ep_degree expert replicas. Need
-        #    to individually wrap experts using the ep_mesh because ModuleDict doesn't have a
-        #    forward method.
-
-        # The ignored_params arg requires torch nightly (> 2.6.0)
-        ignored_params = set()
-        if ep_degree == 1:
-            pass
-        elif ep_degree == world_size:
-            # No replication in this case.
-            ignored_params.add(moe.experts.parameters())
-        else:
-            # Don't reshard due to comms costs
-            assert ep_mesh is not None
-            fully_shard(
-                moe.experts,
-                mesh=ep_mesh["outer"],
-                mp_policy=mp_policy,
-                reshard_after_forward=False,
-            )
-            moe.experts.set_reshard_after_backward(False)
-        fully_shard(
-            moe,
-            mesh=fsdp_mesh,
-            ignored_params=ignored_params,
-            mp_policy=mp_policy,
-            reshard_after_forward=True,
-        )
-    # The root unit doesn't own any params, so manually force the first layer to not shard after
-    # bwd
-    model.layers[0].set_reshard_after_backward(False)
-    fully_shard(model, mesh=fsdp_mesh, mp_policy=mp_policy)
-
-
-class SequentialModuleWithForward(nn.Module):
-    def __init__(self, modules_list) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList(modules_list)
-
-    def forward(self, inputs):
-        outputs = inputs
-        for idx, module in enumerate(self.layers):
-            with record_function(f"fwd_{idx}"):
-                outputs = module(outputs)
-        return outputs
-
 
 if __name__ == "__main__":
     # torchrun specific
@@ -139,6 +59,7 @@ if __name__ == "__main__":
     cache = torch.empty(int(cache_size_bytes // 4), dtype=torch.int, device="cuda")
 
     iters_per_impl = args.warmups + args.reps
+    torch.manual_seed(42 + rank)
     inputs = torch.randn(
         iters_per_impl, args.bsz * args.seqlen, args.in_features, **factory_kwargs
     )
@@ -164,7 +85,7 @@ if __name__ == "__main__":
         for ep_degree in ep_degrees:
             ep_mesh = get_ep_mesh(ep_degree, world_size)
             for impl in impls:
-                model = SequentialModuleWithForward(
+                model = SequentialProfileModule(
                     [
                         MoE(
                             in_features=args.in_features,
@@ -190,7 +111,15 @@ if __name__ == "__main__":
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
                 )
-                shard_model(model, ep_degree, world_size, ep_mesh, mp_policy)
+                shard_sequential_model(
+                    seq_model=model,
+                    ep_degree=ep_degree,
+                    world_size=world_size,
+                    ep_mesh=ep_mesh,
+                    fsdp_mesh=fsdp_mesh,
+                    mp_policy=mp_policy,
+                )
+
                 idx = 0
                 for _ in range(args.warmups):
                     out = model(inputs[idx])
@@ -215,6 +144,7 @@ if __name__ == "__main__":
                         f"{impl_name}: {time_s=:.2e}, {time_std_s=:.2e}, {time_std_s/time_s=:.2e}"
                     )
                     results[impl_name] = time_s
+                del model
 
     finally:
         if not rank:

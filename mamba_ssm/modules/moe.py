@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Literal, Optional
+from torch.profiler import ProfilerActivity, profile, record_function
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -396,9 +397,10 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
         counts = _get_counts(indices, self.n_routed_experts)
         assert self.ep_mesh is not None  # mypy
-        tokens_per_expert_group = funcol.all_to_all_single(
-            counts, None, None, group=self.ep_mesh
-        )
+        with record_function("all2all::tok_per_exp_grp"):
+            tokens_per_expert_group = funcol.all_to_all_single(
+                counts, None, None, group=self.ep_mesh
+            )
 
         # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
         # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
@@ -416,9 +418,10 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         import torch.distributed as dist
 
         dist.barrier()
-        x_recv = funcol.all_to_all_single_autograd(
-            x_by_expert, recv_counts, send_counts, group=self.ep_mesh
-        )
+        with record_function("all2all::send0"):
+            x_recv = funcol.all_to_all_single_autograd(
+                x_by_expert, recv_counts, send_counts, group=self.ep_mesh
+            )
         return x_recv, send_counts, recv_counts, tokens_per_expert_group
 
 
@@ -549,9 +552,10 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
             )
 
         # Send results back to original ranks (reversed send/recv count data)
-        x_out = funcol.all_to_all_single_autograd(
-            x_send, send_counts, recv_counts, group=self.ep_mesh
-        )
+        with record_function("all2all::send1"):
+            x_out = funcol.all_to_all_single_autograd(
+                x_send, send_counts, recv_counts, group=self.ep_mesh
+            )
 
         # Save an allocation: store the unsorted results back in x_by_expert.
         x_by_expert[flat_sorted_indices] = x_out
@@ -605,9 +609,10 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         x_recv_sorted[recv_sorted_indices] = z[idxs_align]
 
         # Send results back to original ranks (reversed send/recv count data)
-        x_out = funcol.all_to_all_single_autograd(
-            x_recv_sorted, send_counts, recv_counts, group=self.ep_mesh
-        )
+        with record_function("all2all::send1"):
+            x_out = funcol.all_to_all_single_autograd(
+                x_recv_sorted, send_counts, recv_counts, group=self.ep_mesh
+            )
 
         # Save an allocation: store the unsorted results back in x_by_expert.
         x_by_expert[flat_sorted_indices] = x_out
