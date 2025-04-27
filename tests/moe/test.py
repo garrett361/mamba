@@ -314,21 +314,15 @@ class TestTitan(_TestBase):
 
         torch.manual_seed(42)
 
-        # tokens_per_expert_group = torch.arange(
-        #     num_ranks * experts_per_rank, dtype=torch.int32, device=self.device
-        # )
-        # tokens_per_expert_group = torch.arange(
-        #     1, num_ranks * experts_per_rank + 1, dtype=torch.int32, device=self.device
-        # )
+        alignment = 16
         tokens_per_expert_group = torch.randint(
-            16,
+            4 * alignment,
             size=(num_ranks * experts_per_rank,),
             dtype=torch.int32,
             device=self.device,
         )
 
         # The tokens will be scattered into a tensor of size max_len which can accommodate them.
-        alignment = 16
         # Set max_len to twice the number of tokens. Should be big enough
         max_len = 2 * tokens_per_expert_group.sum().item()
 
