@@ -14,7 +14,6 @@ from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
     RoutedExpertsNoEPForLoop,
-    RoutedExpertsTorchEPForLoop,
     RoutedExpertsTorchEPGroupedMM,
     _RoutedExperts,
 )
@@ -132,7 +131,7 @@ class _TestBase(DTest):
 
     @property
     def n_routed_experts(self) -> int:
-        return 2 * self.n_activated_experts * self.world_size
+        return 4 * self.n_activated_experts * self.world_size
 
     @property
     def batch_size(self) -> int:
@@ -166,22 +165,25 @@ class _TestBase(DTest):
     def factory_kwargs(self) -> dict[str, Any]:
         return {"device": self.device, "dtype": self.dtype}
 
-    def get_inputs(self) -> torch.Tensor:
+    def get_inputs(self, seed: int = 42) -> torch.Tensor:
+        torch.manual_seed(seed)
         return torch.randn(
             self.batch_size, self.seqlen, self.in_features, **self.factory_kwargs
         )
 
-    def get_input_toks(self) -> torch.Tensor:
+    def get_input_toks(self, seed: int = 42) -> torch.Tensor:
+        torch.manual_seed(seed)
         return torch.randint(
             self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
         )
 
     def get_inputs_weights_indices(
-        self,
+        self, seed: int = 42
     ) -> tuple[torch.Tensor, torch.Tensor, torch.LongTensor]:
         """
         Returns the flattened inputs, weights, and indices used by routed experts.
         """
+        torch.manual_seed(seed)
         inputs = torch.randn(
             self.batch_size * self.seqlen, self.in_features, **self.factory_kwargs
         )
@@ -226,7 +228,7 @@ class TestRoutedExperts(_TestBase):
         # Set weights equal
         _copy_params_routed_experts(model, model_ep)
 
-        inputs, weights, indices = self.get_inputs_weights_indices()
+        inputs, weights, indices = self.get_inputs_weights_indices(seed=42 + self.rank)
         outputs = model(inputs, weights, indices)
         outputs_ep = model_ep(inputs, weights, indices)
 
