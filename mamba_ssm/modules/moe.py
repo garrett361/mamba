@@ -269,19 +269,19 @@ def _get_exp_outputs_grouped_mm(
     x: torch.Tensor,
     fc1_weights: torch.Tensor,
     fc2_weights: torch.Tensor,
-    offs: torch.IntTensor,
+    offsets: torch.IntTensor,
     activation: Callable[[torch.Tensor], torch.Tensor],
 ):
     """
     Compute the outputs from all experts using torch._grouped_mm
     """
     y = torch._grouped_mm(
-        x, fc1_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
+        x, fc1_weights.transpose(-2, -1), offs=offsets, out_dtype=x.dtype
     )
     y, gate = y.chunk(2, dim=-1)
     y = y * activation(gate)
     y = torch._grouped_mm(
-        y, fc2_weights.transpose(-2, -1), offs=offs, out_dtype=x.dtype
+        y, fc2_weights.transpose(-2, -1), offs=offsets, out_dtype=x.dtype
     )
     return y
 
@@ -474,15 +474,15 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
 
         counts = _get_counts(indices, self.n_routed_experts)
 
-        idxs_align, _, offs = pad_sorted_idxs_torch(
+        idxs_align, _, offsets = pad_sorted_idxs_torch(
             counts, indices.numel(), _GROUPED_MM_ALIGNMENT
         )
-        # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
         # sized, empirically tuned to be large enough to handle the routed tokens.
-        z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offs, self.activation
+            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
         )
 
         # Remove the alignment and return the tokens to their original ordering
@@ -506,12 +506,12 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
         counts = _get_counts(indices, self.n_routed_experts)
 
         # Expand the tokens to an appropriately aligned tensor.
-        idxs_align, _, offs = pad_sorted_idxs(
+        idxs_align, _, offsets = pad_sorted_idxs(
             counts, indices.numel(), _GROUPED_MM_ALIGNMENT
         )
-        # NOTE: @goon - offs[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
         # sized, empirically tuned to be large enough to handle the routed tokens.
-        z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         # z = torch.empty(
         #     ((int(1.5 * indices.numel()) + 31) // 32) * 32,
         #     x.shape[-1],
@@ -521,7 +521,7 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
 
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offs, self.activation
+            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
         )
 
         # Remove the alignment and return the tokens to their original ordering
@@ -598,15 +598,70 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         # Sort and pad to use grouped GEMM
         recv_sorted_indices = local_expert_idxs.argsort(dim=-1)
         x_recv_sorted = x_recv[recv_sorted_indices]
-        idxs_align, _, offs = pad_sorted_idxs(
+        idxs_align, _, offsets = pad_sorted_idxs(
             tokens_per_expert_group.view(-1, self.n_local_experts).sum(dim=0),
             x_recv.shape[0],
             _GROUPED_MM_ALIGNMENT,
         )
-        z = torch.empty(offs[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         z[idxs_align] = x_recv_sorted
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offs, self.activation
+            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+        )
+        # Remove the alignment and return the tokens to their original ordering. Re-use
+        # x_recv_sorted and avoid a new allocation.
+        x_recv_sorted[recv_sorted_indices] = z[idxs_align]
+
+        # Send results back to original ranks (reversed send/recv count data)
+        # print(f"{self.ep_mesh.get_local_rank()=}:\t{x_recv_sorted.shape=}\n\t{send_counts=}\n\t{sum(send_counts)=}\n\t{recv_counts=}\n\t{sum(recv_counts)=}")
+        with record_function("all2all::send1"):
+            x_out = funcol.all_to_all_single_autograd(
+                x_recv_sorted, send_counts, recv_counts, group=self.ep_mesh
+            )
+
+        # Save an allocation: store the unsorted results back in x_by_expert.
+        x_by_expert[flat_sorted_indices] = x_out
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
+
+
+class RoutedExpertsTorchEPGroupedMMTriton(_RoutedExpertsTorchEP):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        from torchtitan.experiments.kernels.moe.indices import generate_permute_indices  # noqa
+
+        self._gen_perm_idx_fn = generate_permute_indices
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        # Sort tokens by the expert they are indexed to.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
+
+        x_recv, send_counts, recv_counts, tokens_per_expert_group = (
+            self._get_ep_toks_and_routing_data(x_by_expert, indices)
+        )
+
+        # NOTE: @goon - using max_len = tokens_per_expert_group.sum().item() induces a CUDA sync.
+        n_recv_toks = tokens_per_expert_group.sum().item()
+        recv_sorted_indices, _, offsets = self._gen_perm_idx_fn(
+            tokens_per_expert_group,
+            self.n_local_experts,
+            self.ep_mesh.size(),
+            n_recv_toks,
+            _GROUPED_MM_ALIGNMENT,
+        )
+
+        # Tokens sorted by experts with padding:
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        z[recv_sorted_indices] = x_recv
+
+        z = _get_exp_outputs_grouped_mm(
+            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
         )
         # Remove the alignment and return the tokens to their original ordering. Re-use
         # x_recv_sorted and avoid a new allocation.
@@ -684,4 +739,5 @@ NON_EP_EXPERT_CLASSES = {
 EP_EXPERT_CLASSES = {
     "torch": RoutedExpertsTorchEPForLoop,
     "torch_gemm": RoutedExpertsTorchEPGroupedMM,
+    # "torch_gemm_triton": RoutedExpertsTorchEPGroupedMMTriton,
 }
