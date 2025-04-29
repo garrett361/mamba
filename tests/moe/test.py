@@ -515,6 +515,76 @@ class TestTitan(_TestBase):
         except AssertionError as e:
             raise RuntimeError(f"Grad check failed for {exp_idx=} weights") from e
 
+    def test_grouped_mm_zero_toks(self) -> None:
+        """
+        Test the case where an expert gets zero tokens
+        """
+        torch.manual_seed(42)
+        # Matmul dims all need to be divisible by 16 (everything but n_groups)
+        n_experts = 4
+        d_model = 16
+        d_out = 4 * d_model
+        bsz = 2
+        seqlen = 8 * n_experts
+        n_toks = bsz * seqlen
+
+        toks = torch.randn(
+            n_toks, d_model, device=self.device, dtype=self.dtype, requires_grad=True
+        )
+        weight = torch.randn(
+            n_experts,
+            d_out,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        # exp_idx=1 gets zero tokens, while exp_idx=2 gets double its share.
+        offs = torch.tensor(
+            [
+                n_toks // n_experts,
+                n_toks // n_experts,
+                3 * n_toks // n_experts,
+                4 * n_toks // n_experts,
+            ],
+            device=self.device,
+            dtype=torch.int32,
+        )
+
+        out = torch._grouped_mm(
+            toks, weight.transpose(-2, -1), offs=offs, out_dtype=torch.bfloat16
+        )
+        assert out.shape == torch.Size([n_toks, d_out])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        weight_copy = deepcopy(weight)
+        out_alt_list = []
+        for tok_chunk, exp_weight in zip(
+            toks_copy.chunk(n_experts),
+            (weight_copy[0], weight_copy[2], weight_copy[2], weight_copy[3]),
+        ):
+            out_alt_list.append(tok_chunk @ exp_weight.t())
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(
+            out,
+            out_alt,
+            atol=self.tol,
+            rtol=self.tol,
+        )
+
+        # Backwards. Currently hanging on bwd.
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        out_alt.backward(grad)
+        #
+        # torch.testing.assert_close(
+        #     weight.grad, weight_copy.grad, atol=self.tol, rtol=self.tol
+        # )
+        # torch.testing.assert_close(
+        #     toks.grad, toks_copy.grad, atol=self.tol, rtol=self.tol
+        # )
+
     def test_titan_gemm_equal(self) -> None:
         """
         torchtitan GEMM
