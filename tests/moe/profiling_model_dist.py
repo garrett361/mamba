@@ -92,15 +92,17 @@ if __name__ == "__main__":
         parser.add_argument("--wait", type=int, default=3)
         parser.add_argument("--warmup", type=int, default=3)
         parser.add_argument("--all_ranks", action="store_true")
-        # Just use some tiny vocab size for testing
-        parser.add_argument("--vocab_size", type=int, default=4096)
+        parser.add_argument("--vocab_size", type=int, default=128256)
+        parser.add_argument("--attn_layer_rate", type=int, default=4)
 
         args = parser.parse_args()
         if rank == 0:
             print(f"--> running with these configs {args}")
 
         ssm_cfg = {"layer": "Mamba2"}
-        attn_layer_idx = [args.n_layer - 1]
+        attn_layer_idx = list(
+            range(args.attn_layer_rate, args.n_layer, args.attn_layer_rate)
+        )
         attn_cfg = {
             "causal": True,
             "d_conv": 0,
