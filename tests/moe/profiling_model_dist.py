@@ -192,6 +192,9 @@ if __name__ == "__main__":
                     fsdp_mesh=fsdp_mesh,
                     mp_policy=mp_policy,
                 )
+
+                if not rank:
+                    print(f"{model=}")
                 # Assumption: no tied params
                 with profile(
                     activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
