@@ -1,7 +1,7 @@
 import json
 import os
 from argparse import ArgumentParser
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import torch
@@ -38,8 +38,9 @@ def trace_handler(prof):
         )
     )
     trace_dir = Path(args.trace_dir)
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
     subdir = trace_dir.joinpath(
-        f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/"
+        f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/{timestamp}/"
     )
     subdir.mkdir(parents=True, exist_ok=True)
     filename = f"trace_{impl}_step_{prof.step_num}_rank_{rank}_bsz_{args.bsz}_seq_{args.seqlen}"
@@ -47,7 +48,7 @@ def trace_handler(prof):
         filename += "_act_ckpt"
     filename += ".json"
 
-    prof.export_chrome_trace(str(subdir.joinpath(filename)))
+    prof.export_chrome_trace(str(subdir.joinpath(f"{filename}")))
     if not rank:
         with open(subdir.joinpath(f"args_{impl}.json"), "w") as fp:
             json.dump(vars(args), fp)

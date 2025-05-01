@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -20,14 +21,18 @@ def trace_handler(prof):
         )
     )
     trace_dir = Path(args.trace_dir)
-    trace_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
+    subdir = trace_dir.joinpath(
+        f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/{timestamp}/"
+    )
+    subdir.mkdir(parents=True, exist_ok=True)
 
     import json
 
-    with open(trace_dir.joinpath(f"args_{impl}.json"), "w") as fp:
+    with open(subdir.joinpath(f"args_{impl}.json"), "w") as fp:
         json.dump(vars(args), fp)
     prof.export_chrome_trace(
-        str(trace_dir.joinpath(f"trace_{impl}_step_{prof.step_num}.json"))
+        str(subdir.joinpath(f"trace_{impl}_step_{prof.step_num}.json"))
     )
 
 

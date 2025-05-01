@@ -1,7 +1,7 @@
 import json
 import os
 from argparse import ArgumentParser
-from datetime import timedelta
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -40,8 +40,9 @@ def trace_handler(prof):
         )
     )
     trace_dir = Path(args.trace_dir)
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
     subdir = trace_dir.joinpath(
-        f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/"
+        f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/{timestamp}/"
     )
     subdir.mkdir(parents=True, exist_ok=True)
 
