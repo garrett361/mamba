@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+from torch.profiler import record_function
 import torch.nn as nn
 
 from mamba_ssm.models.config_mamba import MambaConfig
@@ -220,10 +221,12 @@ class MixerModel(nn.Module):
         hidden_states = self.embedding(input_ids)
         residual = None
         for layer_idx in sorted(self.layers):
-            layer = self.layers[layer_idx]
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
-            )
+            # TODO: @goon - remove record_function
+            with record_function(f"{layer_idx=}"):
+                layer = self.layers[layer_idx]
+                hidden_states, residual = layer(
+                    hidden_states, residual, inference_params=inference_params, **mixer_kwargs
+                )
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
