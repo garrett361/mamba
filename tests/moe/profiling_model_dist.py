@@ -42,10 +42,12 @@ def trace_handler(prof):
         f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/"
     )
     subdir.mkdir(parents=True, exist_ok=True)
+    filename = f"trace_{impl}_step_{prof.step_num}_rank_{rank}_bsz_{args.bsz}_seq_{args.seqlen}"
+    if args.act_ckpt:
+        filename += "_act_ckpt"
+    filename += ".json"
 
-    prof.export_chrome_trace(
-        str(subdir.joinpath(f"trace_{impl}_step_{prof.step_num}_rank_{rank}.json"))
-    )
+    prof.export_chrome_trace(str(subdir.joinpath(filename)))
     if not rank:
         with open(subdir.joinpath(f"args_{impl}.json"), "w") as fp:
             json.dump(vars(args), fp)
