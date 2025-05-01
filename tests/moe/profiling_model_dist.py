@@ -83,7 +83,7 @@ if __name__ == "__main__":
         parser.add_argument("--impls", type=str, default=",".join(EP_EXPERT_CLASSES))
         parser.add_argument("--in_features", type=int, default=3072)
         parser.add_argument("--n_activated_experts", type=int, default=8)
-        parser.add_argument("--n_layer", type=int, default=2)
+        parser.add_argument("--n_layer", type=int, default=4)
         parser.add_argument("--n_routed_experts", type=int, default=64)
         parser.add_argument("--n_shared_experts", type=int, default=0)
         parser.add_argument("--no_bwd", action="store_true")
@@ -191,7 +191,6 @@ if __name__ == "__main__":
                     ep_mesh=ep_mesh,
                     fsdp_mesh=fsdp_mesh,
                     mp_policy=mp_policy,
-                    rank=rank,
                 )
                 # Assumption: no tied params
                 with profile(
