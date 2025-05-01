@@ -103,7 +103,7 @@ if __name__ == "__main__":
 
         ssm_cfg = {"layer": "Mamba2"}
         attn_layer_idx = list(
-            range(args.attn_layer_rate, args.n_layer, args.attn_layer_rate)
+            range(args.attn_layer_rate - 1, args.n_layer, args.attn_layer_rate)
         )
         attn_cfg = {
             "causal": True,
