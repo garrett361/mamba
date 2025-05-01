@@ -1,4 +1,3 @@
-from typing import Optional
 import torch
 import torch.nn as nn
 from torch.distributed import init_device_mesh
@@ -6,6 +5,7 @@ from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.profiler import record_function
+
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import MoE
 
@@ -135,6 +135,7 @@ def shard_sequential_model(
     seq_model.layers[0].set_reshard_after_backward(False)
     fully_shard(seq_model, mesh=fsdp_mesh, mp_policy=mp_policy)
 
+
 def shard_full_model(
     model: MambaLMHeadModel,
     ep_degree: int,
@@ -142,12 +143,9 @@ def shard_full_model(
     ep_mesh: DeviceMesh,
     fsdp_mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy,
-    rank: Optional[int]=None
 ) -> None:
     fully_shard(model.lm_head, mesh=fsdp_mesh, mp_policy=mp_policy)
-    fully_shard(
-        model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy
-    )
+    fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     # NOTE: @goon - model.backbone.layers is a module_dict on the MoE branch
     for idx, block in model.backbone.layers.items():
         # Cases:
@@ -159,18 +157,12 @@ def shard_full_model(
         ignored_params = set()
         if isinstance(block.mlp, MoE):
             if ep_degree == 1:
-                if not rank:
-                    print("Not sharding MoE block")
                 pass
             elif ep_degree == world_size:
                 # No replication in this case.
-                if not rank:
-                    print(f"Ignoring params for {block.mlp.experts=}")
                 ignored_params.add(block.mlp.experts.parameters())
             else:
                 # Don't reshard due to comms costs
-                if not rank:
-                    print(f"Wrapping {block.mlp.experts=}")
                 fully_shard(
                     block.mlp.experts,
                     mesh=ep_mesh["outer"],
