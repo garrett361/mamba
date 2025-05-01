@@ -141,9 +141,8 @@ if __name__ == "__main__":
         # Different inputs on different ranks for even tok distribution
         torch.manual_seed(42 + rank)
         iters_per_impl = args.repeat * (args.active + args.wait + args.warmup)
-        dtype = torch.bfloat16
         device = "cuda"
-        factory_kwargs = {"dtype": dtype, "device": device}
+        factory_kwargs = {"device": device}
         inputs = torch.randint(
             args.vocab_size,
             size=(iters_per_impl, args.bsz, args.seqlen),
@@ -172,8 +171,6 @@ if __name__ == "__main__":
                     ep_mesh=None if ep_mesh is None else ep_mesh["inner"],
                     **factory_kwargs,
                 )
-                # Hack for uniform dtype:
-                model.to(dtype)
 
                 if args.act_ckpt:
                     # Just ckpt mixer layers
