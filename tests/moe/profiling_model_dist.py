@@ -174,11 +174,12 @@ if __name__ == "__main__":
                 model.to(dtype)
 
                 if args.act_ckpt:
+                    # Just ckpt mixer layers
                     if not rank:
                         print("Applying activation checkpointing")
-                    for layer_idx, moe in enumerate(model.backbone.layers):
-                        model[layer_idx] = checkpoint_wrapper(
-                            moe, preserve_rng_state=False
+                    for layer_idx, block in model.backbone.layers.items():
+                        model.backbone.layers[layer_idx].mixer = checkpoint_wrapper(
+                            block.mixer, preserve_rng_state=False
                         )
 
                 mp_policy = MixedPrecisionPolicy(
