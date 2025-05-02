@@ -435,9 +435,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         self._tok_count += sum(recv_counts)  # testing
 
         # Receive toks from other workers
-        import torch.distributed as dist
 
-        dist.barrier()
         with record_function("all2all::send0"):
             x_recv = funcol.all_to_all_single_autograd(
                 x_by_expert, recv_counts, send_counts, group=self.ep_mesh
