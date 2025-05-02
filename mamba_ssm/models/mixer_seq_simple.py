@@ -451,3 +451,13 @@ def fully_shard_moe(
         reversed_blocks = list(reversed(blocks))
         for b_prev, b_next in zip(reversed_blocks[:-1], reversed_blocks[1:]):
             b_prev.set_modules_to_backward_prefetch([b_next])
+
+
+def init_meta_moe(model: MambaLMHeadModel):
+    # Move to cuda and initialize.
+    model.to_empty(device=torch.cuda.current_device())
+
+    # TODO: proper normalization; just normal init for now
+    for p in model.parameters():
+        nn.init.normal_(p)
+    nn.init.normal_(model.backbone.embedding.weight, std=0.02)

@@ -17,7 +17,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, fully_shard_moe
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, fully_shard_moe, init_meta_moe
 from mamba_ssm.modules.moe import EP_EXPERT_CLASSES
 
 
@@ -103,6 +103,7 @@ if __name__ == "__main__":
         parser.add_argument("--all_ranks", action="store_true")
         parser.add_argument("--vocab_size", type=int, default=128256)
         parser.add_argument("--attn_layer_rate", type=int, default=4)
+        parser.add_argument("--low_cpu_fsdp", action="store_true")
 
         args = parser.parse_args()
         if rank == 0:
@@ -173,11 +174,21 @@ if __name__ == "__main__":
                 )
                 if not rank:
                     print(f"{cfg=}")
-                model = MambaLMHeadModel(
-                    config=cfg,
-                    ep_mesh=None if ep_mesh is None else ep_mesh["inner"],
-                    **factory_kwargs,
-                )
+
+                if args.low_cpu_fsdp:
+                    if rank == 0:
+                        print("Building model on meta device...")
+                    with torch.device("meta"):
+                        model = MambaLMHeadModel(
+                            cfg,
+                            ep_mesh=None if ep_mesh is None else ep_mesh["inner"],
+                        )
+                else:
+                    model = MambaLMHeadModel(
+                        config=cfg,
+                        ep_mesh=None if ep_mesh is None else ep_mesh["inner"],
+                        **factory_kwargs,
+                    )
 
                 if args.act_ckpt:
                     # Just ckpt mixer layers
@@ -199,6 +210,12 @@ if __name__ == "__main__":
                     ep_mesh=ep_mesh,
                     mp_policy=mp_policy,
                 )
+
+
+                if args.low_cpu_fsdp:
+                    if rank == 0:
+                        print("Moving meta model to CUDA...")
+                    init_meta_moe(model)
 
                 if not rank:
                     print(f"{model=}")
