@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from timing_utils import get_ep_mesh
 from torch import distributed as dist
 from torch.distributed import init_device_mesh
@@ -219,7 +220,9 @@ if __name__ == "__main__":
                         with record_function("fwd"):
                             out = model(inputs[idx])
                         with record_function("bwd"):
-                            out.logits.pow(2).sum().backward()
+                            F.cross_entropy(
+                                out.logits.view(-1, out.size(-1)), inputs[idx].view(-1).long()
+                            ).backward()
                         model.zero_grad()
                         prof.step()
                 del model
