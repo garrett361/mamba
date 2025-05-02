@@ -1,5 +1,5 @@
-from argparse import ArgumentParser
 import subprocess
+from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
 
@@ -23,9 +23,7 @@ def trace_handler(prof):
     )
     trace_dir = Path(args.trace_dir)
     timestamp = datetime.now().strftime("%y%m%d_%H%M")
-    subdir = trace_dir.joinpath(
-        f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/{timestamp}/"
-    )
+    subdir = trace_dir.joinpath(f"one_gpu/{timestamp}/")
     subdir.mkdir(parents=True, exist_ok=True)
 
     import json
@@ -55,7 +53,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--active", type=int, default=2)
-    parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/one_gpu")
+    parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/experts")
     parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES))
     parser.add_argument("--no_bwd", action="store_true")
 
