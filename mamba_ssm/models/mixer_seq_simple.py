@@ -114,7 +114,7 @@ def _init_weights(
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
-    #TODO: @goon - MoE weights.
+    # TODO: @goon - MoE weights.
     if isinstance(module, nn.Linear):
         if module.bias is not None:
             if not getattr(module.bias, "_no_reinit", False):
@@ -208,13 +208,17 @@ class MixerModel(nn.Module):
                 _init_weights,
                 n_layer=n_layer,
                 **(initializer_cfg if initializer_cfg is not None else {}),
-                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+                n_residuals_per_layer=1
+                if d_intermediate == 0
+                else 2,  # 2 if we have MLP
             )
         )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+            i: layer.allocate_inference_cache(
+                batch_size, max_seqlen, dtype=dtype, **kwargs
+            )
             for i, layer in self.layers.items()
         }
 
@@ -226,10 +230,15 @@ class MixerModel(nn.Module):
             with record_function(f"{layer_idx=}"):
                 layer = self.layers[layer_idx]
                 hidden_states, residual = layer(
-                    hidden_states, residual, inference_params=inference_params, **mixer_kwargs
+                    hidden_states,
+                    residual,
+                    inference_params=inference_params,
+                    **mixer_kwargs,
                 )
         if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
+            residual = (
+                (hidden_states + residual) if residual is not None else hidden_states
+            )
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             # Set prenorm=False here since we don't need the residual
@@ -241,18 +250,17 @@ class MixerModel(nn.Module):
                 residual=residual,
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
-                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+                is_rms_norm=isinstance(self.norm_f, RMSNorm),
             )
         return hidden_states
 
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
-
     def __init__(
         self,
         config: MambaConfig,
         initializer_cfg=None,
-        ep_mesh: Optional[DeviceMesh]=None,
+        ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
     ) -> None:
@@ -274,7 +282,9 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
 
         super().__init__()
         if vocab_size % pad_vocab_size_multiple != 0:
-            vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
+            vocab_size += pad_vocab_size_multiple - (
+                vocab_size % pad_vocab_size_multiple
+            )
         self.backbone = MixerModel(
             d_model=d_model,
             n_layer=n_layer,
@@ -309,14 +319,25 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             self.lm_head.weight = self.backbone.embedding.weight
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+        return self.backbone.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype, **kwargs
+        )
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        inference_params=None,
+        num_last_tokens=0,
+        **mixer_kwargs,
+    ):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
+        hidden_states = self.backbone(
+            input_ids, inference_params=inference_params, **mixer_kwargs
+        )
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
@@ -328,7 +349,9 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config_data = load_config_hf(pretrained_model_name)
         config = MambaConfig(**config_data)
         model = cls(config, device=device, dtype=dtype, **kwargs)
-        model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
+        model.load_state_dict(
+            load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype)
+        )
         return model
 
     def save_pretrained(self, save_directory):
@@ -340,12 +363,12 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         os.makedirs(save_directory, exist_ok=True)
 
         # Save the model's state_dict
-        model_path = os.path.join(save_directory, 'pytorch_model.bin')
+        model_path = os.path.join(save_directory, "pytorch_model.bin")
         torch.save(self.state_dict(), model_path)
 
         # Save the configuration of the model
-        config_path = os.path.join(save_directory, 'config.json')
-        with open(config_path, 'w') as f:
+        config_path = os.path.join(save_directory, "config.json")
+        with open(config_path, "w") as f:
             json.dump(self.config.__dict__, f, indent=4)
 
     def _get_tok_counts(self) -> int:
@@ -356,7 +379,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         for mod in self.modules():
             if isinstance(mod, MoE) and hasattr(mod.experts, "_tok_count"):
                 tok_count += mod.experts._tok_count
-                mod.experts._tok_count=0
+                mod.experts._tok_count = 0
         return tok_count
 
 
@@ -365,15 +388,20 @@ def fully_shard_moe(
     ep_degree: int,
     world_size: int,
     fsdp_mesh: DeviceMesh,
-    ep_mesh: Optional[DeviceMesh]=None,
-    mp_policy: Optional[MixedPrecisionPolicy]=None,
+    ep_mesh: Optional[DeviceMesh] = None,
+    mp_policy: Optional[MixedPrecisionPolicy] = None,
+    reshard_lm_head_after_fwd: bool = False,
     explicit_fwd_prefetch: bool = True,
     explicit_bwd_prefetch: bool = True,
 ) -> None:
     assert fsdp_mesh.ndim == 1
-    fully_shard(model.lm_head, mesh=fsdp_mesh, mp_policy=mp_policy)
+    fully_shard(
+        model.lm_head,
+        mesh=fsdp_mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=reshard_lm_head_after_fwd,
+    )
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
-    # NOTE: @goon - model.backbone.layers is a module_dict on the MoE branch
     for idx, block in model.backbone.layers.items():
         # Cases:
         # 1. ep_degree = 1: full replication, fully shard with the fsdp_mesh
