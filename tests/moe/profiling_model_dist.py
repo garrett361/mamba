@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import torch
-from timing_utils import get_ep_mesh, shard_full_model
+from timing_utils import get_ep_mesh
 from torch import distributed as dist
 from torch.distributed import init_device_mesh
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -17,7 +17,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.modules.moe import EP_EXPERT_CLASSES
+from mamba_ssm.modules.moe import EP_EXPERT_CLASSES, fully_shard_moe
 
 
 def trace_handler(prof):
@@ -190,7 +190,7 @@ if __name__ == "__main__":
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
                 )
-                shard_full_model(
+                fully_shard_moe(
                     model=model,
                     ep_degree=ep_degree,
                     world_size=world_size,
