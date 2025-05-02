@@ -392,7 +392,7 @@ def fully_shard_moe(
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     reshard_lm_head_after_fwd: bool = False,
     explicit_fwd_prefetch: bool = True,
-    explicit_bwd_prefetch: bool = True,
+    explicit_bwd_prefetch: bool = False,
 ) -> None:
     assert fsdp_mesh.ndim == 1
     fully_shard(
