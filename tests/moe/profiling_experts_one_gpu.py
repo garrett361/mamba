@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,11 @@ def trace_handler(prof):
 
     with open(subdir.joinpath(f"args_{impl}.json"), "w") as fp:
         json.dump(vars(args), fp)
+    short_hash = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    with open(subdir.joinpath(short_hash), "w") as _:
+        pass
     prof.export_chrome_trace(
         str(subdir.joinpath(f"trace_{impl}_step_{prof.step_num}.json"))
     )

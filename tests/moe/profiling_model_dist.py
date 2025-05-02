@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from argparse import ArgumentParser
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,7 @@ def trace_handler(prof):
     )
     trace_dir = Path(args.trace_dir)
     timestamp = datetime.now().strftime("%y%m%d_%H%M")
+
     subdir = trace_dir.joinpath(
         f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/{timestamp}/"
     )
@@ -52,6 +54,11 @@ def trace_handler(prof):
     if not rank:
         with open(subdir.joinpath(f"args_{impl}.json"), "w") as fp:
             json.dump(vars(args), fp)
+        short_hash = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        with open(subdir.joinpath(short_hash), "w") as _:
+            pass
 
 
 if __name__ == "__main__":
