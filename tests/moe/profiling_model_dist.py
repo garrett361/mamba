@@ -84,6 +84,7 @@ if __name__ == "__main__":
         )
         parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/model")
         parser.add_argument("--act_ckpt", action="store_true")
+        parser.add_argument("--act_ckpt_entire_blocks", action="store_true")
         parser.add_argument("--active", type=int, default=2)
         parser.add_argument("--bsz", type=int, default=2)
         parser.add_argument("--d_intermediate", type=int, default=1344)
@@ -201,7 +202,7 @@ if __name__ == "__main__":
                     # Just ckpt mixer layers
                     if not rank:
                         print("Applying activation checkpointing")
-                    act_ckpt_moe(model)
+                    act_ckpt_moe(model, mixer_only=args.act_ckpt_entire_blocks)
 
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16

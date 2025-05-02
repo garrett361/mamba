@@ -456,14 +456,19 @@ def fully_shard_moe(
             b_prev.set_modules_to_backward_prefetch([b_next])
 
 
-def act_ckpt_moe(model: MambaLMHeadModel):
+def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
     """
-    Only wrap the mixers to avoid repeating costly all-to-alls.
+    By default, only wraps the mixers to avoid repeating costly all-to-alls.
     """
     for layer_idx, block in model.backbone.layers.items():
-        model.backbone.layers[layer_idx].mixer = checkpoint_wrapper(
-            block.mixer, preserve_rng_state=False
-        )
+        if mixer_only:
+            model.backbone.layers[layer_idx].mixer = checkpoint_wrapper(
+                block.mixer, preserve_rng_state=False
+            )
+        else:
+            model.backbone.layers[layer_idx] = checkpoint_wrapper(
+                block, preserve_rng_state=False
+            )
 
 
 def init_meta_moe(model: MambaLMHeadModel):
