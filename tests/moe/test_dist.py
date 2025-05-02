@@ -1,7 +1,9 @@
+from copy import deepcopy
 from typing import Any
 
 import pytest
 import torch
+import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
@@ -15,6 +17,7 @@ from mamba_ssm.modules.moe import (
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPGroupedMM,
+    _get_counts,
     _RoutedExperts,
 )
 
@@ -323,8 +326,8 @@ class TestMoEEP(_TestBase):
             moe_impl=moe_impl,
             **self.factory_kwargs,
         )
-        model = MoE(**model_kwargs)
-        model_ep = MoE(**model_kwargs, ep_mesh=ep_mesh)
+        model = MoE(**model_kwargs).to(self.dtype)
+        model_ep = MoE(**model_kwargs, ep_mesh=ep_mesh).to(self.dtype)
 
         # Force models equal
         _copy_params(model, model_ep)
@@ -363,16 +366,21 @@ class TestMoEEP(_TestBase):
 class TestModelEP(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_fwd(self) -> None:
+    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
+    def test_fwd(self, moe_impl: str) -> None:
+        # Some classes have dtype constraints:
+        if "gemm" in moe_impl:
+            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
         )
         model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
-        model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh)
+        moe_cfg = deepcopy(self.cfg)
+        moe_cfg.moe_cfg["moe_impl"] = moe_impl
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh)
 
         # Verify EP
-        print(f"{model_ep=}")
         for m, m_ep in zip(model.modules(), model_ep.modules()):
             if isinstance(m, MoE):
                 assert (
@@ -392,13 +400,21 @@ class TestModelEP(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_bwd(self) -> None:
+    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
+    def test_bwd(self, moe_impl: str) -> None:
+        # Some classes have dtype constraints:
+        if "gemm" in moe_impl:
+            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
         )
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
-        model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh)
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        moe_cfg = deepcopy(self.cfg)
+        moe_cfg.moe_cfg["moe_impl"] = moe_impl
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
+            self.dtype
+        )
 
         # Force models equal
         _copy_params(model, model_ep)
@@ -437,3 +453,85 @@ class TestModelEP(_TestBase):
                     assert isinstance(p, DTensor)
         except Exception as e:
             raise RuntimeError(f"Failed on {n=}, {p=}") from e
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
+    def test_fwd_compile(self, moe_impl: str) -> None:
+        # Some classes have dtype constraints:
+        if "gemm" in moe_impl:
+            self.dtype = torch.bfloat16
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
+        moe_cfg = deepcopy(self.cfg)
+        moe_cfg.moe_cfg["moe_impl"] = moe_impl
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh)
+
+        # Verify EP
+        for m, m_ep in zip(model.modules(), model_ep.modules()):
+            if isinstance(m, MoE):
+                assert (
+                    m_ep.experts.n_local_experts
+                    == m.experts.n_local_experts // self.world_size
+                )
+
+        # Force models equal
+        _copy_params(model, model_ep)
+
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+        model_ep = torch.compile(model_ep)
+        outputs_ep = model_ep(inputs)
+
+        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+
+
+def compile_breaking_fn(
+    x: torch.Tensor,
+    indices: torch.LongTensor,
+    ep_mesh,
+    n_routed_experts,
+    n_local_experts: int = 8,
+) -> torch.Tensor:
+    # Sort tokens by the expert they are indexed to.
+    flat_sorted_indices = indices.flatten().argsort(dim=-1)
+    n_activated_experts = indices.shape[-1]
+    x_by_expert = x[flat_sorted_indices // n_activated_experts]
+
+    counts = _get_counts(indices, n_routed_experts)
+    assert ep_mesh is not None  # mypy
+    tokens_per_expert_group = funcol.all_to_all_single(
+        counts, None, None, group=ep_mesh
+    )
+
+    # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
+    # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
+    send_counts = counts.reshape(ep_mesh.size(), n_local_experts).sum(dim=1).tolist()
+    recv_counts = (
+        tokens_per_expert_group.reshape(ep_mesh.size(), n_local_experts)
+        .sum(dim=1)
+        .tolist()
+    )
+
+    # Receive toks from other workers
+    x_recv = funcol.all_to_all_single_autograd(
+        x_by_expert, recv_counts, send_counts, group=ep_mesh
+    )
+    return x_recv
+
+
+class TestCompileBreaking(_TestBase):
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_fwd(self) -> None:
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        fn_compiled = torch.compile(compile_breaking_fn)
+        for seed in range(3):
+            inputs, _, indices = self.get_inputs_weights_indices(seed=seed)
+            fn_compiled(inputs, indices, ep_mesh, self.n_routed_experts)
