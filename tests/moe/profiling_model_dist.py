@@ -175,6 +175,11 @@ if __name__ == "__main__":
                 if not rank:
                     print(f"{cfg=}")
 
+                # Model building order:
+                # 1. Create model, maybe on meta device.
+                # 2. Activation checkpointing, if applicable
+                # 3. fully_shard
+                # 4. init weights, if meta device was used
                 if args.low_cpu_fsdp:
                     if rank == 0:
                         print("Building model on meta device...")
