@@ -364,12 +364,13 @@ def fully_shard_moe(
     model: MambaLMHeadModel,
     ep_degree: int,
     world_size: int,
-    ep_mesh: DeviceMesh,
     fsdp_mesh: DeviceMesh,
-    mp_policy: MixedPrecisionPolicy,
+    ep_mesh: Optional[DeviceMesh]=None,
+    mp_policy: Optional[MixedPrecisionPolicy]=None,
     explicit_fwd_prefetch: bool = True,
     explicit_bwd_prefetch: bool = True,
 ) -> None:
+    assert fsdp_mesh.ndim == 1
     fully_shard(model.lm_head, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     # NOTE: @goon - model.backbone.layers is a module_dict on the MoE branch
@@ -389,9 +390,10 @@ def fully_shard_moe(
                 ignored_params.add(block.mlp.experts.parameters())
             else:
                 # Don't reshard due to comms costs
+                outer_ep_mesh_dim = ep_mesh.mesh_dim_names[0]
                 fully_shard(
                     block.mlp.experts,
-                    mesh=ep_mesh["outer"],
+                    mesh=ep_mesh[outer_ep_mesh_dim],
                     mp_policy=mp_policy,
                     reshard_after_forward=False,
                 )
