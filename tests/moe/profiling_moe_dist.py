@@ -98,6 +98,7 @@ if __name__ == "__main__":
         parser.add_argument("--wait", type=int, default=3)
         parser.add_argument("--warmup", type=int, default=3)
         parser.add_argument("--all_ranks", action="store_true")
+        parser.add_argument("--compile", action="store_true")
 
         args = parser.parse_args()
         if rank == 0:
@@ -155,6 +156,8 @@ if __name__ == "__main__":
                         model[layer_idx] = checkpoint_wrapper(
                             moe, preserve_rng_state=False
                         )
+                if args.compile:
+                    model = torch.compile(model)
 
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
