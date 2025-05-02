@@ -10,14 +10,16 @@ import torch.nn.functional as F
 from timing_utils import get_ep_mesh
 from torch import distributed as dist
 from torch.distributed import init_device_mesh
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-)
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, fully_shard_moe, init_meta_moe
+from mamba_ssm.models.mixer_seq_simple import (
+    MambaLMHeadModel,
+    act_ckpt_moe,
+    fully_shard_moe,
+    init_meta_moe,
+)
 from mamba_ssm.modules.moe import EP_EXPERT_CLASSES
 
 
@@ -199,10 +201,7 @@ if __name__ == "__main__":
                     # Just ckpt mixer layers
                     if not rank:
                         print("Applying activation checkpointing")
-                    for layer_idx, block in model.backbone.layers.items():
-                        model.backbone.layers[layer_idx].mixer = checkpoint_wrapper(
-                            block.mixer, preserve_rng_state=False
-                        )
+                    act_ckpt_moe(model)
 
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
@@ -215,7 +214,6 @@ if __name__ == "__main__":
                     ep_mesh=ep_mesh,
                     mp_policy=mp_policy,
                 )
-
 
                 if args.low_cpu_fsdp:
                     if rank == 0:
