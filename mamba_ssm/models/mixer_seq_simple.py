@@ -392,7 +392,7 @@ def fully_shard_moe(
     world_size: int,
     fsdp_mesh: DeviceMesh,
     ep_mesh: Optional[DeviceMesh] = None,
-    mp_policy: Optional[MixedPrecisionPolicy] = None,
+    mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     reshard_lm_head_after_fwd: bool = False,
     explicit_fwd_prefetch: bool = True,
     explicit_bwd_prefetch: bool = False,
