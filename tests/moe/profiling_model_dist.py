@@ -79,9 +79,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--sharding_strategy", choices=["fsdp", "hsdp"], default="fsdp"
         )
-        parser.add_argument(
-            "--trace_dir", default="/gpfs/goon/prof/mamba/multi_gpu/model"
-        )
+        parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/model")
         parser.add_argument("--act_ckpt", action="store_true")
         parser.add_argument("--active", type=int, default=2)
         parser.add_argument("--bsz", type=int, default=2)
