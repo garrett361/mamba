@@ -125,11 +125,6 @@ class _TestBase(DTest):
     tol = 1e-2
 
     @property
-    def factory_kwargs(self) -> int:
-        # Make this a property so that we can change dtype for certain tests.
-        return {"device": self.device, "dtype": self.dtype}
-
-    @property
     def n_routed_experts(self) -> int:
         return 4 * self.n_activated_experts * self.world_size
 
@@ -138,7 +133,7 @@ class _TestBase(DTest):
         return self.world_size
 
     @property
-    def moe_cfg(self) -> int:
+    def moe_cfg(self) -> dict[str, int]:
         return {
             "n_routed_experts": self.n_routed_experts,
             "n_activated_experts": 1,
@@ -147,7 +142,7 @@ class _TestBase(DTest):
         }
 
     @property
-    def cfg(self) -> int:
+    def cfg(self) -> MambaConfig:
         return MambaConfig(
             d_model=self.in_features,
             d_intermediate=self.d_intermediate,
