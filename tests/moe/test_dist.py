@@ -511,11 +511,10 @@ def compile_breaking_fn(
     # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
     # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
     send_counts = counts.reshape(ep_mesh.size(), n_local_experts).sum(dim=1).tolist()
-    recv_counts = (
-        tokens_per_expert_group.reshape(ep_mesh.size(), n_local_experts)
-        .sum(dim=1)
-        .tolist()
+    recv_counts = tokens_per_expert_group.reshape(ep_mesh.size(), n_local_experts).sum(
+        dim=1
     )
+    recv_counts = [int(x) for x in recv_counts]
 
     # Receive toks from other workers
     x_recv = funcol.all_to_all_single_autograd(
