@@ -195,8 +195,8 @@ if __name__ == "__main__":
                     model=model,
                     ep_degree=ep_degree,
                     world_size=world_size,
-                    ep_mesh=ep_mesh,
                     fsdp_mesh=fsdp_mesh,
+                    ep_mesh=ep_mesh,
                     mp_policy=mp_policy,
                 )
 
