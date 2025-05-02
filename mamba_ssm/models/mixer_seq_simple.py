@@ -11,6 +11,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+)
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.profiler import record_function
@@ -451,6 +454,16 @@ def fully_shard_moe(
         reversed_blocks = list(reversed(blocks))
         for b_prev, b_next in zip(reversed_blocks[:-1], reversed_blocks[1:]):
             b_prev.set_modules_to_backward_prefetch([b_next])
+
+
+def act_ckpt_moe(model: MambaLMHeadModel):
+    """
+    Only wrap the mixers to avoid repeating costly all-to-alls.
+    """
+    for layer_idx, block in model.backbone.layers.items():
+        model.backbone.layers[layer_idx].mixer = checkpoint_wrapper(
+            block.mixer, preserve_rng_state=False
+        )
 
 
 def init_meta_moe(model: MambaLMHeadModel):
