@@ -16,8 +16,8 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.modules.moe import EP_EXPERT_CLASSES, fully_shard_moe
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, fully_shard_moe
+from mamba_ssm.modules.moe import EP_EXPERT_CLASSES
 
 
 def trace_handler(prof):
