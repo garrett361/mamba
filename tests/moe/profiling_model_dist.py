@@ -221,7 +221,8 @@ if __name__ == "__main__":
                             out = model(inputs[idx])
                         with record_function("bwd"):
                             F.cross_entropy(
-                                out.logits.view(-1, out.size(-1)), inputs[idx].view(-1).long()
+                                out.logits.view(-1, out.logits.size(-1)),
+                                inputs[idx].view(-1).long(),
                             ).backward()
                         model.zero_grad()
                         prof.step()
