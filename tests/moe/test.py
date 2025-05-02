@@ -254,6 +254,23 @@ class TestMoEModel(_TestBase):
         outputs = model(inputs).logits
         assert outputs.shape == inputs.shape + torch.Size([self.vocab_size])
 
+    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
+    def test_fwd_compile(self, moe_impl) -> None:
+        torch.manual_seed(42)
+        cfg = deepcopy(self.cfg)
+        cfg.moe_cfg["moe_impl"] = moe_impl
+        model = MambaLMHeadModel(cfg, **self.factory_kwargs)
+        model = torch.compile(model)
+        for layer_idx in sorted(model.backbone.layers):
+            mlp = model.backbone.layers[layer_idx].mlp
+            if int(layer_idx) in self.moe_layer_idx:
+                assert isinstance(mlp, MoE)
+            else:
+                assert isinstance(mlp, GatedMLP)
+        inputs = self.get_input_toks()
+        outputs = model(inputs).logits
+        assert outputs.shape == inputs.shape + torch.Size([self.vocab_size])
+
 
 def test_bincount_impl_equiv():
     """
