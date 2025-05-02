@@ -144,6 +144,7 @@ def shard_full_model(
     fsdp_mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy,
     explicit_fwd_prefetch: bool = True,
+    explicit_bwd_prefetch: bool = True,
 ) -> None:
     fully_shard(model.lm_head, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
@@ -188,5 +189,11 @@ def shard_full_model(
     if explicit_fwd_prefetch:
         blocks = list(model.backbone.layers.values())
         blocks.append(model.lm_head)
-        for b_prev, b_next in zip(blocks[:-1] , blocks[1:]):
+        for b_prev, b_next in zip(blocks[:-1], blocks[1:]):
             b_prev.set_modules_to_forward_prefetch([b_next])
+
+    if explicit_bwd_prefetch:
+        blocks = [model.lm_head, *model.backbone.layers.values()]
+        reversed_blocks = list(reversed(blocks))
+        for b_prev, b_next in zip(reversed_blocks[:-1], reversed_blocks[1:]):
+            b_prev.set_modules_to_backward_prefetch([b_next])
