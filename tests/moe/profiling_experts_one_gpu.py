@@ -56,6 +56,7 @@ if __name__ == "__main__":
     parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/experts")
     parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES))
     parser.add_argument("--no_bwd", action="store_true")
+    parser.add_argument("--compile", action="store_true")
 
     args = parser.parse_args()
 
@@ -96,6 +97,8 @@ if __name__ == "__main__":
             n_routed_experts=args.n_routed_experts,
             **factory_kwargs,
         )
+        if args.compile:
+            model = torch.compile(model)
 
         with profile(
             activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],

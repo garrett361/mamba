@@ -107,6 +107,7 @@ if __name__ == "__main__":
         parser.add_argument("--vocab_size", type=int, default=128256)
         parser.add_argument("--attn_layer_rate", type=int, default=4)
         parser.add_argument("--low_cpu_fsdp", action="store_true")
+        parser.add_argument("--compile", action="store_true")
 
         args = parser.parse_args()
         if rank == 0:
@@ -181,8 +182,9 @@ if __name__ == "__main__":
                 # Model building order:
                 # 1. Create model, maybe on meta device.
                 # 2. Activation checkpointing, if applicable
-                # 3. fully_shard
-                # 4. init weights, if meta device was used
+                # 3. Compile, if applicable
+                # 4. fully_shard
+                # 5. init weights, if meta device was used
                 if args.low_cpu_fsdp:
                     if rank == 0:
                         print("Building model on meta device...")
@@ -203,6 +205,9 @@ if __name__ == "__main__":
                     if not rank:
                         print("Applying activation checkpointing")
                     act_ckpt_moe(model, mixer_only=args.act_ckpt_entire_blocks)
+
+                if args.compile:
+                    model = torch.compile(model)
 
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
