@@ -48,7 +48,7 @@ def trace_handler(prof):
         f"world_{world_size}_ep_{ep_degree}_{args.sharding_strategy}/{timestamp}/"
     )
     subdir.mkdir(parents=True, exist_ok=True)
-    filename = f"trace_{impl}_step_{prof.step_num}_rank_{rank}_bsz_{args.bsz}_seq_{args.seqlen}"
+    filename = f"trace_{impl}_step_{prof.step_num}_rank_{rank}_bsz_{args.bsz}_seq_{args.seqlen}_layers_{args.n_layer}_exps_{args.n_routed_experts}_active_{args.n_activated_experts}"
     if args.act_ckpt:
         filename += "_act_ckpt"
     filename += ".json"
