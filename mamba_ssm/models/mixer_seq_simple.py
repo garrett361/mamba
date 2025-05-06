@@ -396,15 +396,16 @@ def fully_shard_moe(
     reshard_lm_head_after_fwd: bool = False,
     explicit_fwd_prefetch: bool = True,
     explicit_bwd_prefetch: bool = False,
+    no_reshard: bool = False,
 ) -> None:
     assert fsdp_mesh.ndim == 1
+    fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(
         model.lm_head,
         mesh=fsdp_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_lm_head_after_fwd,
     )
-    fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     for idx, block in model.backbone.layers.items():
         # Cases:
         # 1. ep_degree = 1: full replication, fully shard with the fsdp_mesh
@@ -454,6 +455,13 @@ def fully_shard_moe(
         reversed_blocks = list(reversed(blocks))
         for b_prev, b_next in zip(reversed_blocks[:-1], reversed_blocks[1:]):
             b_prev.set_modules_to_backward_prefetch([b_next])
+
+    if no_reshard:
+        model.lm_head.set_reshard_after_backward(False)
+        model.backbone.embedding.set_reshard_after_backward(False)
+        for block in model.backbone.layers.values():
+            block.set_reshard_after_backward(False)
+        model.set_reshard_after_backward(False)
 
 
 def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
