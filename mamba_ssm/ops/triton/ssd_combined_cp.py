@@ -23,10 +23,13 @@ from packaging import version
 from mamba_ssm.ops.triton.ssd_combined import (
     _bmm_chunk_bwd,
     _bmm_chunk_fwd,
+    _chunk_cumsum_bwd,
     _chunk_cumsum_fwd,
     _chunk_scan_bwd_dC,
     _chunk_scan_bwd_dcb,
+    _chunk_scan_bwd_ddAcs_stable,
     _chunk_scan_bwd_dstates,
+    _chunk_scan_bwd_dz,
     _chunk_scan_chunk_state_bwd_dx,
     _chunk_scan_fwd,
     _chunk_state_bwd_db,
@@ -34,9 +37,6 @@ from mamba_ssm.ops.triton.ssd_combined import (
     _state_passing_bwd,
     _state_passing_fwd,
     chunk_state_varlen,
-    _chunk_cumsum_bwd,
-    _chunk_scan_bwd_dz,
-    _chunk_scan_bwd_ddAcs_stable,
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -628,6 +628,22 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 #### Start CP Impls ####
 
 
+# Drop-in replacement (up to the tag and group_dst args) for dist.{send,recv}, but using dist.isend,
+# as dist.send can (apparently) yield NCCL errors in multi-nodes settings for some cluster setups.
+def send(tensor, dst=None, group=None) -> None:
+    for op in dist.batch_isend_irecv(
+        [dist.P2POp(dist.isend, tensor, dist.get_global_rank(group, dst), group)]
+    ):
+        op.wait()
+
+
+def recv(tensor, src=None, group=None) -> None:
+    for op in dist.batch_isend_irecv(
+        [dist.P2POp(dist.irecv, tensor, dist.get_global_rank(group, src), group)]
+    ):
+        op.wait()
+
+
 class StatePassingSerialCP(_StatePassingImpl):
     """
     TODO: @goon - seq_idx probably not being treated correctly
@@ -667,14 +683,14 @@ class StatePassingSerialCP(_StatePassingImpl):
                     out_dtype=out_dtype,
                 )
 
-                dist.send(
+                send(
                     final_states.contiguous(),
                     dst=dist.get_global_rank(group, recv_rank),
                     group=group,
                 )
             elif local_rank == recv_rank:
                 recv_init_states = torch.empty_like(states[:, 0])
-                dist.recv(
+                recv(
                     recv_init_states,
                     src=dist.get_global_rank(group, send_rank),
                     group=group,
@@ -746,7 +762,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                         cp_mesh=cp_mesh,
                     )
                 )
-                dist.send(
+                send(
                     send_dinitial_states.contiguous(),
                     dst=dist.get_global_rank(group, recv_rank),
                     group=group,
@@ -755,7 +771,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 recv_dfinal_states = torch.empty(
                     *states[:, 0].shape, dtype=dstates_dtype, device=states.device
                 )
-                dist.recv(
+                recv(
                     recv_dfinal_states,
                     src=dist.get_global_rank(group, send_rank),
                     group=group,
