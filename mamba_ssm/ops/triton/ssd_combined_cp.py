@@ -15,10 +15,12 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional, Type
 
 import torch
+from torch.profiler import record_function
 import torch.distributed as dist
 import triton
 from einops import rearrange
 from packaging import version
+from torch.profiler import record_function
 
 from mamba_ssm.ops.triton.ssd_combined import (
     _bmm_chunk_bwd,
@@ -322,70 +324,82 @@ def _mamba_chunk_scan_combined_fwd_template(
     dt_limit=(0.0, float("inf")),
     cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
-    batch, seqlen, nheads, headdim = x.shape
-    _, _, ngroups, dstate = B.shape
-    assert nheads % ngroups == 0
-    assert B.shape == (batch, seqlen, ngroups, dstate)
-    assert x.shape == (batch, seqlen, nheads, headdim)
-    assert dt.shape == (batch, seqlen, nheads)
-    assert A.shape == (nheads,)
-    assert C.shape == B.shape
-    if z is not None:
-        assert z.shape == x.shape
-    if D is not None:
-        assert D.shape == (nheads, headdim) or D.shape == (nheads,)
-    if seq_idx is not None:
-        assert seq_idx.shape == (batch, seqlen)
-    if B.stride(-1) != 1:
-        B = B.contiguous()
-    if C.stride(-1) != 1:
-        C = C.contiguous()
-    if (
-        x.stride(-1) != 1 and x.stride(1) != 1
-    ):  # Either M or K dimension should be contiguous
-        x = x.contiguous()
-    if (
-        z is not None and z.stride(-1) != 1 and z.stride(1) != 1
-    ):  # Either M or K dimension should be contiguous
-        z = z.contiguous()
-    if D is not None and D.stride(-1) != 1:
-        D = D.contiguous()
-    if initial_states is not None:
+    with record_function("pre_state_passing_impl_fwd"):
+        batch, seqlen, nheads, headdim = x.shape
+        _, _, ngroups, dstate = B.shape
+        assert nheads % ngroups == 0
+        assert B.shape == (batch, seqlen, ngroups, dstate)
+        assert x.shape == (batch, seqlen, nheads, headdim)
+        assert dt.shape == (batch, seqlen, nheads)
+        assert A.shape == (nheads,)
+        assert C.shape == B.shape
+        if z is not None:
+            assert z.shape == x.shape
+        if D is not None:
+            assert D.shape == (nheads, headdim) or D.shape == (nheads,)
+        if seq_idx is not None:
+            assert seq_idx.shape == (batch, seqlen)
+        if B.stride(-1) != 1:
+            B = B.contiguous()
+        if C.stride(-1) != 1:
+            C = C.contiguous()
+        if (
+            x.stride(-1) != 1 and x.stride(1) != 1
+        ):  # Either M or K dimension should be contiguous
+            x = x.contiguous()
+        if (
+            z is not None and z.stride(-1) != 1 and z.stride(1) != 1
+        ):  # Either M or K dimension should be contiguous
+            z = z.contiguous()
+        if D is not None and D.stride(-1) != 1:
+            D = D.contiguous()
+        if initial_states is not None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
-    dA_cumsum, dt = _chunk_cumsum_fwd(
-        dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
-    )
-    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-
-    states, final_states, _ = state_passing_impl.fwd(
-        chunk_size=chunk_size,
-        states=states,
-        dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
-        initial_states=initial_states,
-        seq_idx=seq_idx,
-        out_dtype=C.dtype,
-        cp_mesh=cp_mesh,
-    )
-
-    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    out, out_x = _chunk_scan_fwd(
-        CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx
-    )
-    if cu_seqlens is None:
-        return out, out_x, dt, dA_cumsum, states, final_states
-    else:
-        assert batch == 1, (
-            "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+        dA_cumsum, dt = _chunk_cumsum_fwd(
+            dt,
+            A,
+            chunk_size,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
         )
-        varlen_states = chunk_state_varlen(
-            B.squeeze(0),
-            x.squeeze(0),
-            dt.squeeze(0),
-            dA_cumsum.squeeze(0),
-            cu_seqlens,
-            states.squeeze(0),
+        states = _chunk_state_fwd(
+            B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True
         )
-        return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+
+    with record_function("state_passing_impl_fwd"):
+        states, final_states, _ = state_passing_impl.fwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            out_dtype=C.dtype,
+            cp_mesh=cp_mesh,
+        )
+
+    with record_function("post_state_passing_impl_fwd"):
+        CB = _bmm_chunk_fwd(
+            C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32
+        )
+        out, out_x = _chunk_scan_fwd(
+            CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx
+        )
+        if cu_seqlens is None:
+            return out, out_x, dt, dA_cumsum, states, final_states
+        else:
+            assert batch == 1, (
+                "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
+            )
+            varlen_states = chunk_state_varlen(
+                B.squeeze(0),
+                x.squeeze(0),
+                dt.squeeze(0),
+                dA_cumsum.squeeze(0),
+                cu_seqlens,
+                states.squeeze(0),
+            )
+            return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
 
 
 def _mamba_chunk_scan_combined_bwd_template(
@@ -414,144 +428,153 @@ def _mamba_chunk_scan_combined_bwd_template(
     recompute_output=False,
     cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
-    if dout.stride(-1) != 1:
-        dout = dout.contiguous()
-    batch, seqlen, nheads, headdim = x.shape
-    _, _, ngroups, dstate = B.shape
-    assert dout.shape == (batch, seqlen, nheads, headdim)
-    assert dt.shape == (batch, seqlen, nheads)
-    assert A.shape == (nheads,)
-    assert nheads % ngroups == 0
-    assert B.shape == (batch, seqlen, ngroups, dstate)
-    assert C.shape == B.shape
-    assert out.shape == x.shape
-    if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
-    if seq_idx is not None:
-        assert seq_idx.shape == (batch, seqlen)
-    if dx is not None:
-        assert dx.shape == x.shape
-    if dB is not None:
-        assert dB.shape == B.shape
-        dB_given = dB
-    else:
-        dB_given = torch.empty_like(B)
-    if dC is not None:
-        assert dC.shape == C.shape
-        dC_given = dC
-    else:
-        dC_given = torch.empty_like(C)
-    if dz is not None:
-        assert z is not None
-        assert dz.shape == z.shape
-    if ddt is not None:
-        assert ddt.shape == dt.shape
-        ddt_given = ddt
-    else:
-        ddt_given = torch.empty_like(dt)
-    # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
-    # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
-    dt_in = dt.clone()
-    dA_cumsum, dt = _chunk_cumsum_fwd(
-        dt_in,
-        A,
-        chunk_size,
-        dt_bias=dt_bias,
-        dt_softplus=dt_softplus,
-        dt_limit=dt_limit,
-    )
-    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
-    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
-
-    states, _, bwd_args = state_passing_impl.fwd(
-        chunk_size=chunk_size,
-        states=states,
-        dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
-        initial_states=initial_states,
-        seq_idx=seq_idx,
-        out_dtype=None,
-        cp_mesh=cp_mesh,
-    )
-
-    if z is not None:
-        dz, dout, dD, *rest = _chunk_scan_bwd_dz(
-            x,
-            z,
-            out,
-            dout,
-            chunk_size=chunk_size,
-            has_ddAcs=False,
-            D=D,
-            dz=dz,
-            recompute_output=recompute_output,
+    with record_function("pre_state_passing_impl_fwd"):
+        if dout.stride(-1) != 1:
+            dout = dout.contiguous()
+        batch, seqlen, nheads, headdim = x.shape
+        _, _, ngroups, dstate = B.shape
+        assert dout.shape == (batch, seqlen, nheads, headdim)
+        assert dt.shape == (batch, seqlen, nheads)
+        assert A.shape == (nheads,)
+        assert nheads % ngroups == 0
+        assert B.shape == (batch, seqlen, ngroups, dstate)
+        assert C.shape == B.shape
+        assert out.shape == x.shape
+        if initial_states is not None:
+            assert initial_states.shape == (batch, nheads, headdim, dstate)
+        if seq_idx is not None:
+            assert seq_idx.shape == (batch, seqlen)
+        if dx is not None:
+            assert dx.shape == x.shape
+        if dB is not None:
+            assert dB.shape == B.shape
+            dB_given = dB
+        else:
+            dB_given = torch.empty_like(B)
+        if dC is not None:
+            assert dC.shape == C.shape
+            dC_given = dC
+        else:
+            dC_given = torch.empty_like(C)
+        if dz is not None:
+            assert z is not None
+            assert dz.shape == z.shape
+        if ddt is not None:
+            assert ddt.shape == dt.shape
+            ddt_given = ddt
+        else:
+            ddt_given = torch.empty_like(dt)
+        # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
+        # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
+        dt_in = dt.clone()
+        dA_cumsum, dt = _chunk_cumsum_fwd(
+            dt_in,
+            A,
+            chunk_size,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
         )
-        outz = rest[0] if recompute_output else out
-    else:
-        dz = None
-        outz = out
-    dstates = _chunk_scan_bwd_dstates(
-        C, dA_cumsum, dout, seq_idx=seq_idx, dtype=states.dtype
-    )
+        CB = _bmm_chunk_fwd(
+            C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32
+        )
+        states = _chunk_state_fwd(
+            B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True
+        )
 
-    dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_impl.bwd(
-        chunk_size=chunk_size,
-        states=states,
-        dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
-        dstates=dstates,
-        dstates_dtype=x.dtype,
-        states_dtype=x.dtype,
-        initial_states=initial_states,
-        dfinal_states=dfinal_states,
-        seq_idx=seq_idx,
-        cp_mesh=cp_mesh,
-        bwd_args=bwd_args,
-    )
+    with record_function("state_passing_impl_fwd"):
+        states, _, bwd_args = state_passing_impl.fwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            out_dtype=None,
+            cp_mesh=cp_mesh,
+        )
 
-    dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(
-        x, dt, dA_cumsum, B, CB, dout, dstates, D=D, seq_idx=seq_idx, dx=dx
-    )
-    dB, ddA_next = _chunk_state_bwd_db(
-        x, dt, dA_cumsum, dstates, seq_idx=seq_idx, B=B, ngroups=ngroups
-    )
-    dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(
-        states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups
-    )
-    dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
-    dCB = dCB.to(CB.dtype)
-    _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given)
-    _bmm_chunk_bwd(B, rearrange(dCB, "... l s -> ... s l"), residual=dC, out=dC_given)
-    # If we have z, then dout_x is recomputed in fp32 so dD = (dout_x * x).sum() is more accurate
-    # than dD_from_x = (dout_x * x).sum() where dout_x is in fp16/bf16
-    if z is None:
-        dD = dD_from_x
-    ddA_cumsum_prev[..., -1] += ddA_chunk_cumsum
-    ddA_prev = ddA_cumsum_prev.flip([-1]).cumsum(dim=-1).flip([-1])
-    ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
-    ddA += ddA_next + ddA_prev
+    with record_function("pre_state_passing_impl_bwd"):
+        if z is not None:
+            dz, dout, dD, *rest = _chunk_scan_bwd_dz(
+                x,
+                z,
+                out,
+                dout,
+                chunk_size=chunk_size,
+                has_ddAcs=False,
+                D=D,
+                dz=dz,
+                recompute_output=recompute_output,
+            )
+            outz = rest[0] if recompute_output else out
+        else:
+            dz = None
+            outz = out
+        dstates = _chunk_scan_bwd_dstates(
+            C, dA_cumsum, dout, seq_idx=seq_idx, dtype=states.dtype
+        )
 
-    ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(
-        ddA,
-        ddt,
-        dt_in,
-        A,
-        dt_bias=dt_bias,
-        dt_softplus=dt_softplus,
-        dt_limit=dt_limit,
-        ddt=ddt_given,
-    )
+    with record_function("state_passing_impl_bwd"):
+        dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_impl.bwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
+            dstates=dstates,
+            dstates_dtype=x.dtype,
+            states_dtype=x.dtype,
+            initial_states=initial_states,
+            dfinal_states=dfinal_states,
+            seq_idx=seq_idx,
+            cp_mesh=cp_mesh,
+            bwd_args=bwd_args,
+        )
 
-    return_vals = (
-        dx,
-        ddt_given,
-        dA,
-        dB_given,
-        dC_given,
-        dD,
-        dz,
-        ddt_bias,
-        dinitial_states,
-    )
-    return return_vals if not recompute_output else (*return_vals, outz)
+    with record_function("post_state_passing_impl_bwd"):
+        dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(
+            x, dt, dA_cumsum, B, CB, dout, dstates, D=D, seq_idx=seq_idx, dx=dx
+        )
+        dB, ddA_next = _chunk_state_bwd_db(
+            x, dt, dA_cumsum, dstates, seq_idx=seq_idx, B=B, ngroups=ngroups
+        )
+        dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(
+            states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups
+        )
+        dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
+        dCB = dCB.to(CB.dtype)
+        _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given)
+        _bmm_chunk_bwd(B, rearrange(dCB, "... l s -> ... s l"), residual=dC, out=dC_given)
+        # If we have z, then dout_x is recomputed in fp32 so dD = (dout_x * x).sum() is more accurate
+        # than dD_from_x = (dout_x * x).sum() where dout_x is in fp16/bf16
+        if z is None:
+            dD = dD_from_x
+        ddA_cumsum_prev[..., -1] += ddA_chunk_cumsum
+        ddA_prev = ddA_cumsum_prev.flip([-1]).cumsum(dim=-1).flip([-1])
+        ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
+        ddA += ddA_next + ddA_prev
+
+        ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(
+            ddA,
+            ddt,
+            dt_in,
+            A,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            ddt=ddt_given,
+        )
+
+        return_vals = (
+            dx,
+            ddt_given,
+            dA,
+            dB_given,
+            dC_given,
+            dD,
+            dz,
+            ddt_bias,
+            dinitial_states,
+        )
+        return return_vals if not recompute_output else (*return_vals, outz)
 
 
 ##### Non-CP impls. For testing and components of other impls.  #####
