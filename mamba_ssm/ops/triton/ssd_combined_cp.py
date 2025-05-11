@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional, Type
 
 import torch
+from torch.profiler import record_function
 import torch.distributed as dist
 import triton
 from einops import rearrange
@@ -120,122 +121,124 @@ class _StatePassingImpl(ABC):
                 return_varlen_states=False,
                 cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
             ):
-                ctx.dt_dtype = dt.dtype
-                if not return_varlen_states:
-                    cu_seqlens = None
-                else:
-                    assert cu_seqlens is not None, (
-                        "cu_seqlens must be provided if return_varlen_states is True"
+                with record_function("state_passing_fwd"):
+                    ctx.dt_dtype = dt.dtype
+                    if not return_varlen_states:
+                        cu_seqlens = None
+                    else:
+                        assert cu_seqlens is not None, (
+                            "cu_seqlens must be provided if return_varlen_states is True"
+                        )
+                    out, out_x, _, _, _, final_states, *rest = (
+                        _mamba_chunk_scan_combined_fwd_template(
+                            cls,
+                            x,
+                            dt,
+                            A,
+                            B,
+                            C,
+                            chunk_size,
+                            D=D,
+                            z=z,
+                            dt_bias=dt_bias,
+                            initial_states=initial_states,
+                            seq_idx=seq_idx,
+                            cu_seqlens=cu_seqlens,
+                            dt_softplus=dt_softplus,
+                            dt_limit=dt_limit,
+                            cp_mesh=cp_mesh,
+                        )
                     )
-                out, out_x, _, _, _, final_states, *rest = (
-                    _mamba_chunk_scan_combined_fwd_template(
-                        cls,
+                    ctx.save_for_backward(
+                        out if z is None else out_x,
                         x,
                         dt,
                         A,
                         B,
                         C,
-                        chunk_size,
-                        D=D,
-                        z=z,
-                        dt_bias=dt_bias,
-                        initial_states=initial_states,
-                        seq_idx=seq_idx,
-                        cu_seqlens=cu_seqlens,
-                        dt_softplus=dt_softplus,
-                        dt_limit=dt_limit,
-                        cp_mesh=cp_mesh,
+                        D,
+                        z,
+                        dt_bias,
+                        initial_states,
+                        seq_idx,
                     )
-                )
-                ctx.save_for_backward(
-                    out if z is None else out_x,
-                    x,
-                    dt,
-                    A,
-                    B,
-                    C,
-                    D,
-                    z,
-                    dt_bias,
-                    initial_states,
-                    seq_idx,
-                )
-                ctx.dt_softplus = dt_softplus
-                ctx.chunk_size = chunk_size
-                ctx.dt_limit = dt_limit
-                ctx.return_final_states = return_final_states
-                ctx.return_varlen_states = return_varlen_states
-                ctx.cp_mesh = cp_mesh
-                if not return_varlen_states:
-                    return out if not return_final_states else (out, final_states)
-                else:
-                    varlen_states = rest[0]
-                    return (
-                        (out, varlen_states)
-                        if not return_final_states
-                        else (out, final_states, varlen_states)
-                    )
+                    ctx.dt_softplus = dt_softplus
+                    ctx.chunk_size = chunk_size
+                    ctx.dt_limit = dt_limit
+                    ctx.return_final_states = return_final_states
+                    ctx.return_varlen_states = return_varlen_states
+                    ctx.cp_mesh = cp_mesh
+                    if not return_varlen_states:
+                        return out if not return_final_states else (out, final_states)
+                    else:
+                        varlen_states = rest[0]
+                        return (
+                            (out, varlen_states)
+                            if not return_final_states
+                            else (out, final_states, varlen_states)
+                        )
 
             @staticmethod
             def backward(ctx, dout, *args):
-                (
-                    out,
-                    x,
-                    dt,
-                    A,
-                    B,
-                    C,
-                    D,
-                    z,
-                    dt_bias,
-                    initial_states,
-                    seq_idx,
-                ) = ctx.saved_tensors
-                assert not ctx.return_varlen_states, (
-                    "return_varlen_states is not supported in backward"
-                )
-                dfinal_states = args[0] if ctx.return_final_states else None
-                dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
-                    _mamba_chunk_scan_combined_bwd_template(
-                        cls,
-                        dout,
+                with record_function("state_passing_bwd"):
+                    (
+                        out,
                         x,
                         dt,
                         A,
                         B,
                         C,
-                        out,
-                        ctx.chunk_size,
-                        D=D,
-                        z=z,
-                        dt_bias=dt_bias,
-                        initial_states=initial_states,
-                        dfinal_states=dfinal_states,
-                        seq_idx=seq_idx,
-                        dt_softplus=ctx.dt_softplus,
-                        dt_limit=ctx.dt_limit,
-                        cp_mesh=ctx.cp_mesh,
+                        D,
+                        z,
+                        dt_bias,
+                        initial_states,
+                        seq_idx,
+                    ) = ctx.saved_tensors
+                    assert not ctx.return_varlen_states, (
+                        "return_varlen_states is not supported in backward"
                     )
-                )
-                return (
-                    dx,
-                    ddt,
-                    dA,
-                    dB,
-                    dC,
-                    None,
-                    dD,
-                    dz,
-                    ddt_bias,
-                    dinitial_states,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                    dfinal_states = args[0] if ctx.return_final_states else None
+                    dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
+                        _mamba_chunk_scan_combined_bwd_template(
+                            cls,
+                            dout,
+                            x,
+                            dt,
+                            A,
+                            B,
+                            C,
+                            out,
+                            ctx.chunk_size,
+                            D=D,
+                            z=z,
+                            dt_bias=dt_bias,
+                            initial_states=initial_states,
+                            dfinal_states=dfinal_states,
+                            seq_idx=seq_idx,
+                            dt_softplus=ctx.dt_softplus,
+                            dt_limit=ctx.dt_limit,
+                            cp_mesh=ctx.cp_mesh,
+                        )
+                    )
+                    return (
+                        dx,
+                        ddt,
+                        dA,
+                        dB,
+                        dC,
+                        None,
+                        dD,
+                        dz,
+                        ddt_bias,
+                        dinitial_states,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
 
         _Fn.__name__ = f"{cls.__name__}Fn"
 

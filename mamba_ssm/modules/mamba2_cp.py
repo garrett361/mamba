@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from einops import rearrange
+from torch.profiler import record_function
 
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
@@ -382,10 +383,11 @@ def conv_cp(
     cp_mesh: dist.device_mesh.DeviceMesh,
     seq_idx=None,
 ) -> torch.Tensor:
-    conv_state_send = xBC[:, -(mamba2.d_conv - 1) :]
-    # TODO: @goon - make the conv_state send/recv async. Can overlap with the first conv.
-    conv_state_recv = causal_passing_comms(conv_state_send, cp_mesh)
-    return conv(xBC, mamba2, conv_state_recv, seq_idx)
+    with record_function("conv_cp"):
+        conv_state_send = xBC[:, -(mamba2.d_conv - 1) :]
+        # TODO: @goon - make the conv_state send/recv async. Can overlap with the first conv.
+        conv_state_recv = causal_passing_comms(conv_state_send, cp_mesh)
+        return conv(xBC, mamba2, conv_state_recv, seq_idx)
 
 
 def in_proj_split(inputs, mamba2: Mamba2):
