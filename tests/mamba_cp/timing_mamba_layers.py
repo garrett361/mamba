@@ -7,19 +7,21 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from mamba_ssm.modules.mamba2_cp import Mamba2CP
+from contextlib import nullcontext
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--cp_mamba_impl", type=str, default="allgather")
     parser.add_argument("--d_model", type=int, default=4096)  # bamba 9.8b default
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--n_layers", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--n_layers", type=int, default=1)
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--seq_len_per_gpu", type=int, default=8192)
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--warmups", type=int, default=10)
+    parser.add_argument("--seq_len_per_gpu", type=int, default=65536)
+    parser.add_argument("--wandb", type=bool, default=False)
+    parser.add_argument("--bwd", type=bool, default=False)
+    parser.add_argument("--warmups", type=int, default=3)
     args = parser.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -59,19 +61,31 @@ if __name__ == "__main__":
             dtype=dtype,
         )
 
-        with torch.no_grad():
+        # Initial barrier to avoid possible issues w/ P2P comms being the first ops.
+        # https://docs.pytorch.org/docs/stable/distributed.html#torch.distributed.batch_isend_irecv
+        dist.barrier()
+        ctx = nullcontext if args.bwd else torch.no_grad
+        with ctx():
             for _ in range(args.warmups):
                 mamba_stack(inputs)
+        dist.barrier()
 
         start = torch.cuda.Event(enable_timing=True)
         stop = torch.cuda.Event(enable_timing=True)
         start.record()
-        with torch.no_grad():
+        with ctx():
             for _ in range(args.iters):
-                mamba_stack(inputs)
-        dist.barrier()
+                outputs = mamba_stack(inputs)
+                if args.bwd:
+                    outputs.sum().backward()
+                    mamba_stack.zero_grad()
+                # Barrier after each iteration to sync processes. Otherwise, we would amortize the
+                # serial impl bubble over all iters, e.g. Mimics actual sync points expected in full
+                # e2e code
+                dist.barrier()
         stop.record()
         torch.cuda.synchronize()
+
         secs = start.elapsed_time(stop) / 1e3
 
         toks_per_gpu = args.batch_size * args.seq_len_per_gpu * args.iters

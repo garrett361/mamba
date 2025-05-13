@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import json
 import os
 import subprocess
@@ -8,9 +9,22 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import ProfilerActivity, profile, record_function
 
 from mamba_ssm.modules.mamba2_cp import Mamba2CP
+
+
+class SequentialRecorded(nn.Module):
+    def __init__(self, mod_list: list[nn.Module]) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(mod_list)
+
+    def forward(self, inputs) -> torch.Tensor:
+        outputs = inputs
+        for idx, layer in enumerate(self.layers):
+            with record_function(f"layer_{idx}"):
+                outputs = layer(outputs)
+        return outputs
 
 
 def trace_handler(prof):
@@ -82,6 +96,7 @@ if __name__ == "__main__":
         parser.add_argument("--trace_ranks", type=str, default="0,-1")
         parser.add_argument("--wait", type=int, default=3)
         parser.add_argument("--warmup", type=int, default=3)
+        parser.add_argument("--bwd", type=bool, default=False) 
 
         args = parser.parse_args()
         impls = args.impls.split(",")
@@ -99,8 +114,8 @@ if __name__ == "__main__":
         )
 
         for impl in impls:
-            mamba_stack = nn.Sequential(
-                *[
+            mamba_stack = SequentialRecorded(
+                [
                     Mamba2CP(
                         d_model=args.d_model,
                         cp_mesh=mesh,
@@ -112,6 +127,7 @@ if __name__ == "__main__":
                 ]
             )
 
+            ctx = nullcontext if args.bwd else torch.no_grad
             with (
                 profile(
                     activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
@@ -126,7 +142,7 @@ if __name__ == "__main__":
                     ),
                     on_trace_ready=trace_handler,
                 ) as prof,
-                torch.no_grad(),
+                ctx(),
             ):
                 for _ in range(iters_per_impl):
                     mamba_stack(inputs)

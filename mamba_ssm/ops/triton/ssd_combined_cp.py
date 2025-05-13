@@ -354,7 +354,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         if D is not None and D.stride(-1) != 1:
             D = D.contiguous()
         if initial_states is not None:
-        assert initial_states.shape == (batch, nheads, headdim, dstate)
+            assert initial_states.shape == (batch, nheads, headdim, dstate)
         dA_cumsum, dt = _chunk_cumsum_fwd(
             dt,
             A,
@@ -539,10 +539,14 @@ def _mamba_chunk_scan_combined_bwd_template(
         dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(
             states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups
         )
-        dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
+        dCB = _chunk_scan_bwd_dcb(
+            x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups
+        )
         dCB = dCB.to(CB.dtype)
         _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given)
-        _bmm_chunk_bwd(B, rearrange(dCB, "... l s -> ... s l"), residual=dC, out=dC_given)
+        _bmm_chunk_bwd(
+            B, rearrange(dCB, "... l s -> ... s l"), residual=dC, out=dC_given
+        )
         # If we have z, then dout_x is recomputed in fp32 so dD = (dout_x * x).sum() is more accurate
         # than dD_from_x = (dout_x * x).sum() where dout_x is in fp16/bf16
         if z is None:
@@ -651,8 +655,9 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 #### Start CP Impls ####
 
 
-# Drop-in replacement (up to the tag and group_dst args) for dist.{send,recv}, but using dist.isend,
-# as dist.send can (apparently) yield NCCL errors in multi-nodes settings for some cluster setups.
+# Async send/recv wrappers.
+# NOTE: @goon - For some reason, plain dist.isend(...).wait() calls are erroring out for me. Don't
+# think is should be necessary to use the `batch_isend_irecv` wrapper.
 def send(tensor, dst=None, group=None) -> None:
     for op in dist.batch_isend_irecv(
         [dist.P2POp(dist.isend, tensor, dist.get_global_rank(group, dst), group)]
