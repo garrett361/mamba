@@ -718,7 +718,6 @@ class StatePassingSerialCP(_StatePassingImpl):
                     src=dist.get_global_rank(group, send_rank),
                     group=group,
                 )
-            dist.barrier()
 
         # Final rank only:
         if local_rank == recv_rank:
@@ -799,8 +798,6 @@ class StatePassingSerialCP(_StatePassingImpl):
                     src=dist.get_global_rank(group, send_rank),
                     group=group,
                 )
-
-            dist.barrier()
 
         if local_rank == recv_rank:
             # First rank only:
