@@ -784,9 +784,9 @@ class _SimpleRoutedExperts(nn.Module):
     ):
         super().__init__()
         self.n_routed_experts = n_routed_experts
-        self.experts = nn.ModuleList(
-            [
-                GatedMLP(
+        self.experts = nn.ModuleDict(
+            {
+                str(i): GatedMLP(
                     in_features=in_features,
                     hidden_features=d_intermediate,
                     multiple_of=multiple_of,
@@ -795,7 +795,7 @@ class _SimpleRoutedExperts(nn.Module):
                     dtype=dtype,
                 )
                 for i in range(n_routed_experts)
-            ]
+            }
         )
 
     def forward(
