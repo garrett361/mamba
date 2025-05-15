@@ -19,6 +19,7 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPGroupedMMTriton,
     _get_counts,
     _get_exp_outputs_grouped_mm,
+    _get_exp_outputs_titan_cg_gemm,
     _get_local_expert_idxs,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
@@ -736,6 +737,75 @@ class TestTitan(_TestBase):
         #     toks.grad, toks_copy.grad, atol=self.tol, rtol=self.tol
         # )
 
+    def test_titan_cg_gemm_equal(self) -> None:
+        """
+        torchtitan CG GEMM
+        """
+        from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
+            cg_grouped_gemm,
+        )
+
+        torch.manual_seed(42)
+
+        n_experts = 4
+        d_model = 512
+        d_out = 4 * d_model
+        bsz = 2
+        group_size_m = 128
+        seqlen = group_size_m * n_experts
+        n_toks = bsz * seqlen
+
+        toks = torch.randn(
+            n_toks, d_model, device=self.device, dtype=self.dtype, requires_grad=True
+        )
+        weight = torch.randn(
+            n_experts,
+            d_out,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+
+        # Send equal numbers of toks to each expert. Note: cg_grouped_gemm uses exp ids, not sizes
+        # or offsets
+        expert_indices = torch.cat(
+            [
+                torch.full(
+                    (n_toks // n_experts,),
+                    exp_idx,
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                for exp_idx in range(n_experts)
+            ]
+        )
+
+        out = cg_grouped_gemm(toks, weight, expert_indices, group_size_m)
+        assert out.shape == torch.Size([n_toks, d_out])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        weight_copy = deepcopy(weight)
+        out_alt_list = []
+        for tok_chunk, exp_weight in zip(toks_copy.chunk(n_experts), weight_copy):
+            out_alt_list.append(tok_chunk @ exp_weight.t())
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(out, out_alt)
+
+
+        # For some reason, out.sum().backward() errors out?
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        out_alt.backward(grad)
+
+        torch.testing.assert_close(
+            weight.grad, weight_copy.grad, atol=self.tol, rtol=self.tol
+        )
+        torch.testing.assert_close(
+            toks.grad, toks_copy.grad, atol=self.tol, rtol=self.tol
+        )
+
 
 class TestMoeImpls(_TestBase):
     def test_bmm_equiv(self):
@@ -838,6 +908,84 @@ class TestMoeImpls(_TestBase):
 
         out = _get_exp_outputs_grouped_mm(
             toks, fc1_weight, fc2_weight, offs=offs, activation=F.silu
+        )
+        assert out.shape == torch.Size([n_toks_expert_0 + n_toks_expert_1, d_model])
+
+        # Compute the equivalent for-loop
+        toks_copy = deepcopy(toks)
+        fc1_weight_copy = deepcopy(fc1_weight)
+        fc2_weight_copy = deepcopy(fc2_weight)
+        out_alt_list = []
+        for tok_chunk, (fc1, fc2) in zip(
+            toks_copy.chunk(3),
+            zip(
+                (fc1_weight_copy[0], fc1_weight_copy[1], fc1_weight_copy[1]),
+                (fc2_weight_copy[0], fc2_weight_copy[1], fc2_weight_copy[1]),
+            ),
+        ):
+            out_alt_list.append(_get_single_exp_output(tok_chunk, fc1, fc2, F.silu))
+        out_alt = torch.cat(out_alt_list, dim=0)
+        torch.testing.assert_close(
+            out,
+            out_alt,
+            atol=self.tol,
+            rtol=self.tol,
+        )
+
+        # Backwards: just test that the _grouped_mm bwd doesn't error out for now.
+        # TODO: @goon - test correctness.
+        out.pow(2).sum().backward()
+
+    def test_get_exp_outputs_titan_cg_gemm(self):
+        torch.manual_seed(42)
+        # Matmul dims all need to be divisible by 16 (everything but n_groups)
+        n_experts = 2
+        d_model = 16
+        d_intermediate = 4 * d_model
+        n_toks_expert_0 = 16
+        n_toks_expert_1 = 2 * n_toks_expert_0
+
+        toks = torch.randn(
+            n_toks_expert_0 + n_toks_expert_1,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        fc1_weight = torch.randn(
+            n_experts,
+            2 * d_intermediate,
+            d_model,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+        fc2_weight = torch.randn(
+            n_experts,
+            d_model,
+            d_intermediate,
+            device=self.device,
+            dtype=self.dtype,
+            requires_grad=True,
+        )
+
+        expert_indices = torch.cat(
+            [
+                torch.full(
+                    (n_toks_expert_0,), 0, device=self.device, dtype=torch.int32
+                ),
+                torch.full(
+                    (n_toks_expert_1,), 1, device=self.device, dtype=torch.int32
+                ),
+            ]
+        )
+        out = _get_exp_outputs_titan_cg_gemm(
+            toks,
+            fc1_weight,
+            fc2_weight,
+            expert_indices=expert_indices,
+            activation=F.silu,
+            group_size_m=n_toks_expert_0,
         )
         assert out.shape == torch.Size([n_toks_expert_0 + n_toks_expert_1, d_model])
 
