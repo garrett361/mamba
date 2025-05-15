@@ -286,6 +286,35 @@ def _get_exp_outputs_grouped_mm(
     return y
 
 
+def _get_exp_outputs_titan_cg_gemm(
+    x: torch.Tensor,
+    fc1_weights: torch.Tensor,
+    fc2_weights: torch.Tensor,
+    expert_indices: torch.IntTensor,
+    activation: Callable[[torch.Tensor], torch.Tensor],
+    group_size_m: int = 128,
+):
+    """
+    Compute the outputs from all experts using titan's CG grouped gemm kernels.
+
+    TODO: @goon - finish. "ModuleNotFoundError: No module named 'tma_cuda_autotune'" errors as of
+    May 15
+    """
+    from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
+        cg_grouped_gemm,
+    )
+
+    y = cg_grouped_gemm(
+        x, fc1_weights, expert_indices=expert_indices, group_size_m=group_size_m
+    )
+    y, gate = y.chunk(2, dim=-1)
+    y = y * activation(gate)
+    y = cg_grouped_gemm(
+        y, fc2_weights, expert_indices=expert_indices, group_size_m=group_size_m
+    )
+    return y
+
+
 def _get_local_expert_idxs(
     tokens_per_expert_group: torch.Tensor, n_local_experts: int
 ) -> torch.IntTensor:
@@ -444,6 +473,10 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
 
 class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
+    """
+    for-loop impl
+    """
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -462,6 +495,10 @@ class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
 
 
 class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
+    """
+    torch._grouped_mm
+    """
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -493,6 +530,10 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
 
 
 class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
+    """
+    torch._grouped_mm and triton indexing kernels
+    """
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -510,12 +551,43 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
         # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
         # sized, empirically tuned to be large enough to handle the routed tokens.
         z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
-        # z = torch.empty(
-        #     ((int(1.5 * indices.numel()) + 31) // 32) * 32,
-        #     x.shape[-1],
-        #     dtype=x.dtype,
-        #     device=x.device,
-        # )
+
+        z[idxs_align] = x_by_expert
+        z = _get_exp_outputs_grouped_mm(
+            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+        )
+
+        # Remove the alignment and return the tokens to their original ordering
+        x_by_expert[flat_sorted_indices] = z[idxs_align]
+
+        # Reshape and weight
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
+        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+        return z
+
+
+class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
+    """
+    titan grouped gemm + triton indexing
+    """
+
+    def forward(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
+    ) -> torch.Tensor:
+        # Sort tokens by the expert they are indexed to.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
+
+        counts = _get_counts(indices, self.n_routed_experts)
+
+        # Expand the tokens to an appropriately aligned tensor.
+        idxs_align, _, offsets = pad_sorted_idxs(
+            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
+        )
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # sized, empirically tuned to be large enough to handle the routed tokens.
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
 
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
@@ -532,6 +604,10 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
 
 
 class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
+    """
+    EP + for-loop
+    """
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -576,6 +652,10 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
 
 
 class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
+    """
+    EP + torch._grouped_mm
+    """
+
     def forward(
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
@@ -626,6 +706,12 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
 
 
 class RoutedExpertsTorchEPGroupedMMTriton(_RoutedExpertsTorchEP):
+    """
+    EP + torch._grouped_mm and triton indexing kernels.
+
+    TODO: incomplete.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         from torchtitan.experiments.kernels.moe.indices import generate_permute_indices  # noqa
@@ -692,7 +778,7 @@ class _SimpleRoutedExperts(nn.Module):
         n_routed_experts: int,
         multiple_of: int = 1,
         activation=F.silu,
-        ep_mesh: Optional[DeviceMesh] = None,
+        ep_mesh: Optional[DeviceMesh] = None,  # Intentionally unused
         device=None,
         dtype=None,
     ):
