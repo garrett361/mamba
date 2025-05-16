@@ -490,7 +490,7 @@ def init_meta_moe(model: MambaLMHeadModel):
     nn.init.normal_(model.backbone.embedding.weight, std=0.02)
 
 
-def get_total_and_active_params(model: MambaLMHeadModel):
+def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, int]:
     """
     Utility for getting the total and active number of parameter for an MoE model.
     """
@@ -501,9 +501,9 @@ def get_total_and_active_params(model: MambaLMHeadModel):
             exp += sum(p.numel() for p in m.parameters())
             moe_mod = m
     if exp == 0:
-        return total, total
+        return total, 0, total
 
     non_exp = total - exp
     # Assumption: same active/routed ratio globally.
     active_exp =  exp * moe_mod.n_activated_experts / moe_mod.n_routed_experts
-    return total, non_exp + active_exp
+    return total, exp, non_exp + active_exp
