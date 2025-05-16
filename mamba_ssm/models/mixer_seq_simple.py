@@ -492,7 +492,8 @@ def init_meta_moe(model: MambaLMHeadModel):
 
 def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, int]:
     """
-    Utility for getting the total and active number of parameter for an MoE model.
+    Utility for getting the parameter count from all params, routed experts, and number of active
+    params per token.
     """
     total = sum(p.numel() for p in model.parameters())
     exp = 0
