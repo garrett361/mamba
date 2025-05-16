@@ -86,7 +86,7 @@ class Gate(nn.Module):
                 group_scores = scores.amax(dim=-1)
             else:
                 # NOTE: @goon - this line seems odd, but is standard: sum the top-2 scores from each
-                # group to create the group score.
+                # group to create the group score. Appears in both HF and DSv3 repos.
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
             indices = group_scores.topk(self.n_limited_groups, dim=-1)[1]
             mask = scores.new_ones(
