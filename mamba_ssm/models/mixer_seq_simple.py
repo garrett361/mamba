@@ -499,7 +499,7 @@ def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, in
     exp = 0
     for m in model.modules():
         if isinstance(m, MoE ):
-            exp += sum(p.numel() for p in m.parameters())
+            exp += sum(p.numel() for p in m.experts.parameters())
             moe_mod = m
     if exp == 0:
         return total, 0, total
