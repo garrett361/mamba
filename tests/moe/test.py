@@ -176,6 +176,34 @@ class TestGate(_TestBase):
             [self.n_activated_experts]
         )
 
+    @pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
+    def test_bwd_with_exp_groups(
+        self, score_func: Literal["sigmoid", "softmax"]
+    ) -> None:
+        """
+        Regression test: using grouped expert options were previously giving in-place modification
+        errors for bwd.
+        """
+        torch.manual_seed(42)
+        model = Gate(
+            in_features=self.in_features,
+            n_routed_experts=self.n_routed_experts,
+            n_activated_experts=self.n_activated_experts,
+            n_expert_groups=4,
+            n_limited_groups=2,
+            score_func=score_func,
+            **self.factory_kwargs,
+        )
+        inputs = self.get_inputs().view(-1, self.in_features)
+        weights, indices = model(inputs)
+        assert weights.shape == inputs.shape[:1] + torch.Size(
+            [self.n_activated_experts]
+        )
+        assert indices.shape == inputs.shape[:1] + torch.Size(
+            [self.n_activated_experts]
+        )
+        weights.sum().backward()
+
 
 class TestRoutedExperts(_TestBase):
     def test_no_ep_naive(self) -> None:
