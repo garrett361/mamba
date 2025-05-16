@@ -92,7 +92,8 @@ class Gate(nn.Module):
             mask = scores.new_ones(
                 x.size(0), self.n_expert_groups, dtype=bool
             ).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+            # NOTE: @goon -  using the in-place masked_fill_ gives in-place backwards pass errors.
+            scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf")).flatten(1)
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
