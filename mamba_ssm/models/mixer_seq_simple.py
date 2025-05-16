@@ -398,7 +398,7 @@ def fully_shard_moe(
     explicit_bwd_prefetch: bool = False,
     no_reshard: bool = False,
 ) -> None:
-    assert fsdp_mesh.ndim == 1
+    assert fsdp_mesh.ndim == 1, f"{fsdp_mesh.dim=}"
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(
         model.lm_head,
