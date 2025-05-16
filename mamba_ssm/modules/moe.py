@@ -789,7 +789,7 @@ class _SimpleRoutedExperts(nn.Module):
     ):
         super().__init__()
         self.n_routed_experts = n_routed_experts
-        self.experts = nn.ModuleDict(
+        self.simple_experts = nn.ModuleDict(
             {
                 str(i): GatedMLP(
                     in_features=in_features,

@@ -398,6 +398,7 @@ def fully_shard_moe(
     explicit_bwd_prefetch: bool = False,
     no_reshard: bool = False,
 ) -> None:
+    # TODO: @goon - hsdp?
     assert fsdp_mesh.ndim == 1, f"{fsdp_mesh.dim=}"
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(
@@ -487,3 +488,22 @@ def init_meta_moe(model: MambaLMHeadModel):
     for p in model.parameters():
         nn.init.normal_(p)
     nn.init.normal_(model.backbone.embedding.weight, std=0.02)
+
+
+def get_total_and_active_params(model: MambaLMHeadModel):
+    """
+    Utility for getting the total and active number of parameter for an MoE model.
+    """
+    total = sum(p.numel() for p in model.parameters())
+    exp = 0
+    for m in model.modules():
+        if isinstance(m, MoE ):
+            exp += sum(p.numel() for p in m.parameters())
+            moe_mod = m
+    if exp == 0:
+        return total, total
+
+    non_exp = total - exp
+    # Assumption: same active/routed ratio globally.
+    active_exp =  exp * moe_mod.n_activated_experts / moe_mod.n_routed_experts
+    return total, non_exp + active_exp
