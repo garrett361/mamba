@@ -506,5 +506,5 @@ def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, in
 
     non_exp = total - exp
     # Assumption: same active/routed ratio globally.
-    active_exp =  exp * moe_mod.n_activated_experts / moe_mod.n_routed_experts
+    active_exp =  (exp * moe_mod.n_activated_experts) // moe_mod.n_routed_experts
     return total, exp, non_exp + active_exp
