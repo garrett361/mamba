@@ -1,14 +1,7 @@
 from dataclasses import dataclass, field
 
 """
-NOTE: @goon - current MoE config schema:
-moe_cfg = {"n_routed_experts": int,
-        "n_activated_experts": int,
-        "n_shared_experts": int,
-        "d_intermediate": int,
-        "n_expert_groups": int=1,
-        "n_limited_groups": int=1,
-}
+NOTE: @goon - moe_cfg matches up to the MoE kwargs 
 """
 
 
