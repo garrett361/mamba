@@ -1,3 +1,4 @@
+import math
 from abc import ABC, abstractmethod
 from typing import Callable, Literal, Optional
 
@@ -341,6 +342,64 @@ def _get_local_expert_idxs(
     return local_expert_idxs
 
 
+class RoutedExpertsFC1Weights(nn.Module):
+    """
+    Container for routed expert FC1 weight. Convenient for aligning FQN's and ensuring the
+    _RoutedExperts weights are initalized by _init_weights.
+    """
+
+    def __init__(
+        self,
+        n_local_experts: int,
+        d_intermediate: int,
+        in_features: int,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.randn(
+                n_local_experts,
+                2 * d_intermediate,
+                in_features,
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+
+class RoutedExpertsFC2Weights(nn.Module):
+    """
+    Container for routed expert FC2 weight. Convenient for aligning FQN's and ensuring the
+    _RoutedExperts weights are initalized by _init_weights.
+    """
+
+    def __init__(
+        self,
+        n_local_experts: int,
+        d_intermediate: int,
+        in_features: int,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.empty(
+                n_local_experts,
+                in_features,
+                d_intermediate,
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+
 class _RoutedExperts(nn.Module, ABC):
     def __init__(
         self,
@@ -377,23 +436,11 @@ class _RoutedExperts(nn.Module, ABC):
         )
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
-        self.fc1_weights = nn.Parameter(
-            torch.randn(
-                self.n_local_experts,
-                2 * d_intermediate,
-                in_features,
-                **factory_kwargs,
-            )
-            / self.in_features ** (0.5)
+        self.fc1 = RoutedExpertsFC1Weights(
+            self.n_local_experts, d_intermediate, in_features, **factory_kwargs
         )
-        self.fc2_weights = nn.Parameter(
-            torch.randn(
-                self.n_local_experts,
-                self.in_features,
-                self.d_intermediate,
-                **factory_kwargs,
-            )
-            / self.d_intermediate ** (0.5)
+        self.fc2 = RoutedExpertsFC2Weights(
+            self.n_local_experts, d_intermediate, in_features, **factory_kwargs
         )
 
     @abstractmethod
@@ -469,7 +516,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         self._tok_count += sum(recv_counts)  # testing
 
         # Receive toks from other workers
-
         with record_function("all2all::send0"):
             x_recv = funcol.all_to_all_single_autograd(
                 x_by_expert, recv_counts, send_counts, group=self.ep_mesh
@@ -487,8 +533,8 @@ class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
     ) -> torch.Tensor:
         z = torch.zeros_like(x)
         # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
-        # self.fc1_weights[exp_idx], results in super-slow CUDA syncs during the backwards pass.
-        for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1_weights, self.fc2_weights)):
+        # self.fc1.weight[exp_idx], results in super-slow CUDA syncs during the backwards pass.
+        for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1.weight, self.fc2.weight)):
             # TODO: @goon - handle no-tokens edge case
             # NOTE: @goon - torch.where incurs a CUDA sync.
             tok_idx, act_exp_idx = torch.where(indices == exp_idx)
@@ -522,7 +568,7 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
         z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
         )
 
         # Remove the alignment and return the tokens to their original ordering
@@ -559,7 +605,7 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
 
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
         )
 
         # Remove the alignment and return the tokens to their original ordering
@@ -596,7 +642,7 @@ class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
 
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
         )
 
         # Remove the alignment and return the tokens to their original ordering
@@ -634,7 +680,7 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
         )
 
         for exp_idx, (fc1_weight, fc2_weight) in enumerate(
-            zip(self.fc1_weights, self.fc2_weights)
+            zip(self.fc1.weight, self.fc2.weight)
         ):
             idxs = local_expert_idxs == exp_idx
             # TODO: @goon - handle no-tokens edge case
@@ -689,7 +735,7 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         z[idxs_align] = x_recv_sorted
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
         )
         # Remove the alignment and return the tokens to their original ordering. Re-use
         # x_recv_sorted and avoid a new allocation.
@@ -750,7 +796,7 @@ class RoutedExpertsTorchEPGroupedMMTriton(_RoutedExpertsTorchEP):
         z[recv_sorted_indices] = x_recv
 
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1_weights, self.fc2_weights, offsets, self.activation
+            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
         )
         # Remove the alignment and return the tokens to their original ordering. Re-use
         # x_recv_sorted and avoid a new allocation.
