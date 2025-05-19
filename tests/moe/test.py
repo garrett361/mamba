@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, init_meta_moe
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     _GROUPED_MM_ALIGNMENT,
@@ -25,6 +25,7 @@ from mamba_ssm.modules.moe import (
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
 )
+from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 
 

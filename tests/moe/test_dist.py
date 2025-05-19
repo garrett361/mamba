@@ -11,7 +11,8 @@ from torch.distributed.tensor import DTensor
 
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, init_meta_moe
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
@@ -22,6 +23,7 @@ from mamba_ssm.modules.moe import (
     _get_counts,
     _RoutedExperts,
 )
+from mamba_ssm.moe_utils._utils import fully_shard_moe
 
 
 def _copy_params_routed_experts(
@@ -426,7 +428,7 @@ class TestModelEP(_TestBase):
 
         # Force models equal
         _copy_params(model, model_ep)
-
+        fully_shard_moe(model_ep)
         fully_shard(model_ep.lm_head, mesh=ep_mesh)
         fully_shard(model_ep.backbone.embedding, mesh=ep_mesh)
         for block in model_ep.backbone.layers.values():
