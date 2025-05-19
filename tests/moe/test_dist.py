@@ -26,13 +26,13 @@ def _copy_params_routed_experts(
     experts: _RoutedExperts, experts_ep: _RoutedExperts
 ) -> None:
     with torch.no_grad():
-        experts_ep.fc1_weights.data.copy_(
-            experts.fc1_weights.data[
+        experts_ep.fc1.weight.data.copy_(
+            experts.fc1.weight.data[
                 experts_ep.experts_start_idx : experts_ep.experts_end_idx
             ]
         )
-        experts_ep.fc2_weights.data.copy_(
-            experts.fc2_weights.data[
+        experts_ep.fc2.weight.data.copy_(
+            experts.fc2.weight.data[
                 experts_ep.experts_start_idx : experts_ep.experts_end_idx
             ]
         )
@@ -55,8 +55,8 @@ def _test_grads_routed_experts(
     experts: _RoutedExperts, experts_ep: _RoutedExperts, tol: float
 ) -> None:
     for p, p_ep in zip(
-        (experts.fc1_weights, experts_ep.fc1_weights),
-        (experts.fc1_weights, experts_ep.fc2_weights),
+        (experts.fc1.weight, experts_ep.fc1.weight),
+        (experts.fc1.weight, experts_ep.fc2.weight),
     ):
         if p.grad is None:
             assert p_ep.grad is None
