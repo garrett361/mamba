@@ -835,7 +835,7 @@ class _SimpleRoutedExperts(nn.Module):
     ):
         super().__init__()
         self.n_routed_experts = n_routed_experts
-        self.simple_experts = nn.ModuleDict(
+        self.experts = nn.ModuleDict(
             {
                 str(i): GatedMLP(
                     in_features=in_features,
@@ -859,7 +859,7 @@ class _SimpleRoutedExperts(nn.Module):
         for i in range(self.n_routed_experts):
             if counts[i] == 0:
                 continue
-            expert = self.experts[i]
+            expert = self.experts[str(i)]
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         return y
