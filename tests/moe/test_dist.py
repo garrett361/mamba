@@ -6,7 +6,7 @@ import torch
 import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 
 from dtest import DTest
@@ -24,6 +24,7 @@ from mamba_ssm.modules.moe import (
 )
 from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.moe_utils._utils import fully_shard_moe
+from tests.moe.test_utils import skip_moe_impl_if_no_h100s
 
 
 def _copy_params_routed_experts(
@@ -217,6 +218,7 @@ class TestRoutedExperts(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("cls", list(EP_EXPERT_CLASSES.values()))
     def test_fwd(self, cls) -> None:
+        skip_moe_impl_if_no_h100s(cls)
         # Some classes have dtype constraints:
         if cls == RoutedExpertsTorchEPGroupedMM:
             self.dtype = torch.bfloat16
@@ -246,6 +248,7 @@ class TestRoutedExperts(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("cls", list(EP_EXPERT_CLASSES.values()))
     def test_bwd(self, cls) -> None:
+        skip_moe_impl_if_no_h100s(cls)
         # Some classes have dtype constraints:
         if cls == RoutedExpertsTorchEPGroupedMM:
             self.dtype = torch.bfloat16
@@ -285,6 +288,7 @@ class TestMoEEP(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_fwd(self, moe_impl: str) -> None:
+        skip_moe_impl_if_no_h100s(EP_EXPERT_CLASSES[moe_impl])
         # Some classes have dtype constraints:
         if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
@@ -319,6 +323,7 @@ class TestMoEEP(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_bwd(self, moe_impl: str) -> None:
+        skip_moe_impl_if_no_h100s(EP_EXPERT_CLASSES[moe_impl])
         # Some classes have dtype constraints:
         if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
@@ -378,6 +383,7 @@ class TestModelEP(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_fwd(self, moe_impl: str) -> None:
+        skip_moe_impl_if_no_h100s(EP_EXPERT_CLASSES[moe_impl])
         # Some classes have dtype constraints:
         if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
@@ -412,6 +418,7 @@ class TestModelEP(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_bwd(self, moe_impl: str) -> None:
+        skip_moe_impl_if_no_h100s(EP_EXPERT_CLASSES[moe_impl])
         # Some classes have dtype constraints:
         if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
@@ -467,6 +474,7 @@ class TestModelEP(_TestBase):
     @pytest.mark.gpu
     @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
     def test_fwd_compile(self, moe_impl: str) -> None:
+        skip_moe_impl_if_no_h100s(EP_EXPERT_CLASSES[moe_impl])
         # Some classes have dtype constraints:
         if "gemm" in moe_impl:
             self.dtype = torch.bfloat16
@@ -513,20 +521,18 @@ class TestModelEP(_TestBase):
         inputs = self.get_input_toks()
         outputs_ep = meta_model_ep(inputs)
 
+
+class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
-    def test_fwd_fully_shard_moe(self, moe_impl: str) -> None:
+    def test_fwd_fully_shard_moe(self) -> None:
         # Some classes have dtype constraints:
-        if "gemm" in moe_impl:
-            self.dtype = torch.bfloat16
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
         )
         model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
         moe_cfg = deepcopy(self.cfg)
-        moe_cfg.moe_cfg["moe_impl"] = moe_impl
         model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
             self.dtype
         )
