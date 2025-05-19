@@ -27,6 +27,7 @@ from mamba_ssm.modules.moe import (
 )
 from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
+from tests.moe.test_utils import skip_if_no_h100s, skip_moe_impl_if_no_h100s
 
 
 def _copy_params_routed_experts(
@@ -232,6 +233,7 @@ class TestRoutedExperts(_TestBase):
         ],
     )
     def test_fwd_equivalence(self, cls) -> None:
+        skip_moe_impl_if_no_h100s(cls)
         torch.manual_seed(42)
         inputs, weights, indices = self.get_inputs_weights_indices()
         kwargs = dict(
@@ -274,6 +276,7 @@ class TestMoE(_TestBase):
 class TestMoEModel(_TestBase):
     @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
     def test_fwd(self, moe_impl) -> None:
+        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         cfg.moe_cfg["moe_impl"] = moe_impl
@@ -290,6 +293,7 @@ class TestMoEModel(_TestBase):
 
     @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
     def test_fwd_compile(self, moe_impl) -> None:
+        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         cfg.moe_cfg["moe_impl"] = moe_impl
@@ -434,6 +438,7 @@ class TestTitan(_TestBase):
         matmuls.
 
         """
+        skip_if_no_h100s()
         torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 4
@@ -501,6 +506,7 @@ class TestTitan(_TestBase):
         """
         Two experts, give the second expert twice the number of toks
         """
+        skip_if_no_h100s()
         torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 2
@@ -581,6 +587,7 @@ class TestTitan(_TestBase):
         """
         Test the case where an expert gets zero tokens
         """
+        skip_if_no_h100s()
         torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 4
@@ -651,6 +658,7 @@ class TestTitan(_TestBase):
         """
         torchtitan GEMM
         """
+        skip_if_no_h100s()
         from torchtitan.experiments.kernels.triton_mg_group_gemm.torchao_pr import (
             ALIGN_SIZE_M,
             grouped_gemm_forward,
@@ -714,6 +722,7 @@ class TestTitan(_TestBase):
         # )
 
     def test_titan_gemm_diff_alignments(self) -> None:
+        skip_if_no_h100s()
         from torchtitan.experiments.kernels.triton_mg_group_gemm.torchao_pr import (
             ALIGN_SIZE_M,
             grouped_gemm_forward,
@@ -913,6 +922,7 @@ class TestMoeImpls(_TestBase):
         torch.testing.assert_close(outputs, outputs_alt)
 
     def test_get_exp_outputs_grouped_mm(self):
+        skip_if_no_h100s()
         torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 2
@@ -980,6 +990,7 @@ class TestMoeImpls(_TestBase):
         out.pow(2).sum().backward()
 
     def test_get_exp_outputs_titan_cg_gemm(self):
+        skip_if_no_h100s()
         torch.manual_seed(42)
         # Matmul dims all need to be divisible by 16 (everything but n_groups)
         n_experts = 2
