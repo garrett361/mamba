@@ -12,7 +12,6 @@ from torch.distributed.tensor import DTensor
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
@@ -23,6 +22,7 @@ from mamba_ssm.modules.moe import (
     _get_counts,
     _RoutedExperts,
 )
+from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.moe_utils._utils import fully_shard_moe
 
 
@@ -428,7 +428,6 @@ class TestModelEP(_TestBase):
 
         # Force models equal
         _copy_params(model, model_ep)
-        fully_shard_moe(model_ep)
         fully_shard(model_ep.lm_head, mesh=ep_mesh)
         fully_shard(model_ep.backbone.embedding, mesh=ep_mesh)
         for block in model_ep.backbone.layers.values():
@@ -499,7 +498,6 @@ class TestModelEP(_TestBase):
 
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
-
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_meta_init(self) -> None:
@@ -508,12 +506,46 @@ class TestModelEP(_TestBase):
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
         )
         with torch.device("meta"):
-            meta_model_ep = MambaLMHeadModel(self.cfg,  ep_mesh=ep_mesh)
+            meta_model_ep = MambaLMHeadModel(self.cfg, ep_mesh=ep_mesh)
 
         init_meta_moe(meta_model_ep, verbose=False)
         torch.manual_seed(42 + self.rank)
         inputs = self.get_input_toks()
         outputs_ep = meta_model_ep(inputs)
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("moe_impl", list(EP_EXPERT_CLASSES))
+    def test_fwd_fully_shard_moe(self, moe_impl: str) -> None:
+        # Some classes have dtype constraints:
+        if "gemm" in moe_impl:
+            self.dtype = torch.bfloat16
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        moe_cfg = deepcopy(self.cfg)
+        moe_cfg.moe_cfg["moe_impl"] = moe_impl
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
+            self.dtype
+        )
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh.size(),
+            world_size=ep_mesh.size(),
+            fsdp_mesh=ep_mesh,
+        )
+
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+        outputs_ep = model_ep(inputs)
+        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+
 
 def compile_breaking_fn(
     x: torch.Tensor,
