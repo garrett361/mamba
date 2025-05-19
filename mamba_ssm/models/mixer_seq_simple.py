@@ -6,7 +6,7 @@ import math
 import os
 from collections import namedtuple
 from functools import partial
-from typing import Optional
+from typing import Any, Optional, Callable
 
 import torch
 import torch.nn as nn
@@ -116,13 +116,17 @@ def _init_weights(
     initializer_range=0.02,  # Now only used for embedding layer.
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
+    verbose: bool=False
 ):
-    # TODO: @goon - MoE weights.
     if isinstance(module, nn.Linear):
         if module.bias is not None:
             if not getattr(module.bias, "_no_reinit", False):
+                if verbose:
+                    print(f"Calling _init_weights on {module=}")
                 nn.init.zeros_(module.bias)
     elif isinstance(module, nn.Embedding):
+        if verbose:
+            print(f"Calling _init_weights on {module=}")
         nn.init.normal_(module.weight, std=initializer_range)
 
     if rescale_prenorm_residual:
@@ -138,6 +142,8 @@ def _init_weights(
                 # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
                 # We need to reinit p since this code could be called multiple times
                 # Having just p *= scale would repeatedly scale it down
+                if verbose:
+                    print(f"Calling _init_weights on {name=}")
                 nn.init.kaiming_uniform_(p, a=math.sqrt(5))
                 with torch.no_grad():
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
@@ -480,17 +486,96 @@ def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
             )
 
 
-def init_meta_moe(model: MambaLMHeadModel):
+def init_meta_moe(
+    model: MambaLMHeadModel,
+    device: Optional[torch.cuda.device] = None,
+    initializer_range: float = 0.02,
+    rescale_prenorm_residual: bool = True,
+    initializer_cfg: Optional[dict[str, Any]] = None,
+    A_init_range=(1, 16),
+    dt_min=0.001,
+    dt_max=0.1,
+    dt_init_floor=1e-4,
+    dt_limit=(0.0, float("inf")),
+    conv_init: Optional[float] = None,
+    verbose: bool = False,
+    final_init_fn: Optional[Callable[[nn.Module], None]] = None,
+):
+    """
+    Move a meta-device moe model to a CUDA device and initialize its parameters.
+    """
     # Move to cuda and initialize.
-    model.to_empty(device=torch.cuda.current_device())
+    model.to_empty(device=device or torch.cuda.current_device())
 
-    # TODO: proper normalization; just normal init for now
-    for p in model.parameters():
-        nn.init.normal_(p)
-    nn.init.normal_(model.backbone.embedding.weight, std=0.02)
+    # First, default init anything that can be default initialized
+    for n, m in model.named_modules():
+        if hasattr(m, "reset_parameters"):
+            if verbose:
+                print(f"Calling reset_parameters on {n=}")
+            m.reset_parameters()
+
+    # Then apply the default mamba_ssm init
+    if verbose:
+        print("Applying default mamba_ssm init")
+    model.apply(
+        partial(
+            _init_weights,
+            n_layer=model.config.n_layer,
+            **(initializer_cfg if initializer_cfg is not None else {}),
+            rescale_prenorm_residual=rescale_prenorm_residual,
+            n_residuals_per_layer=1
+            if model.config.d_intermediate == 0
+            else 2,  # 2 if we have MLP
+            verbose=verbose,
+        )
+    )
+
+    # Need to reinitialize mamba2 params.
+    for name, module in model.named_modules():
+        if isinstance(module, Mamba2):
+            if verbose:
+                print(f"Re-init Mamba2: {name=}")
+            reinit_mamba2(module)
+
+    # Optional custom init at the end.
+    if final_init_fn is not None:
+        final_init_fn(model)
 
 
-def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, int]:
+def reinit_mamba2(
+    mamba2: Mamba2,
+    A_init_range=(1, 16),
+    dt_min=0.001,
+    dt_max=0.1,
+    dt_init_floor=1e-4,
+    conv_init: Optional[float] = None,
+) -> None:
+    with torch.no_grad():
+        if conv_init is not None:
+            nn.init.uniform_(mamba2.conv1d.weight, -conv_init, conv_init)
+
+        # Re-init log dt bias
+        dt_seed = torch.randn_like(mamba2.dt_bias)
+        dt = torch.exp(
+            dt_seed * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        )
+        dt = torch.clamp(dt, min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        mamba2.dt_bias.data = inv_dt
+
+        # Re-init A_log
+        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+        # NOTE: @goon - needs a float32 here?
+        A = mamba2.A_log.uniform_(*A_init_range)
+        A_log = torch.log(A)
+        mamba2.A_log.data = A_log
+
+        # Re-init D
+        nn.init.ones_(mamba2.D)
+
+
+def get_total_exp_and_active_params(model: MambaLMHeadModel) -> tuple[int, int, int]:
     """
     Utility for getting the parameter count from all params, routed experts, and number of active
     params per token.
@@ -498,7 +583,7 @@ def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, in
     total = sum(p.numel() for p in model.parameters())
     exp = 0
     for m in model.modules():
-        if isinstance(m, MoE ):
+        if isinstance(m, MoE):
             exp += sum(p.numel() for p in m.experts.parameters())
             moe_mod = m
     if exp == 0:
@@ -506,5 +591,5 @@ def get_total_exp_and_active_params(model: MambaLMHeadModel)->tuple[int, int, in
 
     non_exp = total - exp
     # Assumption: same active/routed ratio globally.
-    active_exp =  (exp * moe_mod.n_activated_experts) // moe_mod.n_routed_experts
+    active_exp = (exp * moe_mod.n_activated_experts) // moe_mod.n_routed_experts
     return total, exp, non_exp + active_exp
