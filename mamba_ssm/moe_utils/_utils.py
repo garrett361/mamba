@@ -52,7 +52,8 @@ def fully_shard_moe(
                 pass
             elif ep_degree == world_size:
                 # No replication in this case.
-                ignored_params.add(block.mlp.experts.parameters())
+                for p in block.mlp.experts.parameters():
+                    ignored_params.add(p)
             else:
                 # Don't reshard due to comms costs
                 outer_ep_mesh_dim = ep_mesh.mesh_dim_names[0]
