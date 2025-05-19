@@ -546,6 +546,38 @@ class TestModelEP(_TestBase):
         outputs_ep = model_ep(inputs)
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_fwd_fully_shard_moe_with_mp(self) -> None:
+        # Everything in bfloat16
+        dtype = torch.bfloat16
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(dtype)
+        moe_cfg = deepcopy(self.cfg)
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh)
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh.size(),
+            world_size=ep_mesh.size(),
+            fsdp_mesh=ep_mesh,
+            mp_policy=mp_policy,
+        )
+
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        outputs = model(inputs).logits
+        outputs_ep = model_ep(inputs).logits
+        # NOTE: @goon - currently failing on ~0.8% of all inputs.
+        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+
 
 def compile_breaking_fn(
     x: torch.Tensor,
