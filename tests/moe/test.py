@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, init_meta_moe
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     _GROUPED_MM_ALIGNMENT,
@@ -36,14 +36,14 @@ def _copy_params_routed_experts(
         _copy_params_routed_experts(exp_other, exp)
     elif isinstance(exp, _SimpleRoutedExperts):
         with torch.no_grad():
-            fc1_weights = torch.stack([e.fc1.weight.data for e in exp.experts], dim=0)
-            fc2_weights = torch.stack([e.fc2.weight.data for e in exp.experts], dim=0)
-            exp_other.fc1_weights.data.copy_(fc1_weights)
-            exp_other.fc2_weights.data.copy_(fc2_weights)
+            fc1_weight = torch.stack([e.fc1.weight.data for e in exp.experts.values()], dim=0)
+            fc2_weight = torch.stack([e.fc2.weight.data for e in exp.experts.values()], dim=0)
+            exp_other.fc1.weight.data.copy_(fc1_weight)
+            exp_other.fc2.weight.data.copy_(fc2_weight)
     else:
         with torch.no_grad():
-            exp_other.fc1_weights.data.copy_(exp.fc1_weights.data)
-            exp_other.fc2_weights.data.copy_(exp.fc2_weights.data)
+            exp_other.fc1.weight.data.copy_(exp.fc1.weight.data)
+            exp_other.fc2.weight.data.copy_(exp.fc2.weight.data)
 
 
 class _TestBase:
@@ -299,6 +299,14 @@ class TestMoEModel(_TestBase):
         inputs = self.get_input_toks()
         outputs = model(inputs).logits
         assert outputs.shape == inputs.shape + torch.Size([self.vocab_size])
+
+    def test_meta_init(self) -> None:
+        torch.manual_seed(42)
+        with torch.device("meta"):
+            meta_model = MambaLMHeadModel(self.cfg)
+        assert all(p.device == torch.device("meta") for p in meta_model.parameters())
+        init_meta_moe(meta_model, verbose=True)
+        assert all(p.device.type == "cuda" for p in meta_model.parameters())
 
 
 def test_bincount_impl_equiv():
@@ -820,7 +828,6 @@ class TestTitan(_TestBase):
             out_alt_list.append(tok_chunk @ exp_weight.t())
         out_alt = torch.cat(out_alt_list, dim=0)
         torch.testing.assert_close(out, out_alt)
-
 
         # For some reason, out.sum().backward() errors out?
         grad = torch.randn_like(out)
