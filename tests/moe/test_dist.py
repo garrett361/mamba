@@ -11,10 +11,12 @@ from torch.distributed.tensor import DTensor
 
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, init_meta_moe
 from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
+    RoutedExpertsFC1Weights,
+    RoutedExpertsFC2Weights,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPGroupedMM,
     _get_counts,
@@ -43,6 +45,9 @@ def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
         m = model.get_submodule(n)
         if isinstance(m, _RoutedExperts):
             _copy_params_routed_experts(m, m_fsdp)
+        elif isinstance(m, (RoutedExpertsFC1Weights, RoutedExpertsFC2Weights)):
+            # Already accounted for by the _RoutedExperts path.
+            continue
         else:
             with torch.no_grad():
                 for p_dest, p_src in zip(
@@ -79,6 +84,9 @@ def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
             m = model.get_submodule(n)
             if isinstance(m, _RoutedExperts):
                 _test_grads_routed_experts(m, m_fsdp, tol)
+            elif isinstance(m, (RoutedExpertsFC1Weights, RoutedExpertsFC2Weights)):
+                # Already accounted for by the _RoutedExperts path.
+                continue
             else:
                 for (n, p), (_, p_fsdp) in zip(
                     m.named_parameters(recurse=False),
@@ -489,6 +497,21 @@ class TestModelEP(_TestBase):
 
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_meta_init(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        with torch.device("meta"):
+            meta_model_ep = MambaLMHeadModel(self.cfg,  ep_mesh=ep_mesh)
+
+        init_meta_moe(meta_model_ep, verbose=False)
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        outputs_ep = meta_model_ep(inputs)
 
 def compile_breaking_fn(
     x: torch.Tensor,
