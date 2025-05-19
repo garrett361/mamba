@@ -264,10 +264,12 @@ def _get_single_exp_output(
     """
     Compute the outputs from a single expert.
     """
-    y = F.linear(x, fc1_weights)
+    # NOTE: @goon - When the routed experts are ignored in fully_shard, their dtype doesn't get
+    # converted with the fsdp mp_policy, so we ensure conversion here.
+    y = F.linear(x, fc1_weights.to(x))
     y, gate = y.chunk(2, dim=-1)
     y = y * activation(gate)
-    y = F.linear(y, fc2_weights)
+    y = F.linear(y, fc2_weights.to(y))
     return y
 
 
@@ -281,13 +283,15 @@ def _get_exp_outputs_grouped_mm(
     """
     Compute the outputs from all experts using torch._grouped_mm
     """
+    # NOTE: @goon - When the routed experts are ignored in fully_shard, their dtype doesn't get
+    # converted with the fsdp mp_policy, so we ensure conversion here.
     y = torch._grouped_mm(
-        x, fc1_weights.transpose(-2, -1), offs=offsets, out_dtype=x.dtype
+        x, fc1_weights.to(x).transpose(-2, -1), offs=offsets, out_dtype=x.dtype
     )
     y, gate = y.chunk(2, dim=-1)
     y = y * activation(gate)
     y = torch._grouped_mm(
-        y, fc2_weights.transpose(-2, -1), offs=offsets, out_dtype=x.dtype
+        y, fc2_weights.to(y).transpose(-2, -1), offs=offsets, out_dtype=x.dtype
     )
     return y
 
