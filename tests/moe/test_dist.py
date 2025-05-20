@@ -445,6 +445,46 @@ class TestModelEP(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
+    def test_clip_grad(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        moe_cfg = deepcopy(self.cfg)
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
+            self.dtype
+        )
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh.size(),
+            world_size=ep_mesh.size(),
+            fsdp_mesh=ep_mesh,
+        )
+
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+
+        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+        outputs_ep = model_ep(inputs_ep)
+
+        # Grads should match with an avg-over-batches type loss. Sum over other dims to make grads
+        # less small.
+        mean_loss_fn(outputs.logits).backward()
+        mean_loss_fn(outputs_ep.logits).backward()
+
+        # No need for special clipping until PP is used.
+        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        norm_ep = nn.utils.clip_grad_norm_(model_ep.parameters(), 1.0).full_tensor()
+        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
+
+
+class TestMoEUtils(_TestBase):
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
     def test_meta_init(self) -> None:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
@@ -458,8 +498,6 @@ class TestModelEP(_TestBase):
         inputs = self.get_input_toks()
         outputs_ep = meta_model_ep(inputs)
 
-
-class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe(self) -> None:
@@ -521,6 +559,44 @@ class TestMoEUtils(_TestBase):
         mean_loss_fn(outputs_ep.logits).backward()
 
         _test_grads(model, model_ep, tol=self.tol)
+
+    @pytest.mark.world_size(8)
+    @pytest.mark.gpu
+    def test_fwd_fully_shard_moe_replicated(self) -> None:
+        torch.manual_seed(42)
+        # The EP mesh is
+
+        ep_mesh = init_device_mesh(
+            "cuda",
+            (2, self.world_size // 2),
+            mesh_dim_names=("outer", "inner"),
+        )
+        fsdp_mesh = init_device_mesh(
+            "cuda",
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        moe_cfg = deepcopy(self.cfg)
+        model_ep = MambaLMHeadModel(
+            moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh["inner"]
+        ).to(self.dtype)
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh["inner"].size(),
+            world_size=self.world_size,
+            fsdp_mesh=fsdp_mesh,
+        )
+
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+        outputs_ep = model_ep(inputs)
+        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -603,13 +679,13 @@ class TestMoEUtils(_TestBase):
 
         # Check outputs agree pre- and post-taking another step
         reloaded_outputs = model_ep(inputs).logits
-        assert torch.allclose(post_step_outputs, reloaded_outputs)
+        torch.testing.assert_close(post_step_outputs, reloaded_outputs)
 
         mean_loss_fn(reloaded_outputs).backward()
         optim.step()
         optim.zero_grad()
         post_reload_step_outputs = model_ep(inputs).logits
-        assert torch.allclose(post_reload_step_outputs, post_second_step_outputs)
+        torch.testing.assert_close(post_reload_step_outputs, post_second_step_outputs)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -686,63 +762,32 @@ class TestMoEUtils(_TestBase):
 
             # Check outputs agree pre- and post-taking another step
             reloaded_outputs = model_ep(inputs).logits
-            assert torch.allclose(post_step_outputs, reloaded_outputs)
+            torch.testing.assert_close(
+                post_step_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
+            )
 
             # Re-run the backwards against the same data used originally. Requires grad-acc
             # averaging for correctness.
 
-            (mean_loss_fn(reloaded_outputs)/2).backward()
+            (mean_loss_fn(reloaded_outputs) / 2).backward()
 
             # And run on the data that the missing ranks previously ran on:
             torch.manual_seed(42 + self.rank + self.world_size // 2)
-            (mean_loss_fn(model_ep(self.get_input_toks()).logits)/2).backward()
+            (mean_loss_fn(model_ep(self.get_input_toks()).logits) / 2).backward()
 
             optim.step()
             optim.zero_grad()
 
             # Post-step check:
             post_reload_step_outputs = model_ep(inputs).logits
-            assert torch.allclose(post_reload_step_outputs, post_second_step_outputs, atol=self.tol, rtol=self.tol)
+            torch.testing.assert_close(
+                post_reload_step_outputs,
+                post_second_step_outputs,
+                atol=self.tol,
+                rtol=self.tol,
+            )
 
         dist.barrier()
-
-    @pytest.mark.world_size(4)
-    @pytest.mark.gpu
-    def test_clip_grad(self) -> None:
-        torch.manual_seed(42)
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
-        moe_cfg = deepcopy(self.cfg)
-        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
-            self.dtype
-        )
-
-        # Force models equal
-        _copy_params(model, model_ep)
-        fully_shard_moe(
-            model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
-            fsdp_mesh=ep_mesh,
-        )
-
-        inputs = self.get_input_toks()
-        outputs = model(inputs)
-
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep)
-
-        # Grads should match with an avg-over-batches type loss. Sum over other dims to make grads
-        # less small.
-        mean_loss_fn(outputs.logits).backward()
-        mean_loss_fn(outputs_ep.logits).backward()
-
-        # No need for special clipping until PP is used.
-        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_ep = nn.utils.clip_grad_norm_(model_ep.parameters(), 1.0).full_tensor()
-        torch.testing.assert_close(norm, norm_ep)
 
 
 def compile_breaking_fn(

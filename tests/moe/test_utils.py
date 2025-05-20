@@ -35,7 +35,7 @@ def skip_moe_impl_if_no_h100s(moe_impl: str) -> None:
 
 def mean_loss_fn(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Dummy loss function which does a mean over the batch dim and sums over all other dims, so that
-    the grads aren't too small.
+    Dummy loss function which does a mean over the batch dim and tries to make the grads not too big
+    or small.
     """
-    return tensor.sum(dim=tuple(range(1, tensor.ndim))).mean()
+    return tensor.pow(2).mean()
