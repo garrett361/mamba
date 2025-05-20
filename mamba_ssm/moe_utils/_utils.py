@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
 from mamba_ssm.modules.mamba2 import Mamba2
@@ -115,6 +116,7 @@ def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
             )
 
 
+@torch.no_grad()
 def init_meta_moe(
     model: MambaLMHeadModel,
     device: Optional[torch.cuda.device] = None,
@@ -125,7 +127,6 @@ def init_meta_moe(
     dt_min=0.001,
     dt_max=0.1,
     dt_init_floor=1e-4,
-    dt_limit=(0.0, float("inf")),
     conv_init: Optional[float] = None,
     verbose: bool = False,
     final_init_fn: Optional[Callable[[nn.Module], None]] = None,
@@ -150,6 +151,7 @@ def init_meta_moe(
         partial(
             _init_weights,
             n_layer=model.config.n_layer,
+            initializer_range=initializer_range,
             **(initializer_cfg if initializer_cfg is not None else {}),
             rescale_prenorm_residual=rescale_prenorm_residual,
             n_residuals_per_layer=1
@@ -164,13 +166,21 @@ def init_meta_moe(
         if isinstance(module, Mamba2):
             if verbose:
                 print(f"Re-init Mamba2: {name=}")
-            _reinit_mamba2(module)
+            _reinit_mamba2(
+                module,
+                A_init_range=A_init_range,
+                dt_min=dt_min,
+                dt_max=dt_max,
+                dt_init_floor=dt_init_floor,
+                conv_init=conv_init,
+            )
 
     # Optional custom init at the end.
     if final_init_fn is not None:
         final_init_fn(model)
 
 
+@torch.no_grad()
 def _reinit_mamba2(
     mamba2: Mamba2,
     A_init_range=(1, 16),
@@ -179,29 +189,26 @@ def _reinit_mamba2(
     dt_init_floor=1e-4,
     conv_init: Optional[float] = None,
 ) -> None:
-    with torch.no_grad():
-        if conv_init is not None:
-            nn.init.uniform_(mamba2.conv1d.weight, -conv_init, conv_init)
+    if conv_init is not None:
+        nn.init.uniform_(mamba2.conv1d.weight, -conv_init, conv_init)
 
-        # Re-init log dt bias
-        dt_seed = torch.randn_like(mamba2.dt_bias)
-        dt = torch.exp(
-            dt_seed * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
-        )
-        dt = torch.clamp(dt, min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        mamba2.dt_bias.data = inv_dt
+    # Re-init log dt bias
+    dt_seed = torch.randn_like(mamba2.dt_bias)
+    dt = torch.exp(dt_seed * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+    dt = torch.clamp(dt, min=dt_init_floor)
+    # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+    inv_dt = dt + torch.log(-torch.expm1(-dt))
+    mamba2.dt_bias.data = inv_dt
 
-        # Re-init A_log
-        assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        # NOTE: @goon - needs a float32 here?
-        A = mamba2.A_log.uniform_(*A_init_range)
-        A_log = torch.log(A)
-        mamba2.A_log.data = A_log
+    # Re-init A_log
+    assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
+    # NOTE: @goon - needs a float32 here?
+    A = mamba2.A_log.uniform_(*A_init_range)
+    A_log = torch.log(A)
+    mamba2.A_log.data = A_log
 
-        # Re-init D
-        nn.init.ones_(mamba2.D)
+    # Re-init D
+    nn.init.ones_(mamba2.D)
 
 
 def get_total_exp_and_active_params(model: MambaLMHeadModel) -> tuple[int, int, int]:
