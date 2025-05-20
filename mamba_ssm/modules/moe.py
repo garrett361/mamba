@@ -60,6 +60,7 @@ class Gate(nn.Module):
             if self.in_features == 7168
             else None
         )
+        self.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.LongTensor]:
         """
@@ -111,6 +112,10 @@ class Gate(nn.Module):
             f" n_limited_groups={self.n_limited_groups},"
             f" score_func={self.score_func})"
         )
+
+    def reset_parameters(self)->None:
+        nn.init.zeros_(self.bias)
+        # self.lin: nn.Linear can reset its own parameters already. Intentionally not resetting.
 
 
 class MoE(nn.Module):
