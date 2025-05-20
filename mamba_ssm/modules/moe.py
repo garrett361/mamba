@@ -114,7 +114,8 @@ class Gate(nn.Module):
         )
 
     def reset_parameters(self)->None:
-        nn.init.zeros_(self.bias)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
         # self.lin: nn.Linear can reset its own parameters already. Intentionally not resetting.
 
 
