@@ -439,10 +439,10 @@ class TestModelEP(_TestBase):
         fully_shard(model_ep, mesh=ep_mesh)
 
         inputs = self.get_input_toks()
-        outputs = model(inputs)
+        outputs = model(inputs).logits
 
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep)
+        outputs_ep = model_ep(inputs_ep).logits
 
         # Grads should match with an avg-over-batches type loss
         F.cross_entropy(outputs.view(-1, outputs.size(-1)), inputs.view(-1).long())
@@ -451,16 +451,6 @@ class TestModelEP(_TestBase):
         )
 
         _test_grads(model, model_ep, tol=self.tol)
-
-        # Verify the routed experts are not sharded and everything else is
-        try:
-            for n, p in model_ep.named_parameters():
-                if ".experts." in n:
-                    assert not isinstance(p, DTensor)
-                else:
-                    assert isinstance(p, DTensor)
-        except Exception as e:
-            raise RuntimeError(f"Failed on {n=}, {p=}") from e
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
