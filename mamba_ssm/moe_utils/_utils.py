@@ -20,8 +20,6 @@ from mamba_ssm.modules.moe import MoE
 
 def fully_shard_moe(
     model: MambaLMHeadModel,
-    ep_degree: int,
-    world_size: int,
     fsdp_mesh: DeviceMesh,
     ep_mesh: Optional[DeviceMesh] = None,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
@@ -33,7 +31,6 @@ def fully_shard_moe(
     # TODO: @goon - hsdp?
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
-    assert fsdp_mesh.ndim == 1, f"{fsdp_mesh.dim=}"
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(
         model.lm_head,
@@ -43,21 +40,23 @@ def fully_shard_moe(
     )
     for idx, block in model.backbone.layers.items():
         # Cases:
-        # 1. ep_degree = 1: full replication, fully shard with the fsdp_mesh
-        # 2. ep_degree = world_size: no expert replication at all. Ignore experts in fully_shard
-        # 3. world_size > ep_degree > world_size: world_size // ep_degree expert replicas.
+        # 1. ep_mesh is None: full replication, fully shard with the fsdp_mesh
+        # 2. ep_mesh.ndim == 1: no expert replication at all. Ignore experts in fully_shard
+        # 3. ep_mesh.ndim == 2: DP replication over outer dim, EP over inner dim
 
         # The ignored_params arg requires torch nightly (> 2.6.0)
         ignored_params = set()
         if isinstance(block.mlp, MoE):
-            if ep_degree == 1:
+            if ep_mesh is None:
                 pass
-            elif ep_degree == world_size:
+            elif ep_mesh.ndim == 1:
+                assert ep_mesh.ndim == 1, f"{ep_mesh.dim=}"
                 # No replication in this case.
                 for p in block.mlp.experts.parameters():
                     ignored_params.add(p)
-            else:
+            elif ep_mesh.ndim == 2:
                 # Don't reshard due to comms costs
+                assert ep_mesh.ndim == 2, f"{ep_mesh.dim=}"
                 outer_ep_mesh_dim = ep_mesh.mesh_dim_names[0]
                 fully_shard(
                     block.mlp.experts,
@@ -66,6 +65,10 @@ def fully_shard_moe(
                     reshard_after_forward=False,
                 )
                 block.mlp.experts.set_reshard_after_backward(False)
+            else:
+                raise ValueError(
+                    f"Expected ep_mesh to be None or a 1- or 2-D DeviceMesh, got {ep_mesh=}"
+                )
         is_not_last_block = int(idx) < len(model.backbone.layers) - 1
         fully_shard(
             block,

@@ -462,9 +462,8 @@ class TestModelEP(_TestBase):
         _copy_params(model, model_ep)
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
             fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
         )
 
         inputs = self.get_input_toks()
@@ -517,9 +516,8 @@ class TestMoEUtils(_TestBase):
         _copy_params(model, model_ep)
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
             fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
         )
 
         torch.manual_seed(42 + self.rank)
@@ -545,9 +543,8 @@ class TestMoEUtils(_TestBase):
         _copy_params(model, model_ep)
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
             fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
         )
 
         inputs = self.get_input_toks()
@@ -566,8 +563,6 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe_replicated(self) -> None:
         torch.manual_seed(42)
-        # The EP mesh is
-
         ep_mesh = init_device_mesh(
             "cuda",
             (2, self.world_size // 2),
@@ -589,9 +584,43 @@ class TestMoEUtils(_TestBase):
         _copy_params(model, model_ep)
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh["inner"].size(),
-            world_size=self.world_size,
             fsdp_mesh=fsdp_mesh,
+            ep_mesh=ep_mesh,
+        )
+
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+        outputs_ep = model_ep(inputs)
+        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+
+    @pytest.mark.world_size(8)
+    @pytest.mark.gpu
+    def test_fwd_fully_shard_moe_hsdp(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            "cuda",
+            (self.world_size,),
+            mesh_dim_names=("ep",),
+        )
+        hsdp_mesh = init_device_mesh(
+            "cuda",
+            (2, self.world_size // 2),
+            mesh_dim_names=("outer", "inner"),
+        )
+
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        moe_cfg = deepcopy(self.cfg)
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
+            self.dtype
+        )
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        fully_shard_moe(
+            model_ep,
+            fsdp_mesh=hsdp_mesh,
+            ep_mesh=ep_mesh,
         )
 
         torch.manual_seed(42 + self.rank)
@@ -619,9 +648,8 @@ class TestMoEUtils(_TestBase):
 
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
             fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
             mp_policy=mp_policy,
         )
 
@@ -645,9 +673,8 @@ class TestMoEUtils(_TestBase):
 
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
             fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
         )
         # Large LR to create big changes:
         optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
@@ -707,9 +734,8 @@ class TestMoEUtils(_TestBase):
 
         fully_shard_moe(
             model_ep,
-            ep_degree=ep_mesh.size(),
-            world_size=ep_mesh.size(),
             fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
         )
         # Large LR to create big changes:
         lr = 1e-1
@@ -748,9 +774,8 @@ class TestMoEUtils(_TestBase):
 
             fully_shard_moe(
                 model_ep,
-                ep_degree=ep_mesh.size(),
-                world_size=ep_mesh.size(),
                 fsdp_mesh=ep_mesh,
+                ep_mesh=ep_mesh,
             )
 
             optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
