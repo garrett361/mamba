@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -12,7 +12,6 @@ from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_di
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torch.distributed.tensor import DTensor
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
 from mamba_ssm.modules.mamba2 import Mamba2

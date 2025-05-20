@@ -19,9 +19,7 @@ from mamba_ssm.modules.moe import (
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPGroupedMM,
-    RoutedExpertsWeights,
     _get_counts,
-    _RoutedExperts,
 )
 from mamba_ssm.moe_utils import MoEState, fully_shard_moe, init_meta_moe
 from tests.moe.test_utils import skip_moe_impl_if_no_h100s
@@ -644,7 +642,10 @@ class TestMoEUtils(_TestBase):
         outputs.logits.pow(2).mean().backward()
         outputs_ep.logits.pow(2).mean().backward()
 
-        _test_grads(model, model_ep, tol=self.tol)
+        # No need for special clipping until PP is used.
+        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        norm_ep = nn.utils.clip_grad_norm_(model_ep.parameters(), 1.0).full_tensor()
+        torch.testing.assert_close(norm, norm_ep)
 
 
 def compile_breaking_fn(
