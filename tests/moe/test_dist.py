@@ -42,52 +42,25 @@ def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
                 p_dest.data.copy_(p_src.data)
 
 
-def _test_grads_routed_experts(
-    experts: _RoutedExperts, experts_ep: _RoutedExperts, tol: float
-) -> None:
-    for p, p_ep in zip(
-        (experts.fc1.weight, experts.fc2.weight),
-        (experts_ep.fc1.weight, experts_ep.fc2.weight),
-    ):
-        assert not isinstance(p, DTensor)
-        assert isinstance(p_ep, DTensor)
-        grad = p.grad
-        grad_ep = p_ep.grad
-        assert isinstance(grad_ep, DTensor)
-        grad_ep = grad_ep.full_tensor()
-        torch.testing.assert_close(
-            grad,
-            grad_ep,
-            atol=tol,
-            rtol=tol,
-        )
-
-
 def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
     with torch.no_grad():
         for n, m_fsdp in model_fsdp.named_modules():
             m = model.get_submodule(n)
-            if isinstance(m, _RoutedExperts):
-                _test_grads_routed_experts(m, m_fsdp, tol)
-            elif isinstance(m, RoutedExpertsWeights):
-                # Already accounted for by the _RoutedExperts path.
-                continue
-            else:
-                for (n, p), (_, p_fsdp) in zip(
-                    m.named_parameters(recurse=False),
-                    m_fsdp.named_parameters(recurse=False),
-                ):
-                    if p.grad is None:
-                        assert p_fsdp.grad is None
-                        return
-                    grad = p.grad
-                    grad_fsdp = p_fsdp.grad
-                    if isinstance(grad_fsdp, DTensor):
-                        grad_fsdp = grad_fsdp.full_tensor()
-                    try:
-                        torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
-                    except Exception as e:
-                        raise RuntimeError(f"Failed on {n=}") from e
+            for (n, p), (_, p_fsdp) in zip(
+                m.named_parameters(recurse=False),
+                m_fsdp.named_parameters(recurse=False),
+            ):
+                if p.grad is None:
+                    assert p_fsdp.grad is None
+                    return
+                grad = p.grad
+                grad_fsdp = p_fsdp.grad
+                if isinstance(grad_fsdp, DTensor):
+                    grad_fsdp = grad_fsdp.full_tensor()
+                try:
+                    torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
+                except Exception as e:
+                    raise RuntimeError(f"Failed on {n=}") from e
 
 
 class _TestBase(DTest):
