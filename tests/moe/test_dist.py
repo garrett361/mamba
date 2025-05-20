@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
@@ -22,7 +23,7 @@ from mamba_ssm.modules.moe import (
     _get_counts,
 )
 from mamba_ssm.moe_utils import MoEState, fully_shard_moe, init_meta_moe
-from tests.moe.test_utils import skip_moe_impl_if_no_h100s
+from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
 
 
 def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
@@ -230,8 +231,8 @@ class TestRoutedExperts(_TestBase):
         outputs_ep = model_ep(inputs_ep, weights_ep, indices_ep)
 
         # Note: important to use an avg-type loss here.
-        outputs.pow(2).mean().backward()
-        outputs_ep.pow(2).mean().backward()
+        mean_loss_fn(outputs).backward()
+        mean_loss_fn(outputs_ep).backward()
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -316,8 +317,8 @@ class TestMoEEP(_TestBase):
         outputs_ep = model_ep(inputs_ep)
 
         # Note: important to use an avg-type loss here.
-        outputs.pow(2).mean().backward()
-        outputs_ep.pow(2).mean().backward()
+        mean_loss_fn(outputs).backward()
+        mean_loss_fn(outputs_ep).backward()
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -516,8 +517,8 @@ class TestMoEUtils(_TestBase):
         outputs_ep = model_ep(inputs_ep)
 
         # Grads should match with an avg-over-batches type loss
-        outputs.logits.pow(2).mean().backward()
-        outputs_ep.logits.pow(2).mean().backward()
+        mean_loss_fn(outputs.logits).backward()
+        mean_loss_fn(outputs_ep.logits).backward()
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -575,7 +576,7 @@ class TestMoEUtils(_TestBase):
         torch.manual_seed(42 + self.rank)
         inputs = self.get_input_toks()
         pre_step_outputs = model_ep(inputs).logits
-        pre_step_outputs.sum().backward()
+        mean_loss_fn(pre_step_outputs).backward()
         optim.step()
         optim.zero_grad()
         post_step_outputs = model_ep(inputs).logits
@@ -587,7 +588,7 @@ class TestMoEUtils(_TestBase):
         dcp.save(state_dict, checkpoint_id="/tmp/dcp")
 
         # Corrupt the state by taking another step
-        post_step_outputs.sum().backward()
+        mean_loss_fn(post_step_outputs).backward()
         optim.step()
         optim.zero_grad()
 
@@ -604,11 +605,106 @@ class TestMoEUtils(_TestBase):
         reloaded_outputs = model_ep(inputs).logits
         assert torch.allclose(post_step_outputs, reloaded_outputs)
 
-        reloaded_outputs.sum().backward()
+        mean_loss_fn(reloaded_outputs).backward()
         optim.step()
         optim.zero_grad()
         post_reload_step_outputs = model_ep(inputs).logits
         assert torch.allclose(post_reload_step_outputs, post_second_step_outputs)
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_dcp_save_load_reconfigured(self) -> None:
+        """
+        Test reloading in a different sharded cfg.
+        """
+        # Run on all available ranks initially:
+        seed = 42
+        torch.manual_seed(seed)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model_ep = MambaLMHeadModel(
+            self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
+        ).to(self.dtype)
+
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh.size(),
+            world_size=ep_mesh.size(),
+            fsdp_mesh=ep_mesh,
+        )
+        # Large LR to create big changes:
+        lr = 1e-1
+        optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        pre_step_outputs = model_ep(inputs).logits
+        mean_loss_fn(pre_step_outputs).backward()
+        optim.step()
+        optim.zero_grad()
+        post_step_outputs = model_ep(inputs).logits
+        # Sanity check that the model changed:
+        assert not torch.allclose(pre_step_outputs, post_step_outputs)
+
+        # Save state
+        state_dict = {"moe": MoEState(model_ep, optim)}
+        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+
+        # Take another step and save the outputs
+        mean_loss_fn(post_step_outputs).backward()
+        optim.step()
+        optim.zero_grad()
+        post_second_step_outputs = model_ep(inputs).logits
+        # Sanity check:
+        assert not torch.allclose(post_step_outputs, post_second_step_outputs)
+
+        # Try to reload on half the ranks.
+        if self.rank < self.world_size // 2:
+            torch.manual_seed(seed + 1)
+            ep_mesh = init_device_mesh(
+                self.device_type, (self.world_size // 2,), mesh_dim_names=("ep",)
+            )
+            model_ep = MambaLMHeadModel(
+                self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
+            ).to(self.dtype)
+
+            fully_shard_moe(
+                model_ep,
+                ep_degree=ep_mesh.size(),
+                world_size=ep_mesh.size(),
+                fsdp_mesh=ep_mesh,
+            )
+
+            optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
+            # Reload and overwrite the corrupted state
+            reconfig_state_dict = {"moe": MoEState(model_ep, optim)}
+            dcp.load(
+                reconfig_state_dict,
+                checkpoint_id="/tmp/dcp",
+                process_group=ep_mesh.get_group(),  # NOTE: @goon - hangs, if not specified
+            )
+
+            # Check outputs agree pre- and post-taking another step
+            reloaded_outputs = model_ep(inputs).logits
+            assert torch.allclose(post_step_outputs, reloaded_outputs)
+
+            # Re-run the backwards against the same data used originally. Requires grad-acc
+            # averaging for correctness.
+
+            (mean_loss_fn(reloaded_outputs)/2).backward()
+
+            # And run on the data that the missing ranks previously ran on:
+            torch.manual_seed(42 + self.rank + self.world_size // 2)
+            (mean_loss_fn(model_ep(self.get_input_toks()).logits)/2).backward()
+
+            optim.step()
+            optim.zero_grad()
+
+            # Post-step check:
+            post_reload_step_outputs = model_ep(inputs).logits
+            assert torch.allclose(post_reload_step_outputs, post_second_step_outputs, atol=self.tol, rtol=self.tol)
+
+        dist.barrier()
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -638,9 +734,10 @@ class TestMoEUtils(_TestBase):
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep)
 
-        # Grads should match with an avg-over-batches type loss
-        outputs.logits.pow(2).mean().backward()
-        outputs_ep.logits.pow(2).mean().backward()
+        # Grads should match with an avg-over-batches type loss. Sum over other dims to make grads
+        # less small.
+        mean_loss_fn(outputs.logits).backward()
+        mean_loss_fn(outputs_ep.logits).backward()
 
         # No need for special clipping until PP is used.
         norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
