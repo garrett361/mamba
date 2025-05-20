@@ -8,6 +8,8 @@ from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
@@ -220,3 +222,23 @@ def get_total_exp_and_active_params(model: MambaLMHeadModel) -> tuple[int, int, 
     # Assumption: same active/routed ratio globally.
     active_exp = (exp * moe_mod.n_activated_experts) // moe_mod.n_routed_experts
     return total, exp, non_exp + active_exp
+
+
+class MoEState(Stateful):
+    def __init__(self, model, optimizer: torch.optim.Optimizer):
+        self.model = model
+        self.optimizer = optimizer
+
+    def state_dict(self):
+        model_state_dict, optimizer_state_dict = get_state_dict(
+            self.model, self.optimizer
+        )
+        return {"model": model_state_dict, "optim": optimizer_state_dict}
+
+    def load_state_dict(self, state_dict):
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optim"],
+        )
