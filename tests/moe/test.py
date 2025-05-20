@@ -27,7 +27,7 @@ from mamba_ssm.modules.moe import (
 )
 from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
-from tests.moe.test_utils import skip_if_no_h100s, skip_moe_impl_if_no_h100s
+from tests.moe.test_utils import skip_if_no_h100s, skip_moe_impl_if_no_h100s, mean_loss_fn
 
 
 def _copy_params_routed_experts(
@@ -252,7 +252,7 @@ class TestRoutedExperts(_TestBase):
         torch.testing.assert_close(out_other, out, atol=1e-2, rtol=1e-2)
 
         # Just test that backwards doesn't error. TODO: @goon - correctness tests.
-        out_other.pow(2).sum().backward()
+        mean_loss_fn(out_other).backward()
 
 
 class TestMoE(_TestBase):

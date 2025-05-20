@@ -15,6 +15,7 @@ H100_CLASSES = (
     RoutedExpertsTorchEPGroupedMMTriton,
 )
 
+
 def has_cuda_capability(major: int, minor: int) -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
         major,
@@ -22,12 +23,19 @@ def has_cuda_capability(major: int, minor: int) -> bool:
     )
 
 
-def skip_if_no_h100s()->None:
+def skip_if_no_h100s() -> None:
     if not has_cuda_capability(9, 0):
         pytest.skip("Requires H100s")
 
-def skip_moe_impl_if_no_h100s(moe_impl: str)->None:
+
+def skip_moe_impl_if_no_h100s(moe_impl: str) -> None:
     if moe_impl in H100_CLASSES:
         skip_if_no_h100s()
 
 
+def mean_loss_fn(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Dummy loss function which does a mean over the batch dim and sums over all other dims, so that
+    the grads aren't too small.
+    """
+    return tensor.sum(dim=tuple(range(1, tensor.ndim))).mean()
