@@ -15,7 +15,6 @@ H100_CLASSES = (
     RoutedExpertsTorchEPGroupedMMTriton,
 )
 
-
 def has_cuda_capability(major: int, minor: int) -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
         major,
