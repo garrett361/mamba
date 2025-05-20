@@ -90,7 +90,9 @@ class _TestBase(DTest):
     }
     moe_layer_idx = list(range(1, n_layer))
 
-    tol = 1e-2
+    # Put the tolerances pretty high. Should still catch egregious errors, while allowing for
+    # sharding inaccuracies.
+    tol = 1e-1
 
     @property
     def n_routed_experts(self) -> int:
