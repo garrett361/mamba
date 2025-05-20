@@ -27,36 +27,19 @@ from mamba_ssm.moe_utils import MoEState, fully_shard_moe, init_meta_moe
 from tests.moe.test_utils import skip_moe_impl_if_no_h100s
 
 
-def _copy_params_routed_experts(
-    experts: _RoutedExperts, experts_ep: _RoutedExperts
-) -> None:
-    with torch.no_grad():
-        experts_ep.fc1.weight.data.to_local().copy_(
-            experts.fc1.weight.data[
-                experts_ep.experts_start_idx : experts_ep.experts_end_idx
-            ]
-        )
-        experts_ep.fc2.weight.data.to_local().copy_(
-            experts.fc2.weight.data[
-                experts_ep.experts_start_idx : experts_ep.experts_end_idx
-            ]
-        )
-
-
 def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
+    """
+    Copy prams from the sharded model to the local model.
+    """
     for n, m_fsdp in model_fsdp.named_modules():
         m = model.get_submodule(n)
-        if isinstance(m, _RoutedExperts):
-            _copy_params_routed_experts(m, m_fsdp)
-        elif isinstance(m, RoutedExpertsWeights):
-            # Already accounted for by the _RoutedExperts path.
-            continue
-        else:
-            with torch.no_grad():
-                for p_dest, p_src in zip(
-                    m_fsdp.parameters(recurse=False), m.parameters(recurse=False)
-                ):
-                    p_dest.data.copy_(p_src.data)
+        with torch.no_grad():
+            for p_dest, p_src in zip(
+                m.parameters(recurse=False), m_fsdp.parameters(recurse=False)
+            ):
+                if isinstance(p_src, DTensor):
+                    p_src = p_src.full_tensor()
+                p_dest.data.copy_(p_src.data)
 
 
 def _test_grads_routed_experts(
