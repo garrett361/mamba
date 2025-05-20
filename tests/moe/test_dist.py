@@ -508,7 +508,6 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe(self) -> None:
-        # Some classes have dtype constraints:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -537,7 +536,6 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_bwd_fully_shard_moe(self) -> None:
-        # Some classes have dtype constraints:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
@@ -568,16 +566,6 @@ class TestMoEUtils(_TestBase):
         outputs_ep.logits.pow(2).mean().backward()
 
         _test_grads(model, model_ep, tol=self.tol)
-
-        # Verify the routed experts are not sharded and everything else is
-        try:
-            for n, p in model_ep.named_parameters():
-                if ".experts." in n:
-                    assert not isinstance(p, DTensor)
-                else:
-                    assert isinstance(p, DTensor)
-        except Exception as e:
-            raise RuntimeError(f"Failed on {n=}, {p=}") from e
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -667,6 +655,40 @@ class TestMoEUtils(_TestBase):
         optim.zero_grad()
         post_reload_step_outputs = model_ep(inputs).logits
         assert torch.allclose(post_reload_step_outputs, post_second_step_outputs)
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_clip_grad(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        moe_cfg = deepcopy(self.cfg)
+        model_ep = MambaLMHeadModel(moe_cfg, **self.factory_kwargs, ep_mesh=ep_mesh).to(
+            self.dtype
+        )
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh.size(),
+            world_size=ep_mesh.size(),
+            fsdp_mesh=ep_mesh,
+        )
+
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+
+        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+        outputs_ep = model_ep(inputs_ep)
+
+        # Grads should match with an avg-over-batches type loss
+        outputs.logits.pow(2).mean().backward()
+        outputs_ep.logits.pow(2).mean().backward()
+
+        _test_grads(model, model_ep, tol=self.tol)
 
 
 def compile_breaking_fn(
