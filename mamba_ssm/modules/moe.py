@@ -6,7 +6,7 @@ import torch
 import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor, Shard
 from torch.profiler import record_function
 
 from mamba_ssm.modules.mlp import GatedMLP
@@ -319,6 +319,12 @@ def _get_exp_outputs_titan_cg_gemm(
         cg_grouped_gemm,
     )
 
+    # Only intended to operate on locally available shards for EP:
+    if isinstance(fc1_weights, DTensor):
+        fc1_weights = fc1_weights.to_local()
+    if isinstance(fc2_weights, DTensor):
+        fc2_weights = fc2_weights.to_local()
+
     y = cg_grouped_gemm(
         x, fc1_weights, expert_indices=expert_indices, group_size_m=group_size_m
     )
@@ -351,63 +357,55 @@ def _get_local_expert_idxs(
     return local_expert_idxs
 
 
-class RoutedExpertsFC1Weights(nn.Module):
+class RoutedExpertsWeights(nn.Module):
     """
-    Container for routed expert FC1 weight. Convenient for aligning FQN's and ensuring the
-    _RoutedExperts weights are initalized by _init_weights.
-    """
-
-    def __init__(
-        self,
-        n_local_experts: int,
-        d_intermediate: int,
-        in_features: int,
-        device=None,
-        dtype=None,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.randn(
-                n_local_experts,
-                2 * d_intermediate,
-                in_features,
-                device=device,
-                dtype=dtype,
-            )
-        )
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-
-
-class RoutedExpertsFC2Weights(nn.Module):
-    """
-    Container for routed expert FC2 weight. Convenient for aligning FQN's and ensuring the
-    _RoutedExperts weights are initalized by _init_weights.
+    Container for routed expert weights. Convenient for aligning FQN's with other mamba_ssm
+    conventions (thereby ensuring these weight are initalized by _init_weights.) and handling EP via
+    DTensor.
     """
 
     def __init__(
         self,
-        n_local_experts: int,
-        d_intermediate: int,
+        n_routed_experts: int,
+        out_features: int,
         in_features: int,
+        ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(
-                n_local_experts,
+        if ep_mesh is None:
+            data = torch.empty(
+                n_routed_experts, out_features, in_features, device=device, dtype=dtype
+            )
+        else:
+            data = torch.empty(
+                n_routed_experts // ep_mesh.size(),
+                out_features,
                 in_features,
-                d_intermediate,
                 device=device,
                 dtype=dtype,
             )
-        )
+            data = DTensor.from_local(
+                data,
+                device_mesh=ep_mesh,
+                placements=(Shard(0),),
+            )
+        self.weight = nn.Parameter(data)
+        self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # Default nn.Linear init.
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f" n_routed_experts={self.n_routed_experts},"
+            f" out_features={self.out_features},"
+            f" in_features={self.in_features},"
+            f" ep_mesh={self.ep_mesh})"
+        )
 
 class _RoutedExperts(nn.Module, ABC):
     def __init__(
@@ -445,11 +443,19 @@ class _RoutedExperts(nn.Module, ABC):
         )
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
-        self.fc1 = RoutedExpertsFC1Weights(
-            self.n_local_experts, d_intermediate, in_features, **factory_kwargs
+        self.fc1 = RoutedExpertsWeights(
+            self.n_routed_experts,
+            2 * d_intermediate,
+            in_features,
+            ep_mesh,
+            **factory_kwargs,
         )
-        self.fc2 = RoutedExpertsFC2Weights(
-            self.n_local_experts, d_intermediate, in_features, **factory_kwargs
+        self.fc2 = RoutedExpertsWeights(
+            self.n_routed_experts,
+            in_features,
+            d_intermediate,
+            ep_mesh,
+            **factory_kwargs,
         )
 
     @abstractmethod
@@ -688,13 +694,14 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
             tokens_per_expert_group, self.n_local_experts
         )
 
-        for exp_idx, (fc1_weight, fc2_weight) in enumerate(
-            zip(self.fc1.weight, self.fc2.weight)
+        # For-loop only over local expert weights.
+        for exp_idx, (fc1, fc2) in enumerate(
+            zip(self.fc1.weight.to_local(), self.fc2.weight.to_local())
         ):
             idxs = local_expert_idxs == exp_idx
             # TODO: @goon - handle no-tokens edge case
             x_send[idxs] = _get_single_exp_output(
-                x_recv[idxs], fc1_weight, fc2_weight, self.activation
+                x_recv[idxs], fc1, fc2, self.activation
             )
 
         # Send results back to original ranks (reversed send/recv count data)
@@ -743,8 +750,14 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
         )
         z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         z[idxs_align] = x_recv_sorted
+
+        # Only use locally available EP weights
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
+            z,
+            self.fc1.weight.to_local(),
+            self.fc2.weight.to_local(),
+            offsets,
+            self.activation,
         )
         # Remove the alignment and return the tokens to their original ordering. Re-use
         # x_recv_sorted and avoid a new allocation.
@@ -805,7 +818,7 @@ class RoutedExpertsTorchEPGroupedMMTriton(_RoutedExpertsTorchEP):
         z[recv_sorted_indices] = x_recv
 
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
+            z, self.fc1.weight.to_local(), self.fc2.weight.to_local(), offsets, self.activation
         )
         # Remove the alignment and return the tokens to their original ordering. Re-use
         # x_recv_sorted and avoid a new allocation.
