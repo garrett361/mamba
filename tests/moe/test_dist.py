@@ -191,7 +191,7 @@ class TestRoutedExperts(_TestBase):
         model_ep = cls(**model_kwargs, ep_mesh=ep_mesh)
 
         # Set weights equal
-        _copy_params_routed_experts(model, model_ep)
+        _copy_params(model, model_ep)
 
         inputs, weights, indices = self.get_inputs_weights_indices(seed=42 + self.rank)
         outputs = model(inputs, weights, indices)
