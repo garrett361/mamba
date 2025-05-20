@@ -362,7 +362,7 @@ class RoutedExpertsWeights(nn.Module):
     """
     Container for routed expert weights. Convenient for aligning FQN's with other mamba_ssm
     conventions (thereby ensuring these weight are initalized by _init_weights.) and handling EP via
-    DTensor.
+    DTensor, which is necessary for easy DCP integration.
     """
 
     def __init__(

@@ -4,7 +4,9 @@ from typing import Any
 import pytest
 import torch
 import torch.distributed._functional_collectives as funcol
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
@@ -15,15 +17,13 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
-    RoutedExpertsFC1Weights,
-    RoutedExpertsFC2Weights,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPGroupedMM,
+    RoutedExpertsWeights,
     _get_counts,
     _RoutedExperts,
 )
-from mamba_ssm.moe_utils import init_meta_moe
-from mamba_ssm.moe_utils._utils import fully_shard_moe
+from mamba_ssm.moe_utils import MoEState, fully_shard_moe, init_meta_moe
 from tests.moe.test_utils import skip_moe_impl_if_no_h100s
 
 
@@ -31,12 +31,12 @@ def _copy_params_routed_experts(
     experts: _RoutedExperts, experts_ep: _RoutedExperts
 ) -> None:
     with torch.no_grad():
-        experts_ep.fc1.weight.data.copy_(
+        experts_ep.fc1.weight.data.to_local().copy_(
             experts.fc1.weight.data[
                 experts_ep.experts_start_idx : experts_ep.experts_end_idx
             ]
         )
-        experts_ep.fc2.weight.data.copy_(
+        experts_ep.fc2.weight.data.to_local().copy_(
             experts.fc2.weight.data[
                 experts_ep.experts_start_idx : experts_ep.experts_end_idx
             ]
@@ -48,7 +48,7 @@ def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
         m = model.get_submodule(n)
         if isinstance(m, _RoutedExperts):
             _copy_params_routed_experts(m, m_fsdp)
-        elif isinstance(m, (RoutedExpertsFC1Weights, RoutedExpertsFC2Weights)):
+        elif isinstance(m, RoutedExpertsWeights):
             # Already accounted for by the _RoutedExperts path.
             continue
         else:
@@ -63,22 +63,21 @@ def _test_grads_routed_experts(
     experts: _RoutedExperts, experts_ep: _RoutedExperts, tol: float
 ) -> None:
     for p, p_ep in zip(
-        (experts.fc1.weight, experts_ep.fc1.weight),
-        (experts.fc1.weight, experts_ep.fc2.weight),
+        (experts.fc1.weight, experts.fc2.weight),
+        (experts_ep.fc1.weight, experts_ep.fc2.weight),
     ):
-        if p.grad is None:
-            assert p_ep.grad is None
-            return
+        assert not isinstance(p, DTensor)
+        assert isinstance(p_ep, DTensor)
         grad = p.grad
         grad_ep = p_ep.grad
-        if isinstance(grad_ep, DTensor):
-            grad_ep = grad_ep.full_tensor()
-            torch.testing.assert_close(
-                grad[experts_ep.experts_start_idx : experts_ep.experts_end_idx],
-                grad_ep,
-                atol=tol,
-                rtol=tol,
-            )
+        assert isinstance(grad_ep, DTensor)
+        grad_ep = grad_ep.full_tensor()
+        torch.testing.assert_close(
+            grad,
+            grad_ep,
+            atol=tol,
+            rtol=tol,
+        )
 
 
 def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
@@ -87,7 +86,7 @@ def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
             m = model.get_submodule(n)
             if isinstance(m, _RoutedExperts):
                 _test_grads_routed_experts(m, m_fsdp, tol)
-            elif isinstance(m, (RoutedExpertsFC1Weights, RoutedExpertsFC2Weights)):
+            elif isinstance(m, RoutedExpertsWeights):
                 # Already accounted for by the _RoutedExperts path.
                 continue
             else:
@@ -276,7 +275,7 @@ class TestRoutedExperts(_TestBase):
         indices_ep = indices.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep, weights_ep, indices_ep)
 
-        # Grads should match with an avg-over-batches type loss
+        # Note: important to use an avg-type loss here.
         outputs.pow(2).mean().backward()
         outputs_ep.pow(2).mean().backward()
 
@@ -362,20 +361,11 @@ class TestMoEEP(_TestBase):
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep)
 
-        # Grads should match with an average-over-batches type loss
+        # Note: important to use an avg-type loss here.
         outputs.pow(2).mean().backward()
         outputs_ep.pow(2).mean().backward()
 
         _test_grads(model, model_ep, tol=self.tol)
-        # Verify the routed experts are not sharded and everything else is
-        try:
-            for n, p in model_ep.named_parameters():
-                if n.startswith("experts"):
-                    assert not isinstance(p, DTensor)
-                else:
-                    assert isinstance(p, DTensor)
-        except Exception as e:
-            raise RuntimeError(f"Failed on {n=}, {p=}") from e
 
 
 class TestModelEP(_TestBase):
@@ -455,8 +445,10 @@ class TestModelEP(_TestBase):
         outputs_ep = model_ep(inputs_ep)
 
         # Grads should match with an avg-over-batches type loss
-        outputs.logits.pow(2).mean().backward()
-        outputs_ep.logits.pow(2).mean().backward()
+        F.cross_entropy(outputs.view(-1, outputs.size(-1)), inputs.view(-1).long())
+        F.cross_entropy(
+            outputs_ep.view(-1, outputs_ep.size(-1)), inputs_ep.view(-1).long()
+        )
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -597,7 +589,6 @@ class TestMoEUtils(_TestBase):
         except Exception as e:
             raise RuntimeError(f"Failed on {n=}, {p=}") from e
 
-
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe_with_mp(self) -> None:
@@ -629,6 +620,63 @@ class TestMoEUtils(_TestBase):
         outputs_ep = model_ep(inputs).logits
         # NOTE: @goon - currently failing on ~0.8% of all inputs.
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_dcp_save_load(self) -> None:
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model_ep = MambaLMHeadModel(
+            self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
+        ).to(self.dtype)
+
+        fully_shard_moe(
+            model_ep,
+            ep_degree=ep_mesh.size(),
+            world_size=ep_mesh.size(),
+            fsdp_mesh=ep_mesh,
+        )
+        # Large LR to create big changes:
+        optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
+        torch.manual_seed(42 + self.rank)
+        inputs = self.get_input_toks()
+        pre_step_outputs = model_ep(inputs).logits
+        pre_step_outputs.sum().backward()
+        optim.step()
+        optim.zero_grad()
+        post_step_outputs = model_ep(inputs).logits
+        # Sanity check that the model changed:
+        assert not torch.allclose(pre_step_outputs, post_step_outputs)
+
+        # Save state
+        state_dict = {"moe": MoEState(model_ep, optim)}
+        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+
+        # Corrupt the state by taking another step
+        post_step_outputs.sum().backward()
+        optim.step()
+        optim.zero_grad()
+
+        # And save the new outputs
+        post_second_step_outputs = model_ep(inputs).logits
+        # Sanity check:
+        assert not torch.allclose(post_step_outputs, post_second_step_outputs)
+
+        # Reload and overwrite the corrupted state
+        corrupted_state_dict = {"moe": MoEState(model_ep, optim)}
+        dcp.load(corrupted_state_dict, checkpoint_id="/tmp/dcp")
+
+        # Check outputs agree pre- and post-taking another step
+        reloaded_outputs = model_ep(inputs).logits
+        assert torch.allclose(post_step_outputs, reloaded_outputs)
+
+        reloaded_outputs.sum().backward()
+        optim.step()
+        optim.zero_grad()
+        post_reload_step_outputs = model_ep(inputs).logits
+        assert torch.allclose(post_reload_step_outputs, post_second_step_outputs)
 
 
 def compile_breaking_fn(
