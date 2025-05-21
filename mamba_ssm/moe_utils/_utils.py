@@ -1,3 +1,4 @@
+import functools
 import math
 from functools import partial
 from typing import Any, Callable, Optional
@@ -10,8 +11,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
-    get_state_dict,
-    set_state_dict,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
@@ -237,24 +240,67 @@ def get_total_exp_and_active_params(model: MambaLMHeadModel) -> tuple[int, int, 
     return total, exp, non_exp + active_exp
 
 
-class MoEState(Stateful):
-    def __init__(self, model, optimizer: torch.optim.Optimizer):
-        self.model = model
-        self.optimizer = optimizer
+class ModelState(Stateful):
+    # From torchtitan
+    def __init__(self, model: nn.Module | list[nn.Module]) -> None:
+        self.model = [model] if isinstance(model, nn.Module) else model
+        self.cache_state_dict = {
+            k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()
+        }
 
-    def state_dict(self):
-        model_state_dict, optimizer_state_dict = get_state_dict(
-            self.model,
-            self.optimizer,
+    def state_dict(self) -> dict[str, Any]:
+        return self.cache_state_dict
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        func = functools.partial(
+            set_model_state_dict,
+            model_state_dict=state_dict,
+            options=StateDictOptions(strict=False),
+        )
+        list(map(func, self.model))
+        # `set_model_state_dict()` does change the keys of the input state_dict,
+        # we will need to reinitialize the cache_state_dict.
+        self.cache_state_dict = {
+            k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()
+        }
+
+
+class OptimState(Stateful):
+    # Modified from torchtitan
+    def __init__(
+        self,
+        model: nn.Module | list[nn.Module],
+        optimizer: torch.optim.Optimizer | list[torch.optim.Optimizer],
+    ) -> None:
+        self.model = [model] if isinstance(model, nn.Module) else model
+        self.optimizer = (
+            [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        func = functools.partial(
+            get_optimizer_state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
-        return {"model": model_state_dict, "optim": optimizer_state_dict}
+        return {
+            k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()
+        }
 
-    def load_state_dict(self, state_dict):
-        set_state_dict(
-            self.model,
-            self.optimizer,
-            model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optim"],
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        func = functools.partial(
+            set_optimizer_state_dict,
+            optim_state_dict=state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
+        list(map(func, self.model, self.optimizer))
+
+
+def get_dcp_state_dict(
+    model: nn.Module | list[nn.Module],
+    optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
+) -> dict[str, Stateful]:
+    state_dict = {}
+    state_dict["model"] = ModelState(model)
+    if optimizer is not None:
+        state_dict["optim"] = OptimState(model, optimizer)
+    return state_dict
