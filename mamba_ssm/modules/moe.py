@@ -551,9 +551,10 @@ class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
         # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
         # self.fc1.weight[exp_idx], results in super-slow CUDA syncs during the backwards pass.
         for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1.weight, self.fc2.weight)):
-            # TODO: @goon - handle no-tokens edge case
             # NOTE: @goon - torch.where incurs a CUDA sync.
             tok_idx, act_exp_idx = torch.where(indices == exp_idx)
+            if tok_idx.numel() == 0:
+                continue
             z[tok_idx] += (
                 _get_single_exp_output(x[tok_idx], fc1, fc2, self.activation)
                 * weights[tok_idx, act_exp_idx, None]
