@@ -27,7 +27,11 @@ from mamba_ssm.modules.moe import (
 )
 from mamba_ssm.moe_utils import init_meta_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
-from tests.moe.test_utils import skip_if_no_h100s, skip_moe_impl_if_no_h100s, mean_loss_fn
+from tests.moe.test_utils import (
+    mean_loss_fn,
+    skip_if_no_h100s,
+    skip_moe_impl_if_no_h100s,
+)
 
 
 def _copy_params_routed_experts(
@@ -50,6 +54,33 @@ def _copy_params_routed_experts(
         with torch.no_grad():
             exp_other.fc1.weight.data.copy_(exp.fc1.weight.data)
             exp_other.fc2.weight.data.copy_(exp.fc2.weight.data)
+
+
+def _test_grads_routed_experts(
+    simple_exp: _SimpleRoutedExperts, exp: _RoutedExpertsNoEP
+) -> None:
+    assert isinstance(simple_exp, _SimpleRoutedExperts)
+    assert isinstance(exp, _RoutedExpertsNoEP)
+    with torch.no_grad():
+        # Need to handle the case where some of the simple_exp weights may have None grads
+        simple_fc1_grads = []
+        simple_fc2_grads = []
+        for e in simple_exp.experts.values():
+            simple_fc1_grads.append(
+                e.fc1.weight.grad
+                if e.fc1.weight.grad is not None
+                else torch.zeros_like(e.fc1.weight)
+            )
+            simple_fc2_grads.append(
+                e.fc2.weight.grad
+                if e.fc2.weight.grad is not None
+                else torch.zeros_like(e.fc2.weight)
+            )
+
+        simple_fc1_grads = torch.stack(simple_fc1_grads, dim=0)
+        simple_fc2_grads = torch.stack(simple_fc2_grads, dim=0)
+        torch.testing.assert_close(simple_fc1_grads, exp.fc1.weight.grad)
+        torch.testing.assert_close(simple_fc2_grads, exp.fc2.weight.grad)
 
 
 class _TestBase:
@@ -232,7 +263,7 @@ class TestRoutedExperts(_TestBase):
             RoutedExpertsNoEPGroupedMMTriton,
         ],
     )
-    def test_fwd_equivalence(self, cls) -> None:
+    def test_equivalence(self, cls) -> None:
         skip_moe_impl_if_no_h100s(cls)
         torch.manual_seed(42)
         inputs, weights, indices = self.get_inputs_weights_indices()
@@ -243,17 +274,19 @@ class TestRoutedExperts(_TestBase):
             **self.factory_kwargs,
         )
 
-        exp = _SimpleRoutedExperts(**kwargs)
-        exp_other = cls(**kwargs)
-        _copy_params_routed_experts(exp, exp_other)
-        out = exp(inputs, weights, indices)
-        out_other = exp_other(inputs, weights, indices)
+        simple_exp = _SimpleRoutedExperts(**kwargs)
+        exp = cls(**kwargs)
+        _copy_params_routed_experts(simple_exp, exp)
+        out = simple_exp(inputs, weights, indices)
+        out_other = exp(inputs, weights, indices)
 
+        # Test logits agreement.
         torch.testing.assert_close(out_other, out, atol=self.tol, rtol=self.tol)
 
-        # Just test that backwards doesn't error. TODO: @goon - correctness tests.
+        # Test grad agreement.
+        mean_loss_fn(out).backward()
         mean_loss_fn(out_other).backward()
-
+        _test_grads_routed_experts(simple_exp, exp)
 
     @pytest.mark.parametrize(
         "cls",
@@ -264,6 +297,9 @@ class TestRoutedExperts(_TestBase):
         ],
     )
     def test_no_toks(self, cls) -> None:
+        """
+        Verify the routed experts can handle getting zero tokens for one or more experts.
+        """
         skip_moe_impl_if_no_h100s(cls)
         torch.manual_seed(42)
         inputs, weights, indices = self.get_inputs_weights_indices()
@@ -278,16 +314,19 @@ class TestRoutedExperts(_TestBase):
             **self.factory_kwargs,
         )
 
-        exp = _SimpleRoutedExperts(**kwargs)
-        exp_other = cls(**kwargs)
-        _copy_params_routed_experts(exp, exp_other)
-        out = exp(inputs, weights, indices)
-        out_other = exp_other(inputs, weights, indices)
+        simple_exp = _SimpleRoutedExperts(**kwargs)
+        exp = cls(**kwargs)
+        _copy_params_routed_experts(simple_exp, exp)
+        out = simple_exp(inputs, weights, indices)
+        out_other = exp(inputs, weights, indices)
 
+        # Test logits agreement.
         torch.testing.assert_close(out_other, out, atol=self.tol, rtol=self.tol)
 
-        # Just test that backwards doesn't error. TODO: @goon - correctness tests.
+        # Test grad agreement.
+        mean_loss_fn(out).backward()
         mean_loss_fn(out_other).backward()
+        _test_grads_routed_experts(simple_exp, exp)
 
 
 class TestMoE(_TestBase):
