@@ -8,7 +8,11 @@ from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_state_dict,
+    set_state_dict,
+)
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -240,7 +244,9 @@ class MoEState(Stateful):
 
     def state_dict(self):
         model_state_dict, optimizer_state_dict = get_state_dict(
-            self.model, self.optimizer
+            self.model,
+            self.optimizer,
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
         return {"model": model_state_dict, "optim": optimizer_state_dict}
 
@@ -250,4 +256,5 @@ class MoEState(Stateful):
             self.optimizer,
             model_state_dict=state_dict["model"],
             optim_state_dict=state_dict["optim"],
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
