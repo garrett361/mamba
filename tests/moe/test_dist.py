@@ -22,7 +22,7 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsTorchEPGroupedMM,
     _get_counts,
 )
-from mamba_ssm.moe_utils import MoEState, fully_shard_moe, init_meta_moe
+from mamba_ssm.moe_utils import fully_shard_moe, get_dcp_state_dict, init_meta_moe
 from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
 
 
@@ -689,7 +689,7 @@ class TestMoEUtils(_TestBase):
         assert not torch.allclose(pre_step_outputs, post_step_outputs)
 
         # Save state
-        state_dict = {"moe": MoEState(model_ep, optim)}
+        state_dict = get_dcp_state_dict(model_ep, optim)
         dcp.save(state_dict, checkpoint_id="/tmp/dcp")
 
         # Corrupt the state by taking another step
@@ -703,7 +703,7 @@ class TestMoEUtils(_TestBase):
         assert not torch.allclose(post_step_outputs, post_second_step_outputs)
 
         # Reload and overwrite the corrupted state
-        corrupted_state_dict = {"moe": MoEState(model_ep, optim)}
+        corrupted_state_dict = get_dcp_state_dict(model_ep, optim)
         dcp.load(corrupted_state_dict, checkpoint_id="/tmp/dcp")
 
         # Check outputs agree pre- and post-taking another step
@@ -751,7 +751,7 @@ class TestMoEUtils(_TestBase):
         assert not torch.allclose(pre_step_outputs, post_step_outputs)
 
         # Save state
-        state_dict = {"moe": MoEState(model_ep, optim)}
+        state_dict = get_dcp_state_dict(model_ep, optim)
         dcp.save(state_dict, checkpoint_id="/tmp/dcp")
 
         # Take another step and save the outputs
@@ -780,7 +780,7 @@ class TestMoEUtils(_TestBase):
 
             optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
             # Reload and overwrite the corrupted state
-            reconfig_state_dict = {"moe": MoEState(model_ep, optim)}
+            reconfig_state_dict = get_dcp_state_dict(model_ep, optim)
             dcp.load(
                 reconfig_state_dict,
                 checkpoint_id="/tmp/dcp",
