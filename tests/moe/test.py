@@ -249,7 +249,42 @@ class TestRoutedExperts(_TestBase):
         out = exp(inputs, weights, indices)
         out_other = exp_other(inputs, weights, indices)
 
-        torch.testing.assert_close(out_other, out, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(out_other, out, atol=self.tol, rtol=self.tol)
+
+        # Just test that backwards doesn't error. TODO: @goon - correctness tests.
+        mean_loss_fn(out_other).backward()
+
+
+    @pytest.mark.parametrize(
+        "cls",
+        [
+            RoutedExpertsNoEPForLoop,
+            RoutedExpertsNoEPGroupedMM,
+            RoutedExpertsNoEPGroupedMMTriton,
+        ],
+    )
+    def test_no_toks(self, cls) -> None:
+        skip_moe_impl_if_no_h100s(cls)
+        torch.manual_seed(42)
+        inputs, weights, indices = self.get_inputs_weights_indices()
+        # Set all indices to 0, 1, so that other experts don't get tokens
+        assert self.n_routed_experts > 2
+        indices[:, 0] = 0
+        indices[:, 1] = 1
+        kwargs = dict(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            **self.factory_kwargs,
+        )
+
+        exp = _SimpleRoutedExperts(**kwargs)
+        exp_other = cls(**kwargs)
+        _copy_params_routed_experts(exp, exp_other)
+        out = exp(inputs, weights, indices)
+        out_other = exp_other(inputs, weights, indices)
+
+        torch.testing.assert_close(out_other, out, atol=self.tol, rtol=self.tol)
 
         # Just test that backwards doesn't error. TODO: @goon - correctness tests.
         mean_loss_fn(out_other).backward()
