@@ -330,6 +330,7 @@ def attach_tok_count_hooks(
     layers = model.backbone.layers
     hook_dict = {}
     for idx_str, block in layers.items():
-        if isinstance(block.mlp, MoE):
-            hook_dict[idx_str] = TokenCounterHook(block.mlp.experts.tok_counter)
+        for m in block.modules():
+            if isinstance(m, TokenCounter):
+                hook_dict[idx_str] = TokenCounterHook(m)
     return hook_dict

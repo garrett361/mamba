@@ -142,12 +142,9 @@ class _TestBase(DTest):
             self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
         )
 
-    def get_inputs_weights_indices(
+    def get_inputs_weights_indices_counts(
         self, seed: int = 42
     ) -> tuple[torch.Tensor, torch.Tensor, torch.LongTensor]:
-        """
-        Returns the flattened inputs, weights, and indices used by routed experts.
-        """
         torch.manual_seed(seed)
         inputs = torch.randn(
             self.batch_size * self.seqlen, self.in_features, **self.factory_kwargs
@@ -166,7 +163,7 @@ class _TestBase(DTest):
             .topk(self.n_activated_experts, dim=-1)
             .indices
         )
-        return inputs, weights, indices
+        return inputs, weights, indices, TokenCounter()(indices, self.n_routed_experts)
 
 
 class TestRoutedExperts(_TestBase):
@@ -194,9 +191,11 @@ class TestRoutedExperts(_TestBase):
         # Set weights equal
         _copy_params(model, model_ep)
 
-        inputs, weights, indices = self.get_inputs_weights_indices(seed=42 + self.rank)
-        outputs = model(inputs, weights, indices)
-        outputs_ep = model_ep(inputs, weights, indices)
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts(
+            seed=42 + self.rank
+        )
+        outputs = model(inputs, weights, indices, counts)
+        outputs_ep = model_ep(inputs, weights, indices, counts)
 
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
@@ -224,13 +223,15 @@ class TestRoutedExperts(_TestBase):
         # Force models equal
         _copy_params(model, model_ep)
 
-        inputs, weights, indices = self.get_inputs_weights_indices()
-        outputs = model(inputs, weights, indices)
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
+        outputs = model(inputs, weights, indices, counts)
 
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         weights_ep = weights.tensor_split(self.world_size, dim=0)[self.rank]
         indices_ep = indices.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep, weights_ep, indices_ep)
+        # The counts need to be rederived from indices_ep
+        counts_ep = TokenCounter()(indices_ep, self.n_routed_experts)
+        outputs_ep = model_ep(inputs_ep, weights_ep, indices_ep, counts_ep)
 
         # Note: important to use an avg-type loss here.
         mean_loss_fn(outputs).backward()
@@ -859,5 +860,7 @@ class TestCompileBreaking(_TestBase):
         )
         fn_compiled = torch.compile(compile_breaking_fn)
         for seed in range(3):
-            inputs, _, indices = self.get_inputs_weights_indices(seed=seed)
+            inputs, _, indices, counts = self.get_inputs_weights_indices_counts(
+                seed=seed
+            )
             fn_compiled(inputs, indices, ep_mesh, self.n_routed_experts)
