@@ -22,7 +22,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.moe import MoE
+from mamba_ssm.modules.moe import MoE, TokenCounter
 
 
 def fully_shard_moe(
@@ -304,3 +304,32 @@ def get_dcp_state_dict(
     if optimizer is not None:
         state_dict["optim"] = OptimState(model, optimizer)
     return state_dict
+
+
+class TokenCounterHook:
+    def __init__(self, counter: TokenCounter) -> None:
+        self.count = 0
+        self._handle = counter.register_forward_hook(self)
+
+    def reset(self) -> None:
+        self.count = 0
+
+    def __call__(self, module: nn.Module, args, output: torch.Tensor) -> None:
+        self.count += output.detach().clone()
+
+    def remove(self) -> None:
+        self._handle.remove()
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(count={self.count})"
+
+
+def attach_tok_count_hooks(
+    model: MambaLMHeadModel,
+) -> dict[str, TokenCounterHook]:
+    layers = model.backbone.layers
+    hook_dict = {}
+    for idx_str, block in layers.items():
+        if isinstance(block.mlp, MoE):
+            hook_dict[idx_str] = TokenCounterHook(block.mlp.experts.tok_counter)
+    return hook_dict

@@ -6,16 +6,11 @@ import math
 import os
 from collections import namedtuple
 from functools import partial
-from typing import Any, Optional, Callable
+from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.distributed._composable.fsdp import fully_shard
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-)
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.profiler import record_function
 
 from mamba_ssm.models.config_mamba import MambaConfig
@@ -116,7 +111,7 @@ def _init_weights(
     initializer_range=0.02,  # Now only used for embedding layer.
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
-    verbose: bool=False
+    verbose: bool = False,
 ):
     if isinstance(module, nn.Linear):
         if module.bias is not None:
@@ -379,16 +374,3 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config_path = os.path.join(save_directory, "config.json")
         with open(config_path, "w") as f:
             json.dump(self.config.__dict__, f, indent=4)
-
-    def _get_tok_counts(self) -> int:
-        """
-        Get, and reset, the total token counts received by all experts.
-        """
-        tok_count = 0
-        for mod in self.modules():
-            if isinstance(mod, MoE) and hasattr(mod.experts, "_tok_count"):
-                tok_count += mod.experts._tok_count
-                mod.experts._tok_count = 0
-        return tok_count
-
-
