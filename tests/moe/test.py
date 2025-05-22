@@ -143,12 +143,9 @@ class _TestBase:
             self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
         )
 
-    def get_inputs_weights_indices(
+    def get_inputs_weights_indices_counts(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.LongTensor]:
-        """
-        Returns the flattened inputs, weights, and indices used by routed experts.
-        """
         inputs = torch.randn(
             self.batch_size * self.seqlen, self.in_features, **self.factory_kwargs
         )
@@ -166,7 +163,7 @@ class _TestBase:
             .topk(self.n_activated_experts, dim=-1)
             .indices
         )
-        return inputs, weights, indices
+        return inputs, weights, indices, TokenCounter()(indices, self.n_routed_experts)
 
 
 class TestGate(_TestBase):
@@ -181,13 +178,14 @@ class TestGate(_TestBase):
             **self.factory_kwargs,
         )
         inputs = self.get_inputs().view(-1, self.in_features)
-        weights, indices = model(inputs)
+        weights, indices, counts = model(inputs)
         assert weights.shape == inputs.shape[:1] + torch.Size(
             [self.n_activated_experts]
         )
         assert indices.shape == inputs.shape[:1] + torch.Size(
             [self.n_activated_experts]
         )
+        assert counts.shape == torch.Size([self.n_routed_experts])
 
     @pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
     def test_fwd_with_exp_groups(
@@ -204,13 +202,14 @@ class TestGate(_TestBase):
             **self.factory_kwargs,
         )
         inputs = self.get_inputs().view(-1, self.in_features)
-        weights, indices = model(inputs)
+        weights, indices, counts = model(inputs)
         assert weights.shape == inputs.shape[:1] + torch.Size(
             [self.n_activated_experts]
         )
         assert indices.shape == inputs.shape[:1] + torch.Size(
             [self.n_activated_experts]
         )
+        assert counts.shape == torch.Size([self.n_routed_experts])
 
     @pytest.mark.parametrize("score_func", ["sigmoid", "softmax"])
     def test_bwd_with_exp_groups(
@@ -231,34 +230,28 @@ class TestGate(_TestBase):
             **self.factory_kwargs,
         )
         inputs = self.get_inputs().view(-1, self.in_features)
-        weights, indices = model(inputs)
-        assert weights.shape == inputs.shape[:1] + torch.Size(
-            [self.n_activated_experts]
-        )
-        assert indices.shape == inputs.shape[:1] + torch.Size(
-            [self.n_activated_experts]
-        )
+        weights, indices, counts = model(inputs)
         weights.sum().backward()
 
 
 class TestRoutedExperts(_TestBase):
     def test_no_ep_naive(self) -> None:
         torch.manual_seed(42)
-        inputs, weights, indices = self.get_inputs_weights_indices()
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
         experts = RoutedExpertsNoEPForLoop(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
             n_routed_experts=self.n_routed_experts,
             **self.factory_kwargs,
         )
-        outputs = experts(inputs, weights, indices)
+        outputs = experts(inputs, weights, indices, counts)
         assert outputs.shape == inputs.shape
 
     @pytest.mark.parametrize("cls", list(NON_EP_EXPERT_CLASSES.values()))
     def test_equivalence(self, cls) -> None:
         skip_moe_impl_if_no_h100s(cls)
         torch.manual_seed(42)
-        inputs, weights, indices = self.get_inputs_weights_indices()
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
         kwargs = dict(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
@@ -269,8 +262,8 @@ class TestRoutedExperts(_TestBase):
         simple_exp = _SimpleRoutedExperts(**kwargs)
         exp = cls(**kwargs)
         _copy_params_routed_experts(simple_exp, exp)
-        out = simple_exp(inputs, weights, indices)
-        out_other = exp(inputs, weights, indices)
+        out = simple_exp(inputs, weights, indices, counts)
+        out_other = exp(inputs, weights, indices, counts)
 
         # Test logits agreement.
         torch.testing.assert_close(out_other, out, atol=self.tol, rtol=self.tol)
@@ -287,7 +280,7 @@ class TestRoutedExperts(_TestBase):
         """
         skip_moe_impl_if_no_h100s(cls)
         torch.manual_seed(42)
-        inputs, weights, indices = self.get_inputs_weights_indices()
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
         # Set all indices to 0, 1, so that other experts don't get tokens
         assert self.n_routed_experts > 2
         indices[:, 0] = 0
@@ -302,8 +295,8 @@ class TestRoutedExperts(_TestBase):
         simple_exp = _SimpleRoutedExperts(**kwargs)
         exp = cls(**kwargs)
         _copy_params_routed_experts(simple_exp, exp)
-        out = simple_exp(inputs, weights, indices)
-        out_other = exp(inputs, weights, indices)
+        out = simple_exp(inputs, weights, indices, counts)
+        out_other = exp(inputs, weights, indices, counts)
 
         # Test logits agreement.
         torch.testing.assert_close(out_other, out, atol=self.tol, rtol=self.tol)
@@ -938,7 +931,7 @@ class TestMoeImpls(_TestBase):
 
         # Common gating
 
-        x, weights, indices = self.get_inputs_weights_indices()
+        x, weights, indices, counts = self.get_inputs_weights_indices_counts()
 
         # DeepSeek-v3 impl:
         z_ds = torch.zeros_like(x)
