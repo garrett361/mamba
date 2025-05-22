@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 import torch
 from timing_utils import CUDATimer
 
-from mamba_ssm.modules.moe import _get_counts
+from mamba_ssm.modules.moe import TokenCounter
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs
 
 
@@ -52,7 +52,8 @@ if __name__ == "__main__":
         .topk(args.n_activated_experts, dim=-1)
         .indices
     )
-    counts = _get_counts(indices, args.n_routed_experts)
+    counter = TokenCounter()
+    counts = counter(indices, args.n_routed_experts)
     n_toks = args.bsz * args.seqlen
 
     dtype = torch.bfloat16
