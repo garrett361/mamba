@@ -20,7 +20,7 @@ from mamba_ssm.modules.moe import (
     MoE,
     RoutedExpertsNoEPForLoop,
     RoutedExpertsTorchEPGroupedMM,
-    _get_counts,
+    TokenCounter,
 )
 from mamba_ssm.moe_utils import fully_shard_moe, get_dcp_state_dict, init_meta_moe
 from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
@@ -828,8 +828,8 @@ def compile_breaking_fn(
     flat_sorted_indices = indices.flatten().argsort(dim=-1)
     n_activated_experts = indices.shape[-1]
     x_by_expert = x[flat_sorted_indices // n_activated_experts]
-
-    counts = _get_counts(indices, n_routed_experts)
+    counter = TokenCounter()
+    counts = counter(indices, n_routed_experts)
     assert ep_mesh is not None  # mypy
     tokens_per_expert_group = funcol.all_to_all_single(
         counts, None, None, group=ep_mesh

@@ -17,7 +17,7 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPForLoop,
     RoutedExpertsNoEPGroupedMM,
     RoutedExpertsNoEPGroupedMMTriton,
-    _get_counts,
+    TokenCounter,
     _get_exp_outputs_grouped_mm,
     _get_exp_outputs_titan_cg_gemm,
     _get_local_expert_idxs,
@@ -1160,7 +1160,8 @@ class TestTriton(_TestBase):
             .topk(n_activated_experts, dim=-1)
             .indices
         )
-        counts = _get_counts(indices, n_routed_experts)
+        counter = TokenCounter()
+        counts = counter(indices, n_routed_experts)
 
         # Torch impl:
         idxs, sizes, offsets = pad_sorted_idxs_torch(

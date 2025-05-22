@@ -113,7 +113,7 @@ class Gate(nn.Module):
             f" score_func={self.score_func})"
         )
 
-    def reset_parameters(self)->None:
+    def reset_parameters(self) -> None:
         if self.bias is not None:
             nn.init.zeros_(self.bias)
         # self.lin: nn.Linear can reset its own parameters already. Intentionally not resetting.
@@ -250,15 +250,22 @@ class MoE(nn.Module):
         return (z + self.shared_experts(x)).view(x_shape)
 
 
-def _get_counts(indices: torch.LongTensor, n_routed_experts: int) -> torch.IntTensor:
+class TokenCounter(nn.Module):
     """
-    Turns the `indices` tensor into a sorted count of the number of tokens per expert.
+    Turns the `indices` tensor into a sorted count of the number of tokens per expert. Implemented as
+    a module so that we can easily attach hooks for token statistics inspection.
     """
-    with torch.no_grad():
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @torch.no_grad()
+    def forward(self, indices: torch.LongTensor, n_routed_experts: int) -> None:
+        # No grad is needed for tok idxs, a small optimization.
         counts = indices.new_zeros((indices.shape[0], n_routed_experts))
         counts.scatter_(1, indices, 1)
         counts = counts.sum(dim=0, dtype=torch.int32)
-    return counts
+        return counts
 
 
 def _get_single_exp_output(
@@ -408,6 +415,7 @@ class RoutedExpertsWeights(nn.Module):
             f" ep_mesh={self.ep_mesh})"
         )
 
+
 class _RoutedExperts(nn.Module, ABC):
     def __init__(
         self,
@@ -444,6 +452,7 @@ class _RoutedExperts(nn.Module, ABC):
         )
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
+        self.tok_counter = TokenCounter()
         self.fc1 = RoutedExpertsWeights(
             self.n_routed_experts,
             2 * d_intermediate,
@@ -512,7 +521,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
         # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
 
-        counts = _get_counts(indices, self.n_routed_experts)
+        counts = self.tok_counter(indices, self.n_routed_experts)
         assert self.ep_mesh is not None  # mypy
         with record_function("all2all::tok_per_exp_grp"):
             tokens_per_expert_group = funcol.all_to_all_single(
@@ -575,13 +584,13 @@ class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
         n_activated_experts = indices.shape[-1]
         x_by_expert = x[flat_sorted_indices // n_activated_experts]
 
-        counts = _get_counts(indices, self.n_routed_experts)
+        counts = self.tok_counter(indices, self.n_routed_experts)
 
         idxs_align, _, offsets = pad_sorted_idxs_torch(
             counts, indices.numel(), _GROUPED_MM_ALIGNMENT
         )
-        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
-        # sized, empirically tuned to be large enough to handle the routed tokens.
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a
+        # fixed sized, empirically tuned to be large enough to handle the routed tokens.
         z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
         z[idxs_align] = x_by_expert
         z = _get_exp_outputs_grouped_mm(
@@ -610,7 +619,7 @@ class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
         n_activated_experts = indices.shape[-1]
         x_by_expert = x[flat_sorted_indices // n_activated_experts]
 
-        counts = _get_counts(indices, self.n_routed_experts)
+        counts = self.tok_counter(indices, self.n_routed_experts)
 
         # Expand the tokens to an appropriately aligned tensor.
         idxs_align, _, offsets = pad_sorted_idxs(
@@ -647,7 +656,7 @@ class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
         n_activated_experts = indices.shape[-1]
         x_by_expert = x[flat_sorted_indices // n_activated_experts]
 
-        counts = _get_counts(indices, self.n_routed_experts)
+        counts = self.tok_counter(indices, self.n_routed_experts)
 
         # Expand the tokens to an appropriately aligned tensor.
         idxs_align, _, offsets = pad_sorted_idxs(
@@ -820,7 +829,11 @@ class RoutedExpertsTorchEPGroupedMMTriton(_RoutedExpertsTorchEP):
         z[recv_sorted_indices] = x_recv
 
         z = _get_exp_outputs_grouped_mm(
-            z, self.fc1.weight.to_local(), self.fc2.weight.to_local(), offsets, self.activation
+            z,
+            self.fc1.weight.to_local(),
+            self.fc2.weight.to_local(),
+            offsets,
+            self.activation,
         )
         # Remove the alignment and return the tokens to their original ordering. Re-use
         # x_recv_sorted and avoid a new allocation.
