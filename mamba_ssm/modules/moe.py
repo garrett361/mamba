@@ -56,6 +56,7 @@ class Gate(nn.Module):
         n_limited_groups: int = 1,
         score_func: Literal["sigmoid", "softmax"] = "softmax",
         route_scale: float = 1.0,
+        bias: bool = False,
         device=None,
         dtype=None,
     ):
@@ -72,12 +73,11 @@ class Gate(nn.Module):
         self.lin = nn.Linear(
             self.in_features, self.n_routed_experts, bias=False, **factory_kwargs
         )
-        # Fix bias usage
-        self.bias = (
-            nn.Parameter(torch.empty(self.n_routed_experts, **factory_kwargs))
-            if self.in_features == 7168
-            else None
+        self.register_buffer(
+            "bias",
+            torch.empty(self.n_routed_experts, **factory_kwargs) if bias else None,
         )
+
         self.tok_counter = TokenCounter()
         self.reset_parameters()
 
