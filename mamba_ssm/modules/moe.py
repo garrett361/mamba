@@ -192,7 +192,7 @@ class MoE(nn.Module):
             # TODO: @goon - shouldn't be a necessary constraint. Move to torch.chunk semantics for
             # placements.
             raise ValueError(
-                f"{self.n_routed_experts=} must be divisible by {ep_mesh.size()=}"
+                f"{n_routed_experts=} must be divisible by {ep_mesh.size()=}"
             )
         if ep_mesh is not None and ep_mesh.ndim != 1:
             raise ValueError(
