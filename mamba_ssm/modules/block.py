@@ -2,7 +2,7 @@
 from typing import Optional
 
 import torch
-from torch import nn, Tensor
+from torch import Tensor, nn
 
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
@@ -48,44 +48,45 @@ class Block(nn.Module):
             hidden_states: the sequence to the encoder layer (required).
             residual: hidden_states = Mixer(LN(residual))
         """
-        if not self.fused_add_norm:
-            residual = (hidden_states + residual) if residual is not None else hidden_states
-            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
-            if self.residual_in_fp32:
-                residual = residual.to(torch.float32)
-        else:
-            hidden_states, residual = layer_norm_fn(
-                hidden_states,
-                self.norm.weight,
-                self.norm.bias,
-                residual=residual,
-                prenorm=True,
-                residual_in_fp32=self.residual_in_fp32,
-                eps=self.norm.eps,
-                is_rms_norm=isinstance(self.norm, RMSNorm)
-            )
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
+        hidden_states, residual = self.apply_norm(self.norm, hidden_states, residual)
+        hidden_states = self.mixer(
+            hidden_states, inference_params=inference_params, **mixer_kwargs
+        )
 
         if self.mlp is not None:
-            if not self.fused_add_norm:
-                residual = hidden_states + residual
-                hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
-                if self.residual_in_fp32:
-                    residual = residual.to(torch.float32)
-            else:
-                hidden_states, residual = layer_norm_fn(
-                    hidden_states,
-                    self.norm2.weight,
-                    self.norm2.bias,
-                    residual=residual,
-                    prenorm=True,
-                    residual_in_fp32=self.residual_in_fp32,
-                    eps=self.norm2.eps,
-                    is_rms_norm=isinstance(self.norm2, RMSNorm)
-                )
+            hidden_states, residual = self.apply_norm(
+                self.norm2, hidden_states, residual
+            )
             hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+        return self.mixer.allocate_inference_cache(
+            batch_size, max_seqlen, dtype=dtype, **kwargs
+        )
+
+    def apply_norm(
+        self,
+        norm: nn.Module,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not self.fused_add_norm:
+            residual = (
+                (hidden_states + residual) if residual is not None else hidden_states
+            )
+            hidden_states = norm(residual.to(dtype=norm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            hidden_states, residual = layer_norm_fn(
+                hidden_states,
+                norm.weight,
+                norm.bias,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=norm.eps,
+                is_rms_norm=isinstance(norm, RMSNorm),
+            )
