@@ -119,6 +119,7 @@ class Gate(nn.Module):
             # NOTE: @goon -  using the in-place masked_fill_ gives in-place backwards pass errors.
             scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf")).flatten(1)
         indices = torch.topk(scores, self.n_activated_experts, dim=-1)[1]
+        # The bias, when it exists, is only used for routing decisions, not in the weight computation.
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
