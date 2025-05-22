@@ -202,7 +202,7 @@ class MoE(nn.Module):
         # TODO: @goon - better config for which routed experts impl to use.
 
         routed_experts_cls = (
-            NON_EP_EXPERT_CLASSES[moe_impl]
+            NON_EP_EXPERT_CLASSES_AND_SIMPLE[moe_impl]
             if ep_mesh is None
             else EP_EXPERT_CLASSES[moe_impl]
         )
@@ -497,7 +497,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         assert self.ep_mesh is not None
-        self._tok_count = 0  # for testing
 
     def _get_ep_toks_and_routing_data(
         self, x_by_expert: torch.Tensor, indices: torch.Tensor
@@ -538,7 +537,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             .sum(dim=1)
             .tolist()
         )
-        self._tok_count += sum(recv_counts)  # testing
 
         # Receive toks from other workers
         with record_function("all2all::send0"):
@@ -557,6 +555,10 @@ class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
         self, x: torch.Tensor, weights: torch.Tensor, indices: torch.LongTensor
     ) -> torch.Tensor:
         z = torch.zeros_like(x)
+
+        # Intentionally unused; useful for logging tok/expert stats.
+        _ = self.tok_counter(indices, self.n_routed_experts)
+
         # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
         # self.fc1.weight[exp_idx], results in super-slow CUDA syncs during the backwards pass.
         for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1.weight, self.fc2.weight)):
@@ -678,6 +680,9 @@ class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
         x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
         z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
         return z
+
+
+### Start of EP Classes
 
 
 class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
@@ -903,11 +908,13 @@ class _SimpleRoutedExperts(nn.Module):
 
 
 NON_EP_EXPERT_CLASSES = {
-    "_simple": _SimpleRoutedExperts,
     "torch": RoutedExpertsNoEPForLoop,
     "torch_gemm": RoutedExpertsNoEPGroupedMM,
     "torch_gemm_triton": RoutedExpertsNoEPGroupedMMTriton,
 }
+NON_EP_EXPERT_CLASSES_AND_SIMPLE = NON_EP_EXPERT_CLASSES.copy()
+NON_EP_EXPERT_CLASSES_AND_SIMPLE["_simple"] = _SimpleRoutedExperts
+
 EP_EXPERT_CLASSES = {
     "torch": RoutedExpertsTorchEPForLoop,
     "torch_gemm": RoutedExpertsTorchEPGroupedMM,

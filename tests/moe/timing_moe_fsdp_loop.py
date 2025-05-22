@@ -101,26 +101,6 @@ if __name__ == "__main__":
                 results["time_std_s" + (" (EP)" if ep else " (FSDP)")].append(
                     time_std_s
                 )
-                if ep and args.compute_tok_stats:
-                    # Collecting stats for the number of tok per expert
-                    tok_counts = [layer._tok_count for layer in model]
-                    tok_counts_t = torch.tensor(
-                        tok_counts, device="cuda", dtype=torch.bfloat16
-                    )
-                    tok_counts_gathered = (
-                        [torch.empty_like(tok_counts_t) for _ in range(world_size)]
-                        if not rank
-                        else None
-                    )
-                    dist.gather(tok_counts_t, tok_counts_gathered, dst=0)
-                    if not rank:
-                        # Sanity check
-                        tok_counts_gathered_t = torch.stack(tok_counts_gathered, dim=0)
-                        print(
-                            f"Tok per rank (row) per layer (col): {tok_counts_gathered_t}"
-                        )
-                        print(f"Tok sum over ranks: {tok_counts_gathered_t.sum(dim=0)}")
-                        print(f"Tok std over ranks: {tok_counts_gathered_t.std(dim=0)}")
 
         if not rank:
             import pandas as pd

@@ -12,11 +12,10 @@ from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     _GROUPED_MM_ALIGNMENT,
     NON_EP_EXPERT_CLASSES,
+    NON_EP_EXPERT_CLASSES_AND_SIMPLE,
     Gate,
     MoE,
     RoutedExpertsNoEPForLoop,
-    RoutedExpertsNoEPGroupedMM,
-    RoutedExpertsNoEPGroupedMMTriton,
     TokenCounter,
     _get_exp_outputs_grouped_mm,
     _get_exp_outputs_titan_cg_gemm,
@@ -25,7 +24,7 @@ from mamba_ssm.modules.moe import (
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
 )
-from mamba_ssm.moe_utils import init_meta_moe
+from mamba_ssm.moe_utils import attach_tok_count_hooks, init_meta_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 from tests.moe.test_utils import (
     mean_loss_fn,
@@ -255,14 +254,7 @@ class TestRoutedExperts(_TestBase):
         outputs = experts(inputs, weights, indices)
         assert outputs.shape == inputs.shape
 
-    @pytest.mark.parametrize(
-        "cls",
-        [
-            RoutedExpertsNoEPForLoop,
-            RoutedExpertsNoEPGroupedMM,
-            RoutedExpertsNoEPGroupedMMTriton,
-        ],
-    )
+    @pytest.mark.parametrize("cls", list(NON_EP_EXPERT_CLASSES.values()))
     def test_equivalence(self, cls) -> None:
         skip_moe_impl_if_no_h100s(cls)
         torch.manual_seed(42)
@@ -288,14 +280,7 @@ class TestRoutedExperts(_TestBase):
         mean_loss_fn(out_other).backward()
         _test_grads_routed_experts(simple_exp, exp)
 
-    @pytest.mark.parametrize(
-        "cls",
-        [
-            RoutedExpertsNoEPForLoop,
-            RoutedExpertsNoEPGroupedMM,
-            RoutedExpertsNoEPGroupedMMTriton,
-        ],
-    )
+    @pytest.mark.parametrize("cls", list(NON_EP_EXPERT_CLASSES.values()))
     def test_no_toks(self, cls) -> None:
         """
         Verify the routed experts can handle getting zero tokens for one or more experts.
@@ -348,9 +333,9 @@ class TestMoE(_TestBase):
 
 
 class TestMoEModel(_TestBase):
-    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
+    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES_AND_SIMPLE))
     def test_fwd(self, moe_impl) -> None:
-        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
+        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES_AND_SIMPLE[moe_impl])
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         cfg.moe_cfg["moe_impl"] = moe_impl
@@ -365,9 +350,9 @@ class TestMoEModel(_TestBase):
         outputs = model(inputs).logits
         assert outputs.shape == inputs.shape + torch.Size([self.vocab_size])
 
-    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
+    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES_AND_SIMPLE))
     def test_fwd_compile(self, moe_impl) -> None:
-        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
+        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES_AND_SIMPLE[moe_impl])
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         cfg.moe_cfg["moe_impl"] = moe_impl
@@ -1177,3 +1162,25 @@ class TestTriton(_TestBase):
         torch.testing.assert_close(sizes, sizes_alt)
         torch.testing.assert_close(offsets, offsets_alt)
         torch.testing.assert_close(idxs, idxs_alt)
+
+
+class TestMoEUtils(_TestBase):
+    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
+    def test_count_hooks(self, moe_impl) -> None:
+        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
+        torch.manual_seed(42)
+        cfg = deepcopy(self.cfg)
+        cfg.moe_cfg["moe_impl"] = moe_impl
+        model = MambaLMHeadModel(cfg, **self.factory_kwargs)
+        for layer_idx in sorted(model.backbone.layers):
+            mlp = model.backbone.layers[layer_idx].mlp
+            if int(layer_idx) in self.moe_layer_idx:
+                assert isinstance(mlp, MoE)
+            else:
+                assert isinstance(mlp, GatedMLP)
+        hooks = attach_tok_count_hooks(model)
+        assert len(hooks) == sum(isinstance(m, MoE) for m in model.modules())
+        inputs = self.get_input_toks()
+        model(inputs)
+        for h in hooks.values():
+            assert h.count.numel() == cfg.moe_cfg["n_routed_experts"]
