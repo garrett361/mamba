@@ -173,6 +173,7 @@ class MoE(nn.Module):
         n_limited_groups: int = 1,
         score_func: Literal["sigmoid", "softmax"] = "softmax",
         route_scale: float = 1.0,
+        gate_bias: bool = False,
         ep_mesh: Optional[DeviceMesh] = None,
         device=None,
         dtype=None,
@@ -222,6 +223,7 @@ class MoE(nn.Module):
             n_limited_groups=n_limited_groups,
             score_func=self.score_func,
             route_scale=self.route_scale,
+            bias=gate_bias,
             **factory_kwargs,
         )
 
