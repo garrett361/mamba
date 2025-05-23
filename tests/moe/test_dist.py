@@ -22,7 +22,7 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsTorchEPGroupedMM,
     TokenCounter,
 )
-from mamba_ssm.moe_utils import fully_shard_moe, get_dcp_state_dict, init_meta_moe
+from mamba_ssm.moe_utils import fully_shard_moe, get_dcp_state_dict, init_moe
 from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
 
 
@@ -495,7 +495,7 @@ class TestMoEUtils(_TestBase):
         with torch.device("meta"):
             meta_model_ep = MambaLMHeadModel(self.cfg, ep_mesh=ep_mesh)
 
-        init_meta_moe(meta_model_ep, verbose=False)
+        init_moe(meta_model_ep, verbose=False)
         torch.manual_seed(42 + self.rank)
         inputs = self.get_input_toks()
         outputs_ep = meta_model_ep(inputs)
