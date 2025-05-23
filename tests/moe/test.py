@@ -27,7 +27,7 @@ from mamba_ssm.modules.moe import (
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
 )
-from mamba_ssm.moe_utils import TensorNormHook, attach_tok_count_hooks, init_meta_moe
+from mamba_ssm.moe_utils import TensorNormHook, attach_tok_count_hooks, init_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 from tests.moe.test_utils import (
     mean_loss_fn,
@@ -370,7 +370,7 @@ class TestMoEModel(_TestBase):
         with torch.device("meta"):
             meta_model = MambaLMHeadModel(self.cfg)
         assert all(p.device == torch.device("meta") for p in meta_model.parameters())
-        init_meta_moe(meta_model, verbose=False)
+        init_moe(meta_model, verbose=False)
         assert all(p.device.type == "cuda" for p in meta_model.parameters())
         inputs = self.get_input_toks()
         meta_model(inputs)
@@ -1182,7 +1182,7 @@ class TestMoEUtils(_TestBase):
         cfg = deepcopy(self.cfg)
         cfg.moe_cfg["moe_impl"] = moe_impl
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
-        init_meta_moe(model)
+        init_moe(model)
         hook_dict = {}
         for name, mod in model.named_modules():
             if isinstance(mod, (Block, nn.Embedding, MoE, MHA, Mamba2, GatedMLP)):

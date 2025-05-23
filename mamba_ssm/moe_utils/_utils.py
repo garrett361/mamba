@@ -126,7 +126,7 @@ def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
 
 
 @torch.no_grad()
-def init_meta_moe(
+def init_moe(
     model: MambaLMHeadModel,
     device: Optional[torch.cuda.device] = None,
     initializer_range: float = 0.02,
@@ -143,8 +143,9 @@ def init_meta_moe(
     """
     Move a meta-device moe model to a CUDA device and initialize its parameters.
     """
-    # Move to cuda and initialize.
-    model.to_empty(device=device or torch.cuda.current_device())
+    # Move to device and initialize, if using meta tensors:
+    if any(p.is_meta for p in model.parameters()):
+        model.to_empty(device=device or torch.cuda.current_device())
 
     # First, default init anything that can be default initialized
     for n, m in model.named_modules():
