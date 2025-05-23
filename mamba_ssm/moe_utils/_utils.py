@@ -311,9 +311,15 @@ def get_dcp_state_dict(
 
 
 class TokenCounterHook:
-    def __init__(self, counter: TokenCounter) -> None:
+    def __init__(self, module: nn.Module) -> None:
         self.count = 0
-        self._handle = counter.register_forward_hook(self)
+        counter_modules = [m for m in module.modules() if isinstance(m, TokenCounter)]
+        if len(counter_modules) != 1:
+            raise RuntimeError(
+                f"{self.__class__.__name__} can only be attached to modules which contain exactly"
+                f" one TokenCounter instance, not {module=}"
+            )
+        self._handle = counter_modules[0].register_forward_hook(self)
 
     def reset(self) -> None:
         self.count = 0
@@ -335,12 +341,10 @@ class TokenCounterHook:
 def attach_tok_count_hooks(
     model: MambaLMHeadModel,
 ) -> dict[str, TokenCounterHook]:
-    layers = model.backbone.layers
     hook_dict = {}
-    for idx_str, block in layers.items():
-        for m in block.modules():
-            if isinstance(m, TokenCounter):
-                hook_dict[idx_str] = TokenCounterHook(m)
+    for fqn, mod in model.named_modules():
+        if isinstance(mod, MoE):
+            hook_dict[fqn] = TokenCounterHook(mod)
     return hook_dict
 
 
