@@ -27,7 +27,7 @@ from mamba_ssm.modules.moe import (
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
 )
-from mamba_ssm.moe_utils import TensorNormHook, attach_tok_count_hooks, init_moe
+from mamba_ssm.moe_utils import TensorMagnitudeHook, attach_tok_count_hooks, init_moe
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 from tests.moe.test_utils import (
     mean_loss_fn,
@@ -1176,7 +1176,7 @@ class TestMoEUtils(_TestBase):
             assert h.count.numel() == cfg.moe_cfg["n_routed_experts"]
 
     @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
-    def test_norm_hooks(self, moe_impl) -> None:
+    def test_mag_hooks(self, moe_impl) -> None:
         skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
@@ -1186,17 +1186,17 @@ class TestMoEUtils(_TestBase):
         hook_dict = {}
         for name, mod in model.named_modules():
             if isinstance(mod, (Block, nn.Embedding, MoE, MHA, Mamba2, GatedMLP)):
-                hook_dict[name] = TensorNormHook(mod)
+                hook_dict[name] = TensorMagnitudeHook(mod)
         inputs = self.get_input_toks()
         iters = 3
         for _ in range(iters):
             model(inputs)
         for h in hook_dict.values():
-            assert isinstance(h.mean_norm, float)
+            assert isinstance(h.mean, torch.Tensor)
             assert h._iters == iters
-        stats = {n: h.mean_norm for n, h in hook_dict.items()}
+        stats = {n: h.mean for n, h in hook_dict.items()}
         # Reset everything
         for h in hook_dict.values():
             h.reset()
-            assert h.mean_norm == 0.0
+            assert h.mean == 0.0
             assert h._iters == 0

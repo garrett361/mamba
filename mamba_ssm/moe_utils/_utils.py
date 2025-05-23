@@ -142,6 +142,9 @@ def init_moe(
 ) -> None:
     """
     Move a meta-device moe model to a CUDA device and initialize its parameters.
+
+    NOTE: @goon - the default init makes the MLP contributions to the residual stream much smaller
+    than those from the mixer layer. Is that desired?
     """
     # Move to device and initialize, if using meta tensors:
     if any(p.is_meta for p in model.parameters()):
@@ -325,6 +328,9 @@ class TokenCounterHook:
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(count={self.count})"
 
+    def __str__(self) -> str:
+        return repr(self)
+
 
 def attach_tok_count_hooks(
     model: MambaLMHeadModel,
@@ -338,45 +344,44 @@ def attach_tok_count_hooks(
     return hook_dict
 
 
-class TensorNormHook:
+@torch.compile
+def _get_mag(tensor) -> torch.Tensor:
+    # Coincides with tensor.std() if tensor.mean() == 0.0.
+    return tensor.pow(2).mean().sqrt()
+
+
+class TensorMagnitudeHook:
+    """
+    Computes average per-element magnitude of the outputs tensor.
+    """
+
     def __init__(
         self,
         module: nn.Module,
-        norm_type: float = 2.0,
-        error_if_nonfinite: bool = False,
-        foreach=None,
     ) -> None:
-        self._norm_sum = 0
-        self._iters = 0
+        self.reset()
         self._handle = module.register_forward_hook(self)
-        self.norm_type = norm_type
-        self.error_if_nonfinite = error_if_nonfinite
-        self.foreach = foreach
 
     def reset(self) -> None:
-        self._norm_sum = 0
+        self._mag_sum = 0
         self._iters = 0
 
     @property
-    def mean_norm(self) -> float:
+    def mean(self) -> torch.Tensor:
         if not self._iters:
-            return 0.0
-        return self._norm_sum.item() / self._iters
+            raise RuntimeError("No stats recorded yet.")
+        return self._mag_sum / self._iters
 
     @torch.no_grad
     def __call__(self, module: nn.Module, args, output: torch.Tensor) -> None:
-        self._norm_sum += nn.utils.get_total_norm(
-            output.detach(),
-            norm_type=self.norm_type,
-            error_if_nonfinite=self.error_if_nonfinite,
-            foreach=self.foreach,
-        )
+        self._mag_sum += _get_mag(output.detach())
         self._iters += 1
 
     def remove(self) -> None:
         self._handle.remove()
 
     def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(mean_norm={self.mean_norm}, iters={self._iter})"
-        )
+        return f"{self.__class__.__name__}(mean={self.mean}, iters={self._iters})"
+
+    def __str__(self) -> str:
+        return repr(self)

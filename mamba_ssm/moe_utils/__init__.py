@@ -1,5 +1,5 @@
 from mamba_ssm.moe_utils._utils import (
-    TensorNormHook,
+    TensorMagnitudeHook,
     TokenCounterHook,
     act_ckpt_moe,
     attach_tok_count_hooks,
