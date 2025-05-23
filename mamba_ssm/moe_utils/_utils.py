@@ -21,6 +21,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.moe import MoE, TokenCounter
 
@@ -371,7 +372,7 @@ class TensorMagnitudeHook:
         self._iters = 0
 
     @property
-    def mean(self) -> torch.Tensor:
+    def mag(self) -> torch.Tensor:
         if not self._iters:
             raise RuntimeError("No stats recorded yet.")
         return self._mag_sum / self._iters
@@ -385,7 +386,17 @@ class TensorMagnitudeHook:
         self._handle.remove()
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(mean={self.mean}, iters={self._iters})"
+        return f"{self.__class__.__name__}(mean={self.mag}, iters={self._iters})"
 
     def __str__(self) -> str:
         return repr(self)
+
+
+def attach_block_magnitude_hooks(
+    model: MambaLMHeadModel,
+) -> dict[str, TensorMagnitudeHook]:
+    hook_dict = {}
+    for fqn, mod in model.named_modules():
+        if isinstance(mod, Block):
+            hook_dict[fqn] = TensorMagnitudeHook(mod)
+    return hook_dict
