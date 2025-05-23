@@ -228,22 +228,19 @@ class MixerModel(nn.Module):
 
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
-        residual = None
         for layer_idx in sorted(self.layers):
             # TODO: @goon - remove record_function
             with record_function(f"{layer_idx=}"):
                 layer = self.layers[layer_idx]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     hidden_states,
-                    residual,
                     inference_params=inference_params,
                     **mixer_kwargs,
                 )
-        # Set prenorm=False here since we don't need the residual
         hidden_states = get_normed_hidden_states(
             self.norm_f,
             hidden_states,
-            residual,
+            residual=None,
             fused_add_norm=self.fused_add_norm,
             residual_in_fp32=self.residual_in_fp32,
         )
