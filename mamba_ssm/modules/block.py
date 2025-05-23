@@ -1,5 +1,4 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
-from typing import Optional
 
 from torch import Tensor, nn
 
@@ -11,7 +10,13 @@ from mamba_ssm.ops.triton.layer_norm import (
 
 class Block(nn.Module):
     def __init__(
-        self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
+        self,
+        dim,
+        mixer_cls,
+        mlp_cls,
+        norm_cls=nn.LayerNorm,
+        fused_add_norm=False,
+        residual_in_fp32=False,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -37,13 +42,13 @@ class Block(nn.Module):
             self.mlp = None
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
-            assert isinstance(
-                self.norm, (nn.LayerNorm, RMSNorm)
-            ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+            assert isinstance(self.norm, (nn.LayerNorm, RMSNorm)), (
+                "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+            )
 
     def forward(
-            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, **mixer_kwargs
-    ):
+        self, hidden_states: Tensor, inference_params=None, **mixer_kwargs
+    ) -> Tensor:
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -53,7 +58,7 @@ class Block(nn.Module):
         hidden_states, residual = get_normed_hidden_states_and_residual(
             self.norm,
             hidden_states,
-            residual,
+            residual=None,
             fused_add_norm=self.fused_add_norm,
             residual_in_fp32=self.residual_in_fp32,
         )
@@ -70,8 +75,8 @@ class Block(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
             )
             hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual
+        out_dtype = hidden_states.dtype
+        return (hidden_states + residual).to(dtype=out_dtype)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(
