@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     _GROUPED_MM_ALIGNMENT,
@@ -25,10 +26,11 @@ from mamba_ssm.modules.moe import (
     _SimpleRoutedExperts,
 )
 from mamba_ssm.moe_utils import (
+    TokenCounterHook,
+    attach_magnitude_hooks,
     attach_tok_count_hooks,
     init_moe,
 )
-from mamba_ssm.moe_utils._utils import TokenCounterHook, attach_block_magnitude_hooks
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 from tests.moe.test_utils import (
     mean_loss_fn,
@@ -1162,19 +1164,16 @@ class TestTriton(_TestBase):
 
 
 class TestMoEUtils(_TestBase):
-    @pytest.mark.parametrize("moe_impl", list(NON_EP_EXPERT_CLASSES))
-    def test_attach_tok_count_hooks(self, moe_impl) -> None:
-        skip_moe_impl_if_no_h100s(NON_EP_EXPERT_CLASSES[moe_impl])
+    def test_attach_tok_count_hooks(self) -> None:
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
-        cfg.moe_cfg["moe_impl"] = moe_impl
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         hook_dict = attach_tok_count_hooks(model)
         assert len(hook_dict) == sum(isinstance(m, MoE) for m in model.modules())
         inputs = self.get_input_toks()
         model(inputs)
         for h in hook_dict.values():
-            assert h.count.numel() == cfg.moe_cfg["n_routed_experts"]
+            assert h.value.numel() == cfg.moe_cfg["n_routed_experts"]
 
     def test_count_hooks_raise(self) -> None:
         torch.manual_seed(42)
@@ -1184,23 +1183,23 @@ class TestMoEUtils(_TestBase):
         with pytest.raises(RuntimeError):
             TokenCounterHook(model.lm_head)
 
-    def test_attach_block_magnitude_hooks(self) -> None:
+    def test_attach_magnitude_hooks(self) -> None:
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         init_moe(model)
-        hook_dict = attach_block_magnitude_hooks(model)
+        hook_dict = attach_magnitude_hooks(model, Block)
         inputs = self.get_input_toks()
         iters = 3
         for _ in range(iters):
             model(inputs)
         for h in hook_dict.values():
-            assert isinstance(h.mag, torch.Tensor)
+            assert isinstance(h.value, torch.Tensor)
             assert h._iters == iters
-        stats = {n: h.mag for n, h in hook_dict.items()}
+        stats = {n: h.value for n, h in hook_dict.items()}
         # Reset everything
         for h in hook_dict.values():
             h.reset()
             with pytest.raises(RuntimeError):
-                h.mag
+                h.value
             assert h._iters == 0
