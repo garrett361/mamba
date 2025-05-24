@@ -5,9 +5,9 @@ from timing_utils import CUDATimer
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES
+from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES_AND_SIMPLE
 
-moe_impls = list(NON_EP_EXPERT_CLASSES)
+moe_impls = list(NON_EP_EXPERT_CLASSES_AND_SIMPLE)
 
 
 if __name__ == "__main__":

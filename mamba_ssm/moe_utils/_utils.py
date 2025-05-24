@@ -1,9 +1,11 @@
 import functools
 import math
+from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Callable, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -21,7 +23,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
-from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.moe import MoE, TokenCounter
 
@@ -304,16 +305,73 @@ def get_dcp_state_dict(
     model: nn.Module | list[nn.Module],
     optimizer: Optional[torch.optim.Optimizer | list[torch.optim.Optimizer]] = None,
 ) -> dict[str, Stateful]:
-    state_dict = {}
+    state_dict: dict[str, Stateful] = {}
     state_dict["model"] = ModelState(model)
     if optimizer is not None:
         state_dict["optim"] = OptimState(model, optimizer)
     return state_dict
 
 
-class TokenCounterHook:
+class Hook(ABC):
+    @property
+    @abstractmethod
+    def value(self) -> torch.Tensor: ...
+
+    @value.setter
+    @abstractmethod
+    def value(self, value: torch.Tensor) -> None: ...
+
+    @abstractmethod
+    def reset(self) -> None: ...
+
+    @abstractmethod
+    def __call__(self, module: nn.Module, args, output: torch.Tensor) -> None: ...
+
+    @abstractmethod
+    def remove(self) -> None: ...
+
+
+class HookDict(dict):
+    # TODO: @goon - reduce, reset, remove
+    def __setitem__(self, key: str, value: Hook, /) -> None:
+        if not isinstance(key, str):
+            raise TypeError(f"All keys must be strings, not {key=}")
+        if not isinstance(value, Hook):
+            raise TypeError(f"All values must be Hook subclasses, not {value=}")
+        return super().__setitem__(key, value)
+
+    def reset(self) -> None:
+        for hook in self.values():
+            hook.reset()
+
+    def remove(self) -> None:
+        for hook in self.values():
+            hook.remove()
+
+    def all_reduce(self, group: Optional[dist.ProcessGroup] = None) -> None:
+        self._do_collective(dist.all_reduce, group=group)
+
+    def reduce(self, dst: int = 0, group: Optional[dist.ProcessGroup] = None) -> None:
+        # Only rank `dst` gets accurate results.
+        self._do_collective(dist.reduce, group=group, dst=dst)
+
+    def _do_collective(
+        self,
+        in_place_coll,
+        group: Optional[dist.ProcessGroup] = None,
+        **coll_kwargs,
+    ) -> None:
+        # Concatenate and perform a single reduce for speed. Only rank `dst` gets accurate results.
+        # HACK: add trailing trivial dim to avoid errors on concatenating zero-dim tensors, then
+        # remove
+        all_values = torch.cat([h.value[..., None] for h in self.values()])
+        in_place_coll(all_values, group=group, **coll_kwargs)
+        for hook, val_chunk in zip(self.values(), all_values.chunk(len(self))):
+            hook.value = val_chunk[..., 0]  # Remove trailing dim, complete HACK
+
+
+class TokenCounterHook(Hook):
     def __init__(self, module: nn.Module) -> None:
-        self.count = 0
         counter_modules = [m for m in module.modules() if isinstance(m, TokenCounter)]
         if len(counter_modules) != 1:
             raise RuntimeError(
@@ -321,19 +379,30 @@ class TokenCounterHook:
                 f" one TokenCounter instance, not {module=}"
             )
         self._handle = counter_modules[0].register_forward_hook(self)
+        self.reset()
+
+    @property
+    def value(self) -> torch.Tensor:
+        if not isinstance(self._count, torch.Tensor):
+            raise RuntimeError("No stats recorded yet.")
+        return self._count
+
+    @value.setter
+    def value(self, value: torch.Tensor) -> None:
+        self._count = value
 
     def reset(self) -> None:
-        self.count = 0
+        self._count = 0
 
     @torch.no_grad
     def __call__(self, module: nn.Module, args, output: torch.Tensor) -> None:
-        self.count += output.detach().clone()
+        self._count += output.detach().clone()
 
     def remove(self) -> None:
         self._handle.remove()
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(count={self.count})"
+        return f"{self.__class__.__name__}(count={self._count})"
 
     def __str__(self) -> str:
         return repr(self)
@@ -342,7 +411,7 @@ class TokenCounterHook:
 def attach_tok_count_hooks(
     model: MambaLMHeadModel,
 ) -> dict[str, TokenCounterHook]:
-    hook_dict = {}
+    hook_dict = HookDict()
     for fqn, mod in model.named_modules():
         if isinstance(mod, MoE):
             hook_dict[fqn] = TokenCounterHook(mod)
@@ -355,7 +424,7 @@ def _get_mag(tensor) -> torch.Tensor:
     return tensor.pow(2).mean().sqrt()
 
 
-class TensorMagnitudeHook:
+class TensorMagnitudeHook(Hook):
     """
     Computes average per-element magnitude of the outputs tensor.
     """
@@ -368,35 +437,44 @@ class TensorMagnitudeHook:
         self._handle = module.register_forward_hook(self)
 
     def reset(self) -> None:
-        self._mag_sum = 0
+        self._mag = 0
         self._iters = 0
 
     @property
-    def mag(self) -> torch.Tensor:
-        if not self._iters:
+    def value(self) -> torch.Tensor:
+        if not isinstance(self._mag, torch.Tensor):
             raise RuntimeError("No stats recorded yet.")
-        return self._mag_sum / self._iters
+        return self._mag
+
+    @value.setter
+    def value(self, value: torch.Tensor) -> None:
+        self._mag = value
 
     @torch.no_grad
     def __call__(self, module: nn.Module, args, output: torch.Tensor) -> None:
-        self._mag_sum += _get_mag(output.detach())
         self._iters += 1
+        self._mag = (
+            self._mag * ((self._iters - 1) / self._iters)
+            + _get_mag(output.detach().clone()) / self._iters
+        )
 
     def remove(self) -> None:
         self._handle.remove()
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(mean={self.mag}, iters={self._iters})"
+        return f"{self.__class__.__name__}(mag={self._mag}, iters={self._iters})"
 
     def __str__(self) -> str:
         return repr(self)
 
 
-def attach_block_magnitude_hooks(
-    model: MambaLMHeadModel,
+def attach_magnitude_hooks(
+    model: MambaLMHeadModel, classes: nn.Module | list[nn.Module]
 ) -> dict[str, TensorMagnitudeHook]:
-    hook_dict = {}
+    if isinstance(classes, nn.Module):
+        classes = [nn.Module]
+    hook_dict = HookDict()
     for fqn, mod in model.named_modules():
-        if isinstance(mod, Block):
+        if isinstance(mod, classes):
             hook_dict[fqn] = TensorMagnitudeHook(mod)
     return hook_dict

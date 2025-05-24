@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES
+from mamba_ssm.modules.moe import NON_EP_EXPERT_CLASSES_AND_SIMPLE
 
 
 def trace_handler(prof):
@@ -54,7 +54,7 @@ if __name__ == "__main__":
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--active", type=int, default=2)
     parser.add_argument("--trace_dir", default="/gpfs/goon/prof/mamba/experts")
-    parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES))
+    parser.add_argument("--impls", type=str, default=",".join(NON_EP_EXPERT_CLASSES_AND_SIMPLE))
     parser.add_argument("--no_bwd", action="store_true")
     parser.add_argument("--compile", action="store_true")
 
@@ -91,7 +91,7 @@ if __name__ == "__main__":
         .indices
     )
     for impl in impls:
-        model = NON_EP_EXPERT_CLASSES[impl](
+        model = NON_EP_EXPERT_CLASSES_AND_SIMPLE[impl](
             in_features=args.in_features,
             d_intermediate=args.d_intermediate,
             n_routed_experts=args.n_routed_experts,

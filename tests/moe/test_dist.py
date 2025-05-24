@@ -15,6 +15,7 @@ from torch.distributed.tensor import DTensor
 from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
@@ -22,7 +23,13 @@ from mamba_ssm.modules.moe import (
     RoutedExpertsTorchEPGroupedMM,
     TokenCounter,
 )
-from mamba_ssm.moe_utils import fully_shard_moe, get_dcp_state_dict, init_moe
+from mamba_ssm.moe_utils import (
+    attach_magnitude_hooks,
+    attach_tok_count_hooks,
+    fully_shard_moe,
+    get_dcp_state_dict,
+    init_moe,
+)
 from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
 
 
@@ -816,6 +823,51 @@ class TestMoEUtils(_TestBase):
             )
 
         dist.barrier()
+
+    def test_attach_tok_count_hooks(self) -> None:
+        # Test fuctionality
+        torch.manual_seed(42)
+        cfg = deepcopy(self.cfg)
+        model = MambaLMHeadModel(cfg, **self.factory_kwargs)
+        hook_dict = attach_tok_count_hooks(model)
+        assert len(hook_dict) == sum(isinstance(m, MoE) for m in model.modules())
+        inputs = self.get_input_toks()
+        model(inputs)
+        hook_dict.all_reduce()
+        hook_dict.reduce()
+
+        # Test collectives correctness
+        for h in hook_dict.values():
+            h.value = torch.ones_like(h.value)
+        hook_dict.all_reduce()
+        for h in hook_dict.values():
+            assert torch.allclose(h.value, self.world_size * torch.ones_like(h.value))
+
+        hook_dict.reduce()
+        for h in hook_dict.values():
+            if not self.rank:
+                assert torch.allclose(
+                    h.value, self.world_size**2 * torch.ones_like(h.value)
+                )
+            else:
+                assert torch.allclose(
+                    h.value, self.world_size * torch.ones_like(h.value)
+                )
+
+        hook_dict.reset()
+
+    def test_attach_magnitude_hooks(self) -> None:
+        torch.manual_seed(42)
+        cfg = deepcopy(self.cfg)
+        model = MambaLMHeadModel(cfg, **self.factory_kwargs)
+        init_moe(model)
+        hook_dict = attach_magnitude_hooks(model, Block)
+        assert len(hook_dict) == len(model.backbone.layers)
+        inputs = self.get_input_toks()
+        model(inputs)
+        hook_dict.all_reduce()
+        hook_dict.reduce()
+        hook_dict.reset()
 
 
 def compile_breaking_fn(
