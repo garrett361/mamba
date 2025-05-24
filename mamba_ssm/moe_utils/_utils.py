@@ -1,6 +1,7 @@
 import functools
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -19,7 +20,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
@@ -497,3 +498,75 @@ def apply_loss_free_moe_balancing(
         mean_value = hook.value.mean(dtype=torch.float32)
         sign = torch.sign(hook.value - mean_value)
         moe.gate.bias -= lr * sign
+
+
+@dataclass
+class Meshes:
+    dp: Optional[DeviceMesh] = None
+    pp: Optional[DeviceMesh] = None
+    ep: Optional[DeviceMesh] = None
+
+
+def get_meshes(
+    world_size: int,
+    hsdp: bool | int = False,
+    ep: bool | int = False,
+    pp: bool | int = False,
+) -> Meshes:
+    # FSDP
+    if hsdp:
+        hsdp_degree = hsdp if isinstance(hsdp, int) else torch.cuda.device_count()
+        assert not world_size % hsdp_degree, (
+            f"{world_size=} must be divisible by {hsdp_degree=}"
+        )
+
+        dp_mesh = init_device_mesh(
+            "cuda",
+            (world_size // hsdp_degree, hsdp_degree),
+            mesh_dim_names=("outer_dp", "inner_dp"),
+        )
+    else:
+        dp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("inner_dp",))
+
+    # NOTE: @goon - In context parallel, training was much more stable when using separate meshes
+    # for fsdp and CP. Trying the same thing here with EP, but not sure it matters. Don't think it
+    # should, in principle. Also, we may just need separate meshes in the future for more complex
+    # scenarios.
+    if ep:
+        ep_degree = ep if isinstance(ep, int) else world_size
+        assert world_size >= ep, f"{world_size=} must be at least as large as {ep=}"
+        assert not world_size % ep_degree, (
+            f"{world_size=} must be divisible by {ep_degree=}"
+        )
+
+        # Cases:
+        # 1. ep_degree = 1: full replication, no ep_mesh
+        # 2. ep_degree = world_size: ep_mesh is the world
+        # 3. world_size > ep_degree > world_size: 2D mesh with (DP, EP) dims, experts distributed along
+        #    slice.
+        if ep_degree == 1:
+            ep_mesh = None
+        elif ep_degree == world_size:
+            ep_mesh = init_device_mesh(
+                "cuda",
+                (world_size,),
+                mesh_dim_names=("inner_ep",),
+            )
+        else:
+            ep_mesh = init_device_mesh(
+                "cuda",
+                (world_size // ep_degree, ep_degree),
+                mesh_dim_names=("outer_ep", "inner_ep"),
+            )
+
+            ep_mesh = init_device_mesh(
+                "cuda",
+                (world_size // ep_degree, ep_degree),
+                mesh_dim_names=("outer_ep", "inner_ep"),
+            )
+    else:
+        ep_mesh = None
+
+    # TODO: @goon -
+    pp_mesh = None
+    return Meshes(dp=dp_mesh, ep=ep_mesh, pp=pp_mesh)

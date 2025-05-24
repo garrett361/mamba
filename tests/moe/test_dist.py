@@ -28,6 +28,7 @@ from mamba_ssm.moe_utils import (
     attach_tok_count_hooks,
     fully_shard_moe,
     get_dcp_state_dict,
+    get_meshes,
     init_moe,
 )
 from mamba_ssm.moe_utils._utils import apply_loss_free_moe_balancing
@@ -887,6 +888,16 @@ class TestMoEUtils(_TestBase):
         ]
         for b0, b1 in zip(pre_biases, post_biases):
             assert not torch.allclose(b0, b1)
+
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_get_meshes(self) -> None:
+        for hsdp in (False, self.world_size // 2):
+            for ep in (False, self.world_size, self.world_size // 2):
+                meshes = get_meshes(
+                    world_size=self.world_size, hsdp=hsdp, ep=ep, pp=False
+                )
+
 
 def compile_breaking_fn(
     x: torch.Tensor,
