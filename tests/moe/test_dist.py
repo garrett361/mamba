@@ -413,10 +413,12 @@ class TestModelEP(_TestBase):
         outputs_ep = model_ep(inputs_ep).logits
 
         # Grads should match with an avg-over-batches type loss
-        F.cross_entropy(outputs.view(-1, outputs.size(-1)), inputs.view(-1).long())
+        F.cross_entropy(
+            outputs.view(-1, outputs.size(-1)), inputs.view(-1).long()
+        ).backward()
         F.cross_entropy(
             outputs_ep.view(-1, outputs_ep.size(-1)), inputs_ep.view(-1).long()
-        )
+        ).backward()
 
         _test_grads(model, model_ep, tol=self.tol)
 
