@@ -355,6 +355,7 @@ class HookDict(dict):
         # Only rank `dst` gets accurate results.
         self._do_collective(dist.reduce, group=group, dst=dst)
 
+    @torch.no_grad
     def _do_collective(
         self,
         in_place_coll,
