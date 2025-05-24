@@ -872,16 +872,19 @@ class TestMoEUtils(_TestBase):
         hook_dict.reset()
 
     def test_apply_loss_free_moe_balancing(self) -> None:
-        # Test fuctionality
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         hook_dict = attach_tok_count_hooks(model)
         inputs = self.get_input_toks()
         model(inputs)
-        pre_biases = [m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)]
+        pre_biases = [
+            m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)
+        ]
         apply_loss_free_moe_balancing(1.0, model, hook_dict)
-        post_biases = [m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)]
+        post_biases = [
+            m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)
+        ]
         for b0, b1 in zip(pre_biases, post_biases):
             assert not torch.allclose(b0, b1)
 
