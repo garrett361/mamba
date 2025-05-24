@@ -2,6 +2,7 @@ from mamba_ssm.moe_utils._utils import (
     TensorMagnitudeHook,
     TokenCounterHook,
     act_ckpt_moe,
+    apply_loss_free_moe_balancing,
     attach_magnitude_hooks,
     attach_tok_count_hooks,
     fully_shard_moe,

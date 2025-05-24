@@ -478,3 +478,21 @@ def attach_magnitude_hooks(
         if isinstance(mod, classes):
             hook_dict[fqn] = TensorMagnitudeHook(mod)
     return hook_dict
+
+
+def apply_loss_free_moe_balancing(
+    lr: float,
+    model: nn.Module,
+    hook_dict: HookDict[str, TokenCounterHook],
+    group: Optional[dist.ProcessGroup] = None,
+) -> None:
+    """
+    Apply loss-free moe balancing: arXiv:2408.15664.
+    """
+    hook_dict.all_reduce(group=group)
+    for fqn, hook in hook_dict.items():
+        moe = model.get_submodule(fqn)
+        assert moe.gate.bias is not None
+        mean_value = hook.value.mean(dtype=torch.float32)
+        sign = torch.sign(hook.value - mean_value)
+        moe.gate.bias -= lr * sign

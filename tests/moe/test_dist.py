@@ -30,6 +30,7 @@ from mamba_ssm.moe_utils import (
     get_dcp_state_dict,
     init_moe,
 )
+from mamba_ssm.moe_utils._utils import apply_loss_free_moe_balancing
 from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
 
 
@@ -116,6 +117,7 @@ class _TestBase(DTest):
             "n_activated_experts": 1,
             "n_shared_experts": 1,
             "d_intermediate": 64,
+            "gate_bias": True,
         }
 
     @property
@@ -869,6 +871,19 @@ class TestMoEUtils(_TestBase):
         hook_dict.reduce()
         hook_dict.reset()
 
+    def test_apply_loss_free_moe_balancing(self) -> None:
+        # Test fuctionality
+        torch.manual_seed(42)
+        cfg = deepcopy(self.cfg)
+        model = MambaLMHeadModel(cfg, **self.factory_kwargs)
+        hook_dict = attach_tok_count_hooks(model)
+        inputs = self.get_input_toks()
+        model(inputs)
+        pre_biases = [m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)]
+        apply_loss_free_moe_balancing(1.0, model, hook_dict)
+        post_biases = [m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)]
+        for b0, b1 in zip(pre_biases, post_biases):
+            assert not torch.allclose(b0, b1)
 
 def compile_breaking_fn(
     x: torch.Tensor,
