@@ -5,6 +5,7 @@ from mamba_ssm.moe_utils._utils import (
     apply_loss_free_moe_balancing,
     attach_magnitude_hooks,
     attach_tok_count_hooks,
+    clip_grad_norm_,
     fully_shard_moe,
     get_dcp_state_dict,
     get_meshes,
