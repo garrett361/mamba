@@ -110,7 +110,6 @@ if __name__ == "__main__":
         parser.add_argument("--compile", action="store_true")
         parser.add_argument("--explicit_fwd_prefetch", action="store_true")
         parser.add_argument("--explicit_bwd_prefetch", action="store_true")
-        parser.add_argument("--no_reshard", action="store_true")
 
         args = parser.parse_args()
         if rank == 0:
@@ -224,7 +223,6 @@ if __name__ == "__main__":
                     mp_policy=mp_policy,
                     explicit_fwd_prefetch=args.explicit_fwd_prefetch,
                     explicit_bwd_prefetch=args.explicit_bwd_prefetch,
-                    no_reshard=args.no_reshard,
                 )
 
                 if args.low_cpu_fsdp:

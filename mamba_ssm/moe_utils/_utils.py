@@ -5,6 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Iterable, Optional
+from warnings import warn
 
 import torch
 import torch.distributed as dist
@@ -69,6 +70,11 @@ def fully_shard_moe(
                 # Don't reshard due to comms costs
                 assert ep_mesh.ndim == 2, f"{ep_mesh.dim=}"
                 outer_ep_mesh_dim = ep_mesh.mesh_dim_names[0]
+                # Expectation: the inner dim is EP, outer DP
+                warn(
+                    f"Received 2D {ep_mesh=}, applying fully_shard over the outer mesh dim: {outer_ep_mesh_dim}.",
+                    stacklevel=1,
+                )
                 fully_shard(
                     block.mlp.experts,
                     mesh=ep_mesh[outer_ep_mesh_dim],
@@ -552,77 +558,6 @@ def get_meshes(
                 (world_size // ep_degree, ep_degree),
                 mesh_dim_names=("outer_ep", "inner_ep"),
             )
-
-            ep_mesh = init_device_mesh(
-                "cuda",
-                (world_size // ep_degree, ep_degree),
-                mesh_dim_names=("outer_ep", "inner_ep"),
-            )
-    else:
-        ep_mesh = None
-
-    # TODO: @goon -
-    pp_mesh = None
-    return Meshes(dp=dp_mesh, ep=ep_mesh, pp=pp_mesh)
-
-
-def get_meshes(
-    world_size: int,
-    hsdp: bool | int = False,
-    ep: bool | int = False,
-    pp: bool | int = False,
-) -> Meshes:
-    # FSDP
-    if hsdp:
-        hsdp_degree = hsdp if isinstance(hsdp, int) else torch.cuda.device_count()
-        assert not world_size % hsdp_degree, (
-            f"{world_size=} must be divisible by {hsdp_degree=}"
-        )
-
-        dp_mesh = init_device_mesh(
-            "cuda",
-            (world_size // hsdp_degree, hsdp_degree),
-            mesh_dim_names=("outer_dp", "inner_dp"),
-        )
-    else:
-        dp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("inner_dp",))
-
-    # NOTE: @goon - In context parallel, training was much more stable when using separate meshes
-    # for fsdp and CP. Trying the same thing here with EP, but not sure it matters. Don't think it
-    # should, in principle. Also, we may just need separate meshes in the future for more complex
-    # scenarios.
-    if ep:
-        ep_degree = ep if isinstance(ep, int) else world_size
-        assert world_size >= ep, f"{world_size=} must be at least as large as {ep=}"
-        assert not world_size % ep_degree, (
-            f"{world_size=} must be divisible by {ep_degree=}"
-        )
-
-        # Cases:
-        # 1. ep_degree = 1: full replication, no ep_mesh
-        # 2. ep_degree = world_size: ep_mesh is the world
-        # 3. world_size > ep_degree > world_size: 2D mesh with (DP, EP) dims, experts distributed along
-        #    slice.
-        if ep_degree == 1:
-            ep_mesh = None
-        elif ep_degree == world_size:
-            ep_mesh = init_device_mesh(
-                "cuda",
-                (world_size,),
-                mesh_dim_names=("inner_ep",),
-            )
-        else:
-            ep_mesh = init_device_mesh(
-                "cuda",
-                (world_size // ep_degree, ep_degree),
-                mesh_dim_names=("outer_ep", "inner_ep"),
-            )
-
-            ep_mesh = init_device_mesh(
-                "cuda",
-                (world_size // ep_degree, ep_degree),
-                mesh_dim_names=("outer_ep", "inner_ep"),
-            )
     else:
         ep_mesh = None
 
@@ -652,7 +587,7 @@ def clip_grad_norm_(
             else:
                 g_dict[None].append(p.grad)
 
-    total_norm = 0.0
+    total_norm = None
     for grads in g_dict.values():
         # Need to reduce grads with different meshes independently; unsupported op otherwise.
         norm = torch.nn.utils.get_total_norm(
@@ -663,7 +598,10 @@ def clip_grad_norm_(
             # If only using PP, total_norm will be a local tensor.
 
             norm = norm.full_tensor()
-        total_norm += norm
+        if total_norm is None:
+            total_norm = norm
+        else:
+            total_norm += norm
 
     if pp_mesh is not None:
         if math.isinf(norm_type):
@@ -674,5 +612,4 @@ def clip_grad_norm_(
             total_norm **= 1.0 / norm_type
 
     torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
-    assert isinstance(total_norm, torch.Tensor)  # mypy
     return total_norm
