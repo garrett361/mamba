@@ -38,7 +38,6 @@ def fully_shard_moe(
     reshard_lm_head_after_fwd: bool = False,
     explicit_fwd_prefetch: bool = True,
     explicit_bwd_prefetch: bool = False,
-    no_reshard: bool = False,
 ) -> None:
     # TODO: @goon - hsdp?
     if mp_policy is None:
@@ -106,13 +105,6 @@ def fully_shard_moe(
         reversed_blocks = list(reversed(blocks))
         for b_prev, b_next in zip(reversed_blocks[:-1], reversed_blocks[1:]):
             b_prev.set_modules_to_backward_prefetch([b_next])
-
-    if no_reshard:
-        model.lm_head.set_reshard_after_backward(False)
-        model.backbone.embedding.set_reshard_after_backward(False)
-        for block in model.backbone.layers.values():
-            block.set_reshard_after_backward(False)
-        model.set_reshard_after_backward(False)
 
 
 def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
