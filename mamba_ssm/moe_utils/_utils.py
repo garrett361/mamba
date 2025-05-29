@@ -81,7 +81,6 @@ def fully_shard_moe(
                     mp_policy=mp_policy,
                     reshard_after_forward=False,
                 )
-                block.mlp.experts.set_reshard_after_backward(False)
             else:
                 raise ValueError(
                     f"Expected ep_mesh to be None or a 1- or 2-D DeviceMesh, got {ep_mesh=}"
