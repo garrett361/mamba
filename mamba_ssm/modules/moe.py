@@ -1,6 +1,7 @@
 import math
 from abc import ABC, abstractmethod
 from typing import Callable, Literal, Optional
+from warnings import warn
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -194,10 +195,16 @@ class MoE(nn.Module):
             raise ValueError(
                 f"{n_routed_experts=} must be divisible by {ep_mesh.size()=}"
             )
-        if ep_mesh is not None and ep_mesh.ndim != 1:
-            raise ValueError(
-                f"The expert parallel mesh must be one-dimensional: {ep_mesh.ndim=}"
-            )
+        if ep_mesh is not None:
+            if ep_mesh.ndim == 2:
+                inner_ep_mesh_dim = ep_mesh.mesh_dim_names[1]
+                ep_mesh = ep_mesh[inner_ep_mesh_dim]
+                warn(
+                    f"Received 2D {ep_mesh=}, using inner mesh dim ({inner_ep_mesh_dim}) as the EP mesh.",
+                    stacklevel=1,
+                )
+            elif ep_mesh.ndim > 2:
+                raise ValueError(f"Expected 1D or 2D ep_mesh, received {ep_mesh}")
 
         super().__init__()
         self.in_features = in_features
