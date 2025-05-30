@@ -378,6 +378,43 @@ class TestMoEModel(_TestBase):
         inputs = self.get_input_toks()
         meta_model(inputs)
 
+    def test_pp_fwd(self) -> None:
+        torch.manual_seed(42)
+        # The full model:
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
+
+        # Create three PP sections
+        model_pp_first = deepcopy(model)
+        model_pp_mid = deepcopy(model)
+        model_pp_last = deepcopy(model)
+
+        # First stage: embedding only
+        layer_idxs = sorted(model_pp_first.backbone.layers)
+        for idx in layer_idxs:
+            del model_pp_first.backbone.layers[idx]
+        model_pp_first.lm_head = None
+        model_pp_first.backbone.norm_f = None
+
+        # Mid stage: first block only
+        model_pp_mid.backbone.embedding = None
+        model_pp_mid.lm_head = None
+        model_pp_mid.backbone.norm_f = None
+        for idx in layer_idxs[1:]:
+            del model_pp_mid.backbone.layers[idx]
+
+        # Last stage: first block only
+        model_pp_last.backbone.embedding = None
+        del model_pp_last.backbone.layers[layer_idxs[0]]
+
+        inputs = self.get_input_toks()
+
+        outputs = model(inputs).logits
+
+        outputs_first = model_pp_first(inputs)
+        outputs_mid = model_pp_mid(outputs_first)
+        outputs_last = model_pp_last(outputs_mid).logits
+        torch.testing.assert_close(outputs_last, outputs)
+
 
 def test_bincount_impl_equiv():
     """

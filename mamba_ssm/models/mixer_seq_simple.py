@@ -24,9 +24,19 @@ from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 
 try:
-    from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn,  get_normed_hidden_states
+    from mamba_ssm.ops.triton.layer_norm import (
+        RMSNorm,
+        get_normed_hidden_states,
+        layer_norm_fn,
+        rms_norm_fn,
+    )
 except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn, get_normed_hidden_states = None, None, None, None
+    RMSNorm, layer_norm_fn, rms_norm_fn, get_normed_hidden_states = (
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 def create_block(
@@ -227,7 +237,10 @@ class MixerModel(nn.Module):
         }
 
     def forward(self, input_ids, inference_params=None, **mixer_kwargs):
-        hidden_states = self.embedding(input_ids)
+        if self.embedding is not None:
+            hidden_states = self.embedding(input_ids)
+        else:
+            hidden_states = input_ids
         for layer_idx in sorted(self.layers):
             # TODO: @goon - remove record_function
             with record_function(f"{layer_idx=}"):
@@ -237,13 +250,14 @@ class MixerModel(nn.Module):
                     inference_params=inference_params,
                     **mixer_kwargs,
                 )
-        hidden_states = get_normed_hidden_states(
-            self.norm_f,
-            hidden_states,
-            residual=None,
-            fused_add_norm=self.fused_add_norm,
-            residual_in_fp32=self.residual_in_fp32,
-        )
+        if self.norm_f is not None:
+            hidden_states = get_normed_hidden_states(
+                self.norm_f,
+                hidden_states,
+                residual=None,
+                fused_add_norm=self.fused_add_norm,
+                residual_in_fp32=self.residual_in_fp32,
+            )
         return hidden_states
 
 
@@ -332,6 +346,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         )
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
+        if self.lm_head is None:
+            return hidden_states
         lm_logits = self.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
