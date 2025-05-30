@@ -280,7 +280,7 @@ class TestRoutedExperts(_TestBase):
         _test_grads_routed_experts(simple_exp, exp)
 
     @pytest.mark.parametrize("cls", list(NON_EP_EXPERT_CLASSES.values()))
-    def test_no_toks(self, cls) -> None:
+    def test_zero_toks(self, cls) -> None:
         """
         Verify the routed experts can handle getting zero tokens for one or more experts.
         """
