@@ -529,6 +529,59 @@ class TestModelEP(_TestBase):
         torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
 
 
+def train_loop_moe(self: _TestBase, ep: int):
+    torch.manual_seed(42)
+    meshes = get_meshes(world_size=self.world_size, ep=ep)
+    model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
+    model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep)
+    dtype = torch.bfloat16
+    mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+
+    _copy_params(model, model_ep)
+    fully_shard_moe(
+        model_ep,
+        fsdp_mesh=meshes.dp,
+        ep_mesh=meshes.ep,
+        mp_policy=mp_policy,
+    )
+    optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
+
+    inputs = self.get_input_toks()
+    outputs = model(inputs).logits
+
+    inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+    outputs_ep = model_ep(inputs_ep).logits
+    torch.testing.assert_close(
+        outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
+        outputs_ep,
+        atol=self.tol,
+        rtol=self.tol,
+    )
+
+    # Grads should match with an avg-over-batches type loss.
+    mean_loss_fn(outputs).backward()
+    mean_loss_fn(outputs_ep).backward()
+
+    norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
+    assert norm.item() > 0.0, f"{norm=}"
+    assert norm_ep.item() > 0.0, f"{norm_ep=}"
+
+    torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
+
+    _test_grads(model, model_ep, tol=self.tol)
+
+    # Save state
+    optim.step()
+    optim.zero_grad()
+    state_dict = get_dcp_state_dict(model_ep, optim)
+    dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+
+    # Reload (just checking for no errors for now)
+    state_dict_again = get_dcp_state_dict(model_ep, optim)
+    dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
+
+
 class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -988,112 +1041,12 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_e2e_ep(self) -> None:
-        torch.manual_seed(42)
-        meshes = get_meshes(world_size=self.world_size, ep=self.world_size)
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
-        model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep)
-        dtype = torch.bfloat16
-        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
-
-        _copy_params(model, model_ep)
-        fully_shard_moe(
-            model_ep,
-            fsdp_mesh=meshes.dp,
-            ep_mesh=meshes.ep,
-            mp_policy=mp_policy,
-        )
-        optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
-
-        inputs = self.get_input_toks()
-        outputs = model(inputs).logits
-
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep).logits
-        torch.testing.assert_close(
-            outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
-            outputs_ep,
-            atol=self.tol,
-            rtol=self.tol,
-        )
-
-        # Grads should match with an avg-over-batches type loss.
-        mean_loss_fn(outputs).backward()
-        mean_loss_fn(outputs_ep).backward()
-
-        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
-        assert norm.item() > 0.0, f"{norm=}"
-        assert norm_ep.item() > 0.0, f"{norm_ep=}"
-
-        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
-
-        _test_grads(model, model_ep, tol=self.tol)
-
-        # Save state
-        optim.step()
-        optim.zero_grad()
-        state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
-
-        # Reload (just checking for no errors for now)
-        state_dict_again = get_dcp_state_dict(model_ep, optim)
-        dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
+        train_loop_moe(self, ep=self.world_size)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_e2e_ep_replicated(self) -> None:
-        torch.manual_seed(42)
-        # Set ep != self.world_size to induce replicated experts
-        meshes = get_meshes(world_size=self.world_size, ep=self.world_size // 2)
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
-        model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep)
-        dtype = torch.bfloat16
-        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
-
-        _copy_params(model, model_ep)
-        fully_shard_moe(
-            model_ep,
-            fsdp_mesh=meshes.dp,
-            ep_mesh=meshes.ep,
-            mp_policy=mp_policy,
-        )
-        optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
-
-        inputs = self.get_input_toks()
-        outputs = model(inputs).logits
-
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep).logits
-
-        torch.testing.assert_close(
-            outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
-            outputs_ep,
-            atol=self.tol,
-            rtol=self.tol,
-        )
-
-        # Grads should match with an avg-over-batches type loss.
-        mean_loss_fn(outputs).backward()
-        mean_loss_fn(outputs_ep).backward()
-
-        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0).full_tensor()
-        assert norm.item() > 0.0, f"{norm=}"
-        assert norm_ep.item() > 0.0, f"{norm_ep=}"
-
-        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
-
-        _test_grads(model, model_ep, tol=self.tol)
-
-        # Save state
-        optim.step()
-        optim.zero_grad()
-        state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
-
-        # Reload (just checking for no errors for now)
-        corrupted_state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.load(corrupted_state_dict, checkpoint_id="/tmp/dcp")
+        train_loop_moe(self, ep=self.world_size // 2)
 
 
 def compile_breaking_fn(
