@@ -570,6 +570,13 @@ def get_meshes(
     return Meshes(dp=dp_mesh, ep=ep_mesh, pp=pp_mesh)
 
 
+@torch.compile
+def _get_tensor_list_norm(
+    tensor_list: list[torch.Tensor], norm_type: int
+) -> torch.Tensor:
+    return torch.stack(tensor_list).pow(norm_type).sum().pow(1 / norm_type)
+
+
 @torch.no_grad()
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -591,21 +598,19 @@ def clip_grad_norm_(
             else:
                 g_dict[None].append(p.grad)
 
-    total_norm = None
-    for grads in g_dict.values():
-        # Need to reduce grads with different meshes independently; unsupported op otherwise.
-        norm = torch.nn.utils.get_total_norm(
-            grads, norm_type, error_if_nonfinite, foreach
-        )
-        if isinstance(total_norm, DTensor):
-            # Will reach here if any non-PP parallelism is used.
-            # If only using PP, total_norm will be a local tensor.
+    # Need to norm grads with different meshes independently; unsupported op otherwise.
+    norm_dict = {
+        k: torch.nn.utils.get_total_norm(g, norm_type, error_if_nonfinite, foreach)
+        for k, g in g_dict.items()
+    }
+    for k, v in norm_dict.items():
+        if isinstance(p, DTensor):
+            norm_dict[k] = v.full_tensor()
 
-            norm = norm.full_tensor()
-        if total_norm is None:
-            total_norm = norm
-        else:
-            total_norm += norm
+    if math.isinf(norm_type):
+        total_norm = max(norm_dict.values())
+    else:
+        total_norm = _get_tensor_list_norm(list(norm_dict.values()), norm_type)
 
     if pp_mesh is not None:
         if math.isinf(norm_type):
