@@ -1,4 +1,5 @@
 import functools
+import inspect
 import math
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -470,13 +471,17 @@ class TensorMagnitudeHook(Hook):
 
 
 def attach_magnitude_hooks(
-    model: MambaLMHeadModel, classes: nn.Module | list[nn.Module]
+    model: MambaLMHeadModel,
+    classes: nn.Module | type[nn.Module] | list[nn.Module | type[nn.Module]],
 ) -> dict[str, TensorMagnitudeHook]:
+    """
+    Attach TensorMagnitudeHook instances to every class or class instance specified.
+    """
     if isinstance(classes, nn.Module):
-        classes = [nn.Module]
+        classes = [classes]
     hook_dict = HookDict()
     for fqn, mod in model.named_modules():
-        if isinstance(mod, classes):
+        if any(isinstance(mod, c) if inspect.isclass(c) else mod is c for c in classes):
             hook_dict[fqn] = TensorMagnitudeHook(mod)
     return hook_dict
 

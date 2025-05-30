@@ -1188,7 +1188,8 @@ class TestMoEUtils(_TestBase):
         cfg = deepcopy(self.cfg)
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         init_moe(model)
-        hook_dict = attach_magnitude_hooks(model, Block)
+        hook_dict = attach_magnitude_hooks(model, [Block, model.lm_head])
+        assert len(hook_dict) == len(model.backbone.layers) + 1
         inputs = self.get_input_toks()
         iters = 3
         for _ in range(iters):
