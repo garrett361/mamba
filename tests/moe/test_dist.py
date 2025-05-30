@@ -910,6 +910,7 @@ class TestMoEUtils(_TestBase):
         dtype = torch.bfloat16
         mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
+        init_moe(model_ep)
         _copy_params(model, model_ep)
         fully_shard_moe(
             model_ep, fsdp_mesh=meshes.dp, ep_mesh=meshes.ep, mp_policy=mp_policy
@@ -926,9 +927,8 @@ class TestMoEUtils(_TestBase):
         mean_loss_fn(outputs.logits).backward()
         mean_loss_fn(outputs_ep.logits).backward()
 
-        # No need for special clipping until PP is used.
         norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0).full_tensor()
+        norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
         torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
 
     @pytest.mark.world_size(4)
