@@ -249,6 +249,40 @@ class TestRoutedExperts(_TestBase):
 
         _test_grads(model, model_ep, tol=self.tol)
 
+    @pytest.mark.parametrize("cls", list(EP_EXPERT_CLASSES.values()))
+    def test_zero_toks(self, cls) -> None:
+        """
+        Verify the routed experts can handle getting zero tokens for one or more experts.
+        """
+        skip_moe_impl_if_no_h100s(cls)
+        torch.manual_seed(42)
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
+        # Set all indices to 0, 1, so that other experts don't get tokens
+        assert self.n_routed_experts > 2
+        indices[:, 0] = 0
+        indices[:, 1] = 1
+        kwargs = dict(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            **self.factory_kwargs,
+        )
+
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model_kwargs = dict(
+            in_features=self.in_features,
+            d_intermediate=self.moe_cfg["d_intermediate"],
+            n_routed_experts=self.n_routed_experts,
+            **self.factory_kwargs,
+        )
+        model_ep = cls(**model_kwargs, ep_mesh=ep_mesh)
+
+        # Just test for no errors
+        out = model_ep(inputs, weights, indices, counts)
+        mean_loss_fn(out).backward()
+
 
 class TestMoEEP(_TestBase):
     @pytest.mark.world_size(4)
