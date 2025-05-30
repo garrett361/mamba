@@ -16,6 +16,8 @@ from dtest import DTest
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.block import Block
+from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.mha import MHA
 from mamba_ssm.modules.moe import (
     EP_EXPERT_CLASSES,
     MoE,
@@ -947,17 +949,19 @@ class TestMoEUtils(_TestBase):
 
         hook_dict.reset()
 
+    @pytest.mark.gpu
     def test_attach_magnitude_hooks(self) -> None:
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         init_moe(model)
-        hook_dict = attach_magnitude_hooks(model, Block)
-        assert len(hook_dict) == len(model.backbone.layers)
+        # Attach to blocks, mixers, and the lm head instance
+        hook_dict = attach_magnitude_hooks(model, [Block, MHA, Mamba2, model.lm_head])
+        assert len(hook_dict) == 2 * len(model.backbone.layers) + 1
         inputs = self.get_input_toks()
         model(inputs)
-        hook_dict.all_reduce()
-        hook_dict.reduce()
+        hook_dict.all_reduce(op=dist.ReduceOp.AVG)
+        hook_dict.reduce(op=dist.ReduceOp.AVG)
         hook_dict.reset()
 
     def test_apply_loss_free_moe_balancing(self) -> None:

@@ -349,12 +349,21 @@ class HookDict(dict):
         for hook in self.values():
             hook.remove()
 
-    def all_reduce(self, group: Optional[dist.ProcessGroup] = None) -> None:
-        self._do_collective(dist.all_reduce, group=group)
+    def all_reduce(
+        self,
+        group: Optional[dist.ProcessGroup] = None,
+        **coll_kwargs,
+    ) -> None:
+        self._do_collective(dist.all_reduce, group=group, **coll_kwargs)
 
-    def reduce(self, dst: int = 0, group: Optional[dist.ProcessGroup] = None) -> None:
+    def reduce(
+        self,
+        dst: int = 0,
+        group: Optional[dist.ProcessGroup] = None,
+        **coll_kwargs,
+    ) -> None:
         # Only rank `dst` gets accurate results.
-        self._do_collective(dist.reduce, group=group, dst=dst)
+        self._do_collective(dist.reduce, group=group, dst=dst, **coll_kwargs)
 
     @torch.no_grad
     def _do_collective(
