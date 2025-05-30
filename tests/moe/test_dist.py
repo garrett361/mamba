@@ -486,8 +486,7 @@ class TestModelEP(_TestBase):
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep)
 
-        # Grads should match with an avg-over-batches type loss. Sum over other dims to make grads
-        # less small.
+        # Populate grads
         mean_loss_fn(outputs.logits).backward()
         mean_loss_fn(outputs_ep.logits).backward()
 
@@ -922,10 +921,31 @@ class TestMoEUtils(_TestBase):
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep)
 
-        # Grads should match with an avg-over-batches type loss. Sum over other dims to make grads
-        # less small.
+        # Populate grads
         mean_loss_fn(outputs.logits).backward()
         mean_loss_fn(outputs_ep.logits).backward()
+
+        # Force the shared expert and non-shared expert grads to have grads of the same size to
+        # ensure a non-trivial test. Force the L2 norm of the routed-exp and non-routeed-exp grads
+        # to be O(1).
+        total_params = sum(p.numel() for p in model.parameters())
+        n_moe_params = sum(
+            p.numel()
+            for m in model.modules()
+            for p in m.parameters()
+            if isinstance(m, MoE)
+        )
+        non_moe_params = total_params - n_moe_params
+        for mod in (model, model_ep):
+            for m in mod.modules():
+                if isinstance(m, MoE):
+                    for p in m.parameters(recurse=False):
+                        if p.grad is not None:
+                            nn.init.constant_(p.grad, 1 / n_moe_params**0.5)
+                else:
+                    for p in m.parameters(recurse=False):
+                        if p.grad is not None:
+                            nn.init.constant_(p.grad, 1 / non_moe_params**0.5)
 
         norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
