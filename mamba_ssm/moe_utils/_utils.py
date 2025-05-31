@@ -430,12 +430,11 @@ def attach_tok_count_hooks(
 
 
 @torch.compile
-def _get_mag(tensor) -> torch.Tensor:
-    # Coincides with tensor.std() if tensor.mean() == 0.0.
-    return tensor.pow(2).mean().sqrt()
+def _get_mean_abs(tensor) -> torch.Tensor:
+    return tensor.abs().mean()
 
 
-class TensorMagnitudeHook(Hook):
+class TensorMeanAbsHook(Hook):
     """
     Computes average per-element magnitude of the outputs tensor.
     """
@@ -466,7 +465,7 @@ class TensorMagnitudeHook(Hook):
         self._iters += 1
         self._mag = (
             self._mag * ((self._iters - 1) / self._iters)
-            + _get_mag(output.detach().clone()) / self._iters
+            + _get_mean_abs(output.detach().clone()) / self._iters
         )
 
     def remove(self) -> None:
@@ -482,16 +481,16 @@ class TensorMagnitudeHook(Hook):
 def attach_magnitude_hooks(
     model: MambaLMHeadModel,
     classes: nn.Module | type[nn.Module] | list[nn.Module | type[nn.Module]],
-) -> dict[str, TensorMagnitudeHook]:
+) -> dict[str, TensorMeanAbsHook]:
     """
-    Attach TensorMagnitudeHook instances to every class or class instance specified.
+    Attach TensorMeanAbsHook instances to every class or class instance specified.
     """
     if isinstance(classes, nn.Module):
         classes = [classes]
     hook_dict = HookDict()
     for fqn, mod in model.named_modules():
         if any(isinstance(mod, c) if inspect.isclass(c) else mod is c for c in classes):
-            hook_dict[fqn] = TensorMagnitudeHook(mod)
+            hook_dict[fqn] = TensorMeanAbsHook(mod)
     return hook_dict
 
 
