@@ -22,7 +22,7 @@ from mamba_ssm.modules.moe import (
     TokenCounter,
     _get_exp_outputs_grouped_mm,
     _get_exp_outputs_titan_cg_gemm,
-    _get_local_expert_idxs_and_counts,
+    _get_local_indices_and_counts,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
@@ -505,7 +505,7 @@ class TestTitan(_TestBase):
         # permuted_indices_gpu should be equivalent to the below.
 
         # 1) Get the tok-to-local-exp-idx map
-        local_expert_idxs, _ = _get_local_expert_idxs_and_counts(
+        local_expert_idxs, _ = _get_local_indices_and_counts(
             tokens_per_expert_group, experts_per_rank
         )
         # 2) Sort
