@@ -117,6 +117,7 @@ def act_ckpt_moe(model: MambaLMHeadModel, mixer_only: bool = True):
     """
     By default, only wraps the mixers to avoid repeating costly all-to-alls.
     """
+    # TODO: @goon -  skip all-to-all act ckpting
     for layer_idx, block in model.backbone.layers.items():
         if mixer_only:
             model.backbone.layers[layer_idx].mixer = checkpoint_wrapper(
