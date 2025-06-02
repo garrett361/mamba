@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from mamba_ssm.modules.block import Block
+from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.mha import MHA
 from mamba_ssm.modules.mlp import GatedMLP
 from mamba_ssm.modules.moe import (
     _GROUPED_MM_ALIGNMENT,
@@ -20,7 +22,7 @@ from mamba_ssm.modules.moe import (
     TokenCounter,
     _get_exp_outputs_grouped_mm,
     _get_exp_outputs_titan_cg_gemm,
-    _get_local_expert_idxs,
+    _get_local_expert_idxs_and_counts,
     _get_single_exp_output,
     _RoutedExpertsNoEP,
     _SimpleRoutedExperts,
@@ -291,6 +293,11 @@ class TestRoutedExperts(_TestBase):
         assert self.n_routed_experts > 2
         indices[:, 0] = 0
         indices[:, 1] = 1
+        counts = torch.zeros_like(counts)
+        counts[0] = indices.numel() // 2
+        counts[1] = indices.numel() // 2
+
+        # Update counts
         kwargs = dict(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
@@ -498,7 +505,7 @@ class TestTitan(_TestBase):
         # permuted_indices_gpu should be equivalent to the below.
 
         # 1) Get the tok-to-local-exp-idx map
-        local_expert_idxs = _get_local_expert_idxs(
+        local_expert_idxs, _ = _get_local_expert_idxs_and_counts(
             tokens_per_expert_group, experts_per_rank
         )
         # 2) Sort
@@ -1225,8 +1232,8 @@ class TestMoEUtils(_TestBase):
         cfg = deepcopy(self.cfg)
         model = MambaLMHeadModel(cfg, **self.factory_kwargs)
         init_moe(model)
-        hook_dict = attach_magnitude_hooks(model, [Block, model.lm_head])
-        assert len(hook_dict) == len(model.backbone.layers) + 1
+        hook_dict = attach_magnitude_hooks(model, [Block, MHA, Mamba2, model.lm_head])
+        assert len(hook_dict) == 2 * len(model.backbone.layers) + 1
         inputs = self.get_input_toks()
         iters = 3
         for _ in range(iters):

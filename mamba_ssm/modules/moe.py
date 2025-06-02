@@ -26,8 +26,9 @@ class TokenCounter(nn.Module):
         super().__init__()
 
     @torch.no_grad()
-    def forward(self, indices: torch.LongTensor, n_routed_experts: int) -> torch.IntTensor:
-        # No grad is needed for tok idxs, a small optimization.
+    def forward(
+        self, indices: torch.LongTensor, n_routed_experts: int
+    ) -> torch.IntTensor:
         counts = indices.new_zeros((indices.shape[0], n_routed_experts))
         counts.scatter_(1, indices, 1)
         counts = counts.sum(dim=0, dtype=torch.int32)
@@ -287,10 +288,33 @@ class MoE(nn.Module):
         return (z + self.shared_experts(x)).view(x_shape)
 
 
+def _sort_by_exp_idx(
+    x: torch.Tensor,
+    indices: torch.LongTensor,
+) -> tuple[torch.Tensor, torch.LongTensor]:
+    """
+    Take tensor x of shape (n_tok, d_model) and corresponding expert indices of shape (n_tok,
+    n_activated_experts) or (n_tok * n_activated_experts), and return a (n_tok *
+    n_activated_experts, d_model) shaped tensor sorted by expert idx along with the sorted index
+    tensor.
+    """
+
+    if indices.ndim == 1:
+        # This path occurs in EP where indices are already flattened.
+        flat_sorted_indices = indices.argsort(dim=-1)
+        x_by_expert = x[flat_sorted_indices]
+    else:
+        # This path occurs with no EP.
+        flat_sorted_indices = indices.flatten().argsort(dim=-1)
+        n_activated_experts = indices.shape[-1]
+        x_by_expert = x[flat_sorted_indices // n_activated_experts]
+    return x_by_expert, flat_sorted_indices
+
+
 def _get_single_exp_output(
     x: torch.Tensor,
-    fc1_weights: torch.Tensor,
-    fc2_weights: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
     activation: Callable[[torch.Tensor], torch.Tensor],
 ):
     """
@@ -298,17 +322,17 @@ def _get_single_exp_output(
     """
     # NOTE: @goon - When the routed experts are ignored in fully_shard, their dtype doesn't get
     # converted with the fsdp mp_policy, so we ensure conversion here.
-    y = F.linear(x, fc1_weights.to(x))
+    y = F.linear(x, fc1_weight.to(x))
     y, gate = y.chunk(2, dim=-1)
     y = y * activation(gate)
-    y = F.linear(y, fc2_weights.to(y))
+    y = F.linear(y, fc2_weight.to(y))
     return y
 
 
 def _get_exp_outputs_grouped_mm(
     x: torch.Tensor,
-    fc1_weights: torch.Tensor,
-    fc2_weights: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
     offsets: torch.IntTensor,
     activation: Callable[[torch.Tensor], torch.Tensor],
 ):
@@ -318,20 +342,20 @@ def _get_exp_outputs_grouped_mm(
     # NOTE: @goon - When the routed experts are ignored in fully_shard, their dtype doesn't get
     # converted with the fsdp mp_policy, so we ensure conversion here.
     y = torch._grouped_mm(
-        x, fc1_weights.to(x).transpose(-2, -1), offs=offsets, out_dtype=x.dtype
+        x, fc1_weight.to(x).transpose(-2, -1), offs=offsets, out_dtype=x.dtype
     )
     y, gate = y.chunk(2, dim=-1)
     y = y * activation(gate)
     y = torch._grouped_mm(
-        y, fc2_weights.to(y).transpose(-2, -1), offs=offsets, out_dtype=x.dtype
+        y, fc2_weight.to(y).transpose(-2, -1), offs=offsets, out_dtype=x.dtype
     )
     return y
 
 
 def _get_exp_outputs_titan_cg_gemm(
     x: torch.Tensor,
-    fc1_weights: torch.Tensor,
-    fc2_weights: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
     expert_indices: torch.IntTensor,
     activation: Callable[[torch.Tensor], torch.Tensor],
     group_size_m: int = 128,
@@ -347,25 +371,25 @@ def _get_exp_outputs_titan_cg_gemm(
     )
 
     # Only intended to operate on locally available shards for EP:
-    if isinstance(fc1_weights, DTensor):
-        fc1_weights = fc1_weights.to_local()
-    if isinstance(fc2_weights, DTensor):
-        fc2_weights = fc2_weights.to_local()
+    if isinstance(fc1_weight, DTensor):
+        fc1_weight = fc1_weight.to_local()
+    if isinstance(fc2_weight, DTensor):
+        fc2_weight = fc2_weight.to_local()
 
     y = cg_grouped_gemm(
-        x, fc1_weights, expert_indices=expert_indices, group_size_m=group_size_m
+        x, fc1_weight, expert_indices=expert_indices, group_size_m=group_size_m
     )
     y, gate = y.chunk(2, dim=-1)
     y = y * activation(gate)
     y = cg_grouped_gemm(
-        y, fc2_weights, expert_indices=expert_indices, group_size_m=group_size_m
+        y, fc2_weight, expert_indices=expert_indices, group_size_m=group_size_m
     )
     return y
 
 
-def _get_local_expert_idxs(
+def _get_local_expert_idxs_and_counts(
     tokens_per_expert_group: torch.Tensor, n_local_experts: int
-) -> torch.IntTensor:
+) -> tuple[torch.IntTensor, torch.IntTensor]:
     """
     Convert the routing information in tokens_per_expert_group to a tensor which maps token position
     to local expert idx.
@@ -381,7 +405,12 @@ def _get_local_expert_idxs(
     # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
     # the CUDA tensor tokens_per_expert_group to know the output shape
     local_expert_idxs = local_expert_idxs.repeat_interleave(tokens_per_expert_group)
-    return local_expert_idxs
+
+    # Compute tok count per local expert
+    local_expert_counts = tokens_per_expert_group.reshape(-1, n_local_experts).sum(
+        dim=0, dtype=torch.int32
+    )
+    return local_expert_idxs, local_expert_counts
 
 
 class RoutedExpertsWeights(nn.Module):
@@ -435,6 +464,171 @@ class RoutedExpertsWeights(nn.Module):
         )
 
 
+class _ExpertFFNImpl(nn.Module, ABC):
+    """
+    Base class for different routed expert FFN implementations. Useful to create this as a separate
+    module, so that we can checkpoint the FFN inputs without also checkpointing the all-to-all comms
+    in EP use cases.
+    """
+
+    def __init__(
+        self,
+    ):
+        super().__init__()
+
+    @abstractmethod
+    def forward(
+        self,
+        x: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+        activation: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Takes the flattened (n_toks, d_model) shaped inputs x and returns a tensor of the same shape.
+        """
+        raise NotImplementedError
+
+
+class ExpertFFNForLoop(_ExpertFFNImpl):
+    """
+    for-loop impl
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+        activation: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
+        z = torch.empty_like(x_by_expert)
+
+        # Build the idx map
+        n_local_experts = fc1_weight.shape[0]
+        local_expert_idxs = torch.arange(
+            n_local_experts,
+            device=fc1_weight.device,
+            dtype=torch.int32,
+        )
+        # NOTE: @goon - repeat_interleave incurs a CUDA sync since it needs to wait on
+        # the CUDA tensor counts to know the output shape
+        exp_idxs_per_tok = local_expert_idxs.repeat_interleave(counts)
+
+        # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
+        # self.fc1.weight[exp_idx], results in super-slow CUDA syncs during the backwards pass.
+        for exp_idx, (fc1, fc2) in enumerate(zip(fc1_weight, fc2_weight)):
+            tok_idx = exp_idx == exp_idxs_per_tok
+            # NOTE: @goon -  also CUDA syncing here, since the slices have data-dependent shapes
+            z[tok_idx] = _get_single_exp_output(
+                x_by_expert[tok_idx], fc1, fc2, activation
+            )
+
+        # Save an allocation: store the unsorted results back in x_by_expert.
+        x_by_expert[flat_sorted_indices] = z
+        return x_by_expert
+
+
+class ExpertFFNGroupedMM(_ExpertFFNImpl):
+    """
+    torch._grouped_mm
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+        activation: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
+
+        # Expand the tokens to an appropriately aligned tensor.
+        idxs_align, _, offsets = pad_sorted_idxs(
+            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
+        )
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # sized, empirically tuned to be large enough to handle the routed tokens.
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+
+        z[idxs_align] = x_by_expert
+        z = _get_exp_outputs_grouped_mm(z, fc1_weight, fc2_weight, offsets, activation)
+
+        # Remove the alignment and return the tokens to their original ordering
+        x_by_expert[flat_sorted_indices] = z[idxs_align]
+        return x_by_expert
+
+
+class ExpertFFNGroupedMMTriton(_ExpertFFNImpl):
+    """
+    torch._grouped_mm and triton indexing kernels
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+        activation: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
+
+        idxs_align, _, offsets = pad_sorted_idxs_torch(
+            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
+        )
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a
+        # fixed sized, empirically tuned to be large enough to handle the routed tokens.
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+        z[idxs_align] = x_by_expert
+        z = _get_exp_outputs_grouped_mm(z, fc1_weight, fc2_weight, offsets, activation)
+
+        # Remove the alignment and return the tokens to their original ordering
+        x_by_expert[flat_sorted_indices] = z[idxs_align]
+        return x_by_expert
+
+
+class ExpertFFNCGGroupedGemmTriton(_ExpertFFNImpl):
+    """
+    titan grouped gemm + triton indexing
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+        activation: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
+
+        # Expand the tokens to an appropriately aligned tensor.
+        idxs_align, _, offsets = pad_sorted_idxs(
+            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
+        )
+        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
+        # sized, empirically tuned to be large enough to handle the routed tokens.
+        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
+
+        z[idxs_align] = x_by_expert
+        z = _get_exp_outputs_grouped_mm(z, fc1_weight, fc2_weight, offsets, activation)
+
+        # Remove the alignment and return the tokens to their original ordering
+        x_by_expert[flat_sorted_indices] = z[idxs_align]
+        return x_by_expert
+
+
 class _RoutedExperts(nn.Module, ABC):
     def __init__(
         self,
@@ -486,6 +680,9 @@ class _RoutedExperts(nn.Module, ABC):
             **factory_kwargs,
         )
 
+        # To be set by subclasses. Make an __init__ arg?
+        self.ffn_impl: _ExpertFFNImpl = None
+
     @abstractmethod
     def forward(
         self,
@@ -510,6 +707,60 @@ class _RoutedExpertsNoEP(_RoutedExperts):
         super().__init__(*args, **kwargs)
         assert self.ep_mesh is None
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+    ) -> torch.Tensor:
+        z = self.ffn_impl(
+            x=x,
+            fc1_weight=self.fc1.weight,
+            fc2_weight=self.fc2.weight,
+            indices=indices,
+            counts=counts,
+            activation=self.activation,
+        )
+        # Reshape and weight
+        z = z.reshape(*(weights.shape + x.shape[-1:]))
+        z = torch.bmm(weights[:, None], z).squeeze(1)
+        return z
+
+
+class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
+    """
+    for-loop impl
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ffn_impl = ExpertFFNForLoop()
+
+
+class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ffn_impl = ExpertFFNGroupedMM()
+
+
+class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ffn_impl = ExpertFFNGroupedMMTriton()
+
+
+class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
+    """
+    titan grouped gemm + triton indexing
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ffn_impl = ExpertFFNCGGroupedGemmTriton()
+
+
+### Start of EP Classes
 
 class _RoutedExpertsTorchEP(_RoutedExperts):
     """
@@ -566,12 +817,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             )
         return x_recv, send_counts, recv_counts, tokens_per_expert_group
 
-
-class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
-    """
-    for-loop impl
-    """
-
     def forward(
         self,
         x: torch.Tensor,
@@ -579,183 +824,29 @@ class RoutedExpertsNoEPForLoop(_RoutedExpertsNoEP):
         indices: torch.LongTensor,
         counts: torch.IntTensor,
     ) -> torch.Tensor:
-        z = torch.zeros_like(x)
-
-        # Note: for some reason, getting the weights with CPU integer indexing, like fc1 =
-        # self.fc1.weight[exp_idx], results in super-slow CUDA syncs during the backwards pass.
-        for exp_idx, (fc1, fc2) in enumerate(zip(self.fc1.weight, self.fc2.weight)):
-            # NOTE: @goon - torch.where incurs a CUDA sync.
-            tok_idx, act_exp_idx = torch.where(indices == exp_idx)
-            if tok_idx.numel() == 0:
-                continue
-            z[tok_idx] += (
-                _get_single_exp_output(x[tok_idx], fc1, fc2, self.activation)
-                * weights[tok_idx, act_exp_idx, None]
-            )
-        return z
-
-
-class RoutedExpertsNoEPGroupedMM(_RoutedExpertsNoEP):
-    """
-    torch._grouped_mm
-    """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.LongTensor,
-        counts: torch.IntTensor,
-    ) -> torch.Tensor:
-        # Sort tokens by the expert they are indexed to.
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        n_activated_experts = indices.shape[-1]
-        x_by_expert = x[flat_sorted_indices // n_activated_experts]
-
-        idxs_align, _, offsets = pad_sorted_idxs_torch(
-            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
-        )
-        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a
-        # fixed sized, empirically tuned to be large enough to handle the routed tokens.
-        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
-        z[idxs_align] = x_by_expert
-        z = _get_exp_outputs_grouped_mm(
-            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
-        )
-
-        # Remove the alignment and return the tokens to their original ordering
-        x_by_expert[flat_sorted_indices] = z[idxs_align]
-
-        # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
-        return z
-
-
-class RoutedExpertsNoEPGroupedMMTriton(_RoutedExpertsNoEP):
-    """
-    torch._grouped_mm and triton indexing kernels
-    """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.LongTensor,
-        counts: torch.IntTensor,
-    ) -> torch.Tensor:
-        # Sort tokens by the expert they are indexed to.
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        n_activated_experts = indices.shape[-1]
-        x_by_expert = x[flat_sorted_indices // n_activated_experts]
-
-        # Expand the tokens to an appropriately aligned tensor.
-        idxs_align, _, offsets = pad_sorted_idxs(
-            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
-        )
-        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
-        # sized, empirically tuned to be large enough to handle the routed tokens.
-        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
-
-        z[idxs_align] = x_by_expert
-        z = _get_exp_outputs_grouped_mm(
-            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
-        )
-
-        # Remove the alignment and return the tokens to their original ordering
-        x_by_expert[flat_sorted_indices] = z[idxs_align]
-
-        # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
-        return z
-
-
-class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
-    """
-    titan grouped gemm + triton indexing
-    """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.LongTensor,
-        counts: torch.IntTensor,
-    ) -> torch.Tensor:
-        # Sort tokens by the expert they are indexed to.
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        n_activated_experts = indices.shape[-1]
-        x_by_expert = x[flat_sorted_indices // n_activated_experts]
-
-        # Expand the tokens to an appropriately aligned tensor.
-        idxs_align, _, offsets = pad_sorted_idxs(
-            counts, indices.numel(), _GROUPED_MM_ALIGNMENT
-        )
-        # NOTE: @goon - offsets[-1] induces a very long CUDA sync. Can avoid it by letting z be a fixed
-        # sized, empirically tuned to be large enough to handle the routed tokens.
-        z = torch.empty(offsets[-1], x.shape[-1], dtype=x.dtype, device=x.device)
-
-        z[idxs_align] = x_by_expert
-        z = _get_exp_outputs_grouped_mm(
-            z, self.fc1.weight, self.fc2.weight, offsets, self.activation
-        )
-
-        # Remove the alignment and return the tokens to their original ordering
-        x_by_expert[flat_sorted_indices] = z[idxs_align]
-
-        # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x.shape[-1:]))
-        z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
-        return z
-
-
-### Start of EP Classes
-
-
-class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
-    """
-    EP + for-loop
-    """
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.LongTensor,
-        counts: torch.IntTensor,
-    ) -> torch.Tensor:
-        # Sort tokens by the expert they are indexed to.
-        flat_sorted_indices = indices.flatten().argsort(dim=-1)
-        n_activated_experts = indices.shape[-1]
-        x_by_expert = x[flat_sorted_indices // n_activated_experts]
-
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
         x_recv, send_counts, recv_counts, tokens_per_expert_group = (
             self._get_ep_toks_and_routing_data(x_by_expert, counts)
         )
 
-        # Prepare outputs
-        x_send = torch.empty_like(x_recv)
-
-        # Map from token position to local expert idx
-        local_expert_idxs = _get_local_expert_idxs(
+        local_expert_idxs, local_expert_counts = _get_local_expert_idxs_and_counts(
             tokens_per_expert_group, self.n_local_experts
         )
 
-        # For-loop only over local expert weights.
-        for exp_idx, (fc1, fc2) in enumerate(
-            zip(self.fc1.weight.to_local(), self.fc2.weight.to_local())
-        ):
-            idxs = local_expert_idxs == exp_idx
-            # TODO: @goon - handle no-tokens edge case
-            x_send[idxs] = _get_single_exp_output(
-                x_recv[idxs], fc1, fc2, self.activation
-            )
+        # Only use locally available EP weights
+        z = self.ffn_impl(
+            x_recv,
+            self.fc1.weight.to_local(),
+            self.fc2.weight.to_local(),
+            local_expert_idxs,
+            local_expert_counts,
+            self.activation,
+        )
 
         # Send results back to original ranks (reversed send/recv count data)
         with record_function("all2all::send1"):
             x_out = funcol.all_to_all_single_autograd(
-                x_send, send_counts, recv_counts, group=self.ep_mesh
+                z, send_counts, recv_counts, group=self.ep_mesh
             )
 
         # Save an allocation: store the unsorted results back in x_by_expert.
@@ -764,6 +855,62 @@ class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
         x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
         z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
         return z
+
+
+class RoutedExpertsTorchEPForLoop(_RoutedExpertsTorchEP):
+    """
+    EP + for-loop
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ffn_impl = ExpertFFNForLoop()
+
+    # def forward(
+    #     self,
+    #     x: torch.Tensor,
+    #     weights: torch.Tensor,
+    #     indices: torch.LongTensor,
+    #     counts: torch.IntTensor,
+    # ) -> torch.Tensor:
+    #     # Sort tokens by the expert they are indexed to.
+    #     flat_sorted_indices = indices.flatten().argsort(dim=-1)
+    #     n_activated_experts = indices.shape[-1]
+    #     x_by_expert = x[flat_sorted_indices // n_activated_experts]
+    #
+    #     x_recv, send_counts, recv_counts, tokens_per_expert_group = (
+    #         self._get_ep_toks_and_routing_data(x_by_expert, counts)
+    #     )
+    #
+    #     # Prepare outputs
+    #     x_send = torch.empty_like(x_recv)
+    #
+    #     local_expert_idxs = _get_local_expert_idxs(
+    #         tokens_per_expert_group, self.n_local_experts
+    #     )
+    #
+    #     # For-loop only over local expert weights.
+    #     for exp_idx, (fc1, fc2) in enumerate(
+    #         zip(self.fc1.weight.to_local(), self.fc2.weight.to_local())
+    #     ):
+    #         idxs = local_expert_idxs == exp_idx
+    #         # TODO: @goon - handle no-tokens edge case
+    #         x_send[idxs] = _get_single_exp_output(
+    #             x_recv[idxs], fc1, fc2, self.activation
+    #         )
+    #
+    #     # Send results back to original ranks (reversed send/recv count data)
+    #     with record_function("all2all::send1"):
+    #         x_out = funcol.all_to_all_single_autograd(
+    #             x_send, send_counts, recv_counts, group=self.ep_mesh
+    #         )
+    #
+    #     # Save an allocation: store the unsorted results back in x_by_expert.
+    #     x_by_expert[flat_sorted_indices] = x_out
+    #     # Reshape and weight
+    #     x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+    #     z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
+    #     return z
 
 
 class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
@@ -787,8 +934,7 @@ class RoutedExpertsTorchEPGroupedMM(_RoutedExpertsTorchEP):
             self._get_ep_toks_and_routing_data(x_by_expert, counts)
         )
 
-        # Map from token position to local expert idx
-        local_expert_idxs = _get_local_expert_idxs(
+        local_expert_idxs = _get_local_expert_idxs_and_counts(
             tokens_per_expert_group, self.n_local_experts
         )
 

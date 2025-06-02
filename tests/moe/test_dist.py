@@ -263,6 +263,9 @@ class TestRoutedExperts(_TestBase):
         assert self.n_routed_experts > 2
         indices[:, 0] = 0
         indices[:, 1] = 1
+        counts = torch.zeros_like(counts)
+        counts[0] = indices.numel() // 2
+        counts[1] = indices.numel() // 2
         kwargs = dict(
             in_features=self.in_features,
             d_intermediate=self.moe_cfg["d_intermediate"],
