@@ -349,6 +349,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         if self.lm_head is None:
             return hidden_states
         lm_logits = self.lm_head(hidden_states)
+        if self.config.return_logits:
+            return lm_logits
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
