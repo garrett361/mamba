@@ -11,4 +11,5 @@ from mamba_ssm.moe_utils._utils import (
     get_meshes,
     get_total_exp_and_active_params,
     init_moe,
+    set_pp_layers,
 )

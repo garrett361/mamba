@@ -32,6 +32,7 @@ from mamba_ssm.moe_utils import (
     attach_magnitude_hooks,
     attach_tok_count_hooks,
     init_moe,
+    set_pp_layers,
 )
 from mamba_ssm.ops.triton.moe import pad_sorted_idxs, pad_sorted_idxs_torch
 from tests.moe.test_utils import (
@@ -385,7 +386,10 @@ class TestMoEModel(_TestBase):
         inputs = self.get_input_toks()
         meta_model(inputs)
 
-    def test_pp_fwd(self) -> None:
+    def test_pp_fwd_manual(self) -> None:
+        """
+        Manually testing that the model code supports PP.
+        """
         torch.manual_seed(42)
         # The full model:
         model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
@@ -1248,3 +1252,24 @@ class TestMoEUtils(_TestBase):
             with pytest.raises(RuntimeError):
                 h.value
             assert h._iters == 0
+
+    def test_set_pp_layers(self) -> None:
+        torch.manual_seed(42)
+        # The full model:
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
+
+        # Create three PP sections
+        n_stages = 3
+        model_stages = [deepcopy(model) for _ in range(n_stages)]
+        for stage_idx, pp_stage in enumerate(model_stages):
+            set_pp_layers(pp_stage, n_stages, stage_idx)
+
+        inputs = self.get_input_toks()
+
+        outputs = model(inputs).logits
+
+        for stage in model_stages:
+            inputs = stage(inputs)
+        outputs_pp = inputs.logits
+
+        torch.testing.assert_close(outputs_pp, outputs)
