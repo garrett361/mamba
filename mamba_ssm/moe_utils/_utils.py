@@ -632,3 +632,30 @@ def clip_grad_norm_(
 
     torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
+
+
+def set_pp_layers(
+    model: MambaLMHeadModel,
+    n_stages: int,
+    stage_idx: int,
+) -> None:
+    """
+    Deletes and/or sets appropriate layers to None. Ideally acts on a meta-device model.
+    """
+    is_first = stage_idx == 0
+    is_last = stage_idx == n_stages - 1
+    if not is_first:
+        model.backbone.embedding = None
+    if not is_last:
+        model.lm_head = None
+        model.backbone.norm_f = None
+
+    # Divide blocks among stages. Currently giving early stages extra blocks.
+    n_blocks = len(model.backbone.layers)
+    all_block_idxs = set(model.backbone.layers)
+    this_stage_block_idxs = {
+        str(n)
+        for n in torch.arange(n_blocks).tensor_split(n_stages)[stage_idx].tolist()
+    }
+    for k in all_block_idxs - this_stage_block_idxs:
+        del model.backbone.layers[k]
