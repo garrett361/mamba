@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 import torch
@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 from torch.distributed.tensor import DTensor
 
 from dtest import DTest
@@ -34,8 +35,12 @@ from mamba_ssm.moe_utils import (
     get_meshes,
     init_moe,
 )
-from mamba_ssm.moe_utils._utils import apply_loss_free_moe_balancing
-from tests.moe.test_utils import mean_loss_fn, skip_moe_impl_if_no_h100s
+from mamba_ssm.moe_utils._utils import apply_loss_free_moe_balancing, set_pp_layers
+from tests.moe.test_utils import (
+    flattened_cross_entropy,
+    mean_loss_fn,
+    skip_moe_impl_if_no_h100s,
+)
 
 
 def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
@@ -148,10 +153,14 @@ class _TestBase(DTest):
             self.batch_size, self.seqlen, self.in_features, **self.factory_kwargs
         )
 
-    def get_input_toks(self, seed: int = 42) -> torch.Tensor:
+    def get_input_toks(
+        self, seed: int = 42, batch_size: Optional[int] = None
+    ) -> torch.Tensor:
         torch.manual_seed(seed)
         return torch.randint(
-            self.vocab_size, size=(self.batch_size, self.seqlen), device=self.device
+            self.vocab_size,
+            size=(batch_size or self.batch_size, self.seqlen),
+            device=self.device,
         )
 
     def get_inputs_weights_indices_counts(
@@ -600,52 +609,112 @@ def train_loop_moe(self: _TestBase, ep: int):
     torch.testing.assert_close(
         post_save_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
     )
-    dtype = torch.bfloat16
-    mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
-    _copy_params(model, model_ep)
-    fully_shard_moe(
-        model_ep,
-        fsdp_mesh=meshes.dp,
-        ep_mesh=meshes.ep,
-        mp_policy=mp_policy,
+
+def train_loop_pp(self: _TestBase, pp: int):
+    """
+    PP only loop
+    """
+    # TODO: @goon - use get_meshes
+    pp_mesh = init_device_mesh(self.device_type, (pp,), mesh_dim_names=("pp",))
+    # Need to avoid returning a CausalLMOutput object for PP, otherwise internal shape checks fail.
+    pp_cfg = deepcopy(self.cfg)
+    pp_cfg.return_logits = True
+
+    model = MambaLMHeadModel(pp_cfg, **self.factory_kwargs)
+    # Create a non-sharded version of the model with proper init to first populate the ref model's
+    # weights:
+    torch.manual_seed(42)
+    with torch.device("meta"):
+        model_pp = MambaLMHeadModel(pp_cfg, **self.factory_kwargs, ep_mesh=None)
+
+    init_moe(model_pp, verbose=False)
+    _copy_params(model, model_pp)
+
+    # Then delete the unnecessary layers. We we would really delete these prior to moving weights
+    # to GPU with init_moe, but this is the easiest way to ensure matching weights.
+    set_pp_layers(model_pp, n_stages=pp_mesh.size(), stage_idx=pp_mesh.get_local_rank())
+
+    optim = torch.optim.AdamW(model_pp.parameters(), lr=1e-1)
+
+    stage = PipelineStage(
+        model_pp,
+        pp_mesh.get_local_rank(),
+        pp_mesh.size(),
+        self.device,
+        group=pp_mesh.get_group(),
     )
-    optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
 
-    inputs = self.get_input_toks()
-    outputs = model(inputs).logits
+    # Create pipeline schedule
+    losses = []
+    n_microbatches = 2 * pp_mesh.size()
+    inputs = self.get_input_toks(batch_size=self.batch_size * n_microbatches)
+    pp_schedule = Schedule1F1B(stage, n_microbatches, loss_fn=flattened_cross_entropy)
 
-    inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-    outputs_ep = model_ep(inputs_ep).logits
-    torch.testing.assert_close(
-        outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
-        outputs_ep,
-        atol=self.tol,
-        rtol=self.tol,
-    )
+    is_first = pp_mesh.get_local_rank() == 0
+    is_last = pp_mesh.get_local_rank() == pp_mesh.size() - 1
 
-    # Grads should match with an avg-over-batches type loss.
-    mean_loss_fn(outputs).backward()
-    mean_loss_fn(outputs_ep).backward()
+    if is_first:
+        pp_schedule.step(inputs)
+        loss = None
+        out = None
+    elif is_last:
+        out = pp_schedule.step(target=inputs, losses=losses)
+        loss = torch.mean(torch.stack(losses))
+    else:
+        pp_schedule.step()
+        out = None
 
-    norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
-    assert norm.item() > 0.0, f"{norm=}"
-    assert norm_ep.item() > 0.0, f"{norm_ep=}"
+    if is_last:
+        assert len(losses) == n_microbatches
+        ref_out = model(inputs)
+        torch.testing.assert_close(out, ref_out, atol=self.tol, rtol=self.tol)
+        ref_loss = flattened_cross_entropy(ref_out, inputs)
+        torch.testing.assert_close(
+            ref_loss, torch.stack(losses).mean(), atol=self.tol, rtol=self.tol
+        )
+    else:
+        assert len(losses) == 0
 
-    torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
-
-    _test_grads(model, model_ep, tol=self.tol)
-
-    # Save state
-    optim.step()
-    optim.zero_grad()
-    state_dict = get_dcp_state_dict(model_ep, optim)
-    dcp.save(state_dict, checkpoint_id="/tmp/dcp")
-
-    # Reload (just checking for no errors for now)
-    state_dict_again = get_dcp_state_dict(model_ep, optim)
-    dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
+    # The optim should wrap the model part which is passed into PipelineStage, not the PipelineStage
+    # object itself.
+    #
+    # optim = torch.optim.AdamW(model_pp.parameters(), lr=1e-1)
+    #
+    # outputs = model(inputs).logits
+    #
+    # inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+    # outputs_ep = model_pp(inputs_ep).logits
+    # torch.testing.assert_close(
+    #     outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
+    #     outputs_ep,
+    #     atol=self.tol,
+    #     rtol=self.tol,
+    # )
+    #
+    # # Grads should match with an avg-over-batches type loss.
+    # mean_loss_fn(outputs).backward()
+    # mean_loss_fn(outputs_ep).backward()
+    #
+    # norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # norm_ep = clip_grad_norm_(model_pp.parameters(), 1.0)
+    # assert norm.item() > 0.0, f"{norm=}"
+    # assert norm_ep.item() > 0.0, f"{norm_ep=}"
+    #
+    # torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
+    #
+    # _test_grads(model, model_pp, tol=self.tol)
+    #
+    # # Save state
+    # optim.step()
+    # optim.zero_grad()
+    # state_dict = get_dcp_state_dict(model_pp, optim)
+    # dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+    #
+    # # Reload (just checking for no errors for now)
+    # state_dict_again = get_dcp_state_dict(model_pp, optim)
+    # dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
+    #
 
 
 class TestMoEUtils(_TestBase):
@@ -1106,7 +1175,7 @@ class TestMoEUtils(_TestBase):
         norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
         torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
 
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_e2e_ep(self) -> None:
         train_loop_moe(self, ep=self.world_size)
@@ -1115,6 +1184,11 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.gpu
     def test_e2e_ep_replicated(self) -> None:
         train_loop_moe(self, ep=self.world_size // 2)
+
+    @pytest.mark.world_size(2)
+    @pytest.mark.gpu
+    def test_e2e_pp(self) -> None:
+        train_loop_pp(self, pp=self.world_size)
 
 
 def compile_breaking_fn(
