@@ -750,7 +750,7 @@ class TestMoEUtils(_TestBase):
 
         # Save state
         state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
 
         # Corrupt the state by taking another step
         mean_loss_fn(post_step_outputs).backward()
@@ -764,7 +764,7 @@ class TestMoEUtils(_TestBase):
 
         # Reload and overwrite the corrupted state
         corrupted_state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.load(corrupted_state_dict, checkpoint_id="/tmp/dcp")
+        dcp.load(corrupted_state_dict, checkpoint_id=self.checkpoint_id)
 
         # Check outputs agree pre- and post-taking another step
         reloaded_outputs = model_ep(inputs).logits
@@ -812,7 +812,7 @@ class TestMoEUtils(_TestBase):
 
         # Save state
         state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
 
         # Take another step and save the outputs
         mean_loss_fn(post_step_outputs).backward()
@@ -843,7 +843,7 @@ class TestMoEUtils(_TestBase):
             reconfig_state_dict = get_dcp_state_dict(model_ep, optim)
             dcp.load(
                 reconfig_state_dict,
-                checkpoint_id="/tmp/dcp",
+                checkpoint_id=self.checkpoint_id,
                 process_group=ep_mesh.get_group(),  # NOTE: @goon - hangs, if not specified
             )
 
@@ -1003,7 +1003,9 @@ class TestMoEUtils(_TestBase):
 
 
 class TestE2E(_TestBase):
-    def train_loop_moe(self: _TestBase, ep: int):
+    checkpoint_id = "/tmp/dcp"
+
+    def train_loop_ep(self: _TestBase, ep: int):
         torch.manual_seed(42)
         meshes = get_meshes(world_size=self.world_size, ep=ep)
         model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
@@ -1056,17 +1058,21 @@ class TestE2E(_TestBase):
         optim.step()
         optim.zero_grad()
         state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id="/tmp/dcp")
+        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
 
         # Corrupt state
         post_save_outputs = model_ep(inputs_ep).logits
+        # Sanity check the model changed
+        assert not torch.allclose(
+            post_save_outputs, outputs_ep, atol=self.tol, rtol=self.tol
+        )
         mean_loss_fn(post_save_outputs).backward()
         optim.step()
         optim.zero_grad()
 
         # Reload and check state restored
         state_dict_again = get_dcp_state_dict(model_ep, optim)
-        dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
+        dcp.load(state_dict_again, checkpoint_id=self.checkpoint_id)
         reloaded_outputs = model_ep(inputs_ep).logits
         torch.testing.assert_close(
             post_save_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
@@ -1098,7 +1104,9 @@ class TestE2E(_TestBase):
             model_pp, n_stages=pp_mesh.size(), stage_idx=pp_mesh.get_local_rank()
         )
 
-        optim = torch.optim.AdamW(model_pp.parameters(), lr=1e-1)
+        lr = 1e-1
+        optim = torch.optim.AdamW(model.parameters(), lr=lr)
+        optim_pp = torch.optim.AdamW(model_pp.parameters(), lr=lr)
 
         stage = PipelineStage(
             model_pp,
@@ -1121,11 +1129,9 @@ class TestE2E(_TestBase):
 
         if is_first:
             pp_schedule.step(inputs)
-            loss = None
             out = None
         elif is_last:
             out = pp_schedule.step(target=inputs, losses=losses)
-            loss = torch.mean(torch.stack(losses))
         else:
             pp_schedule.step()
             out = None
@@ -1141,59 +1147,51 @@ class TestE2E(_TestBase):
         else:
             assert len(losses) == 0
 
-        # The optim should wrap the model part which is passed into PipelineStage, not the PipelineStage
-        # object itself.
-        #
-        # optim = torch.optim.AdamW(model_pp.parameters(), lr=1e-1)
-        #
-        # outputs = model(inputs).logits
-        #
-        # inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        # outputs_ep = model_pp(inputs_ep).logits
-        # torch.testing.assert_close(
-        #     outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
-        #     outputs_ep,
-        #     atol=self.tol,
-        #     rtol=self.tol,
-        # )
-        #
-        # # Grads should match with an avg-over-batches type loss.
-        # mean_loss_fn(outputs).backward()
-        # mean_loss_fn(outputs_ep).backward()
-        #
-        # norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # norm_ep = clip_grad_norm_(model_pp.parameters(), 1.0)
-        # assert norm.item() > 0.0, f"{norm=}"
-        # assert norm_ep.item() > 0.0, f"{norm_ep=}"
-        #
-        # torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
-        #
-        # _test_grads(model, model_pp, tol=self.tol)
-        #
-        # # Save state
-        # optim.step()
-        # optim.zero_grad()
-        # state_dict = get_dcp_state_dict(model_pp, optim)
-        # dcp.save(state_dict, checkpoint_id="/tmp/dcp")
-        #
-        # # Reload (just checking for no errors for now)
-        # state_dict_again = get_dcp_state_dict(model_pp, optim)
-        # dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
-        #
+        # TODO: @goon - grad clipping
+
+        optim_pp.step()
+        optim_pp.zero_grad()
+
+        state_dict = get_dcp_state_dict(model_pp, optim_pp)
+        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
+
+        # Corrupt state
+        if is_first:
+            pp_schedule.step(inputs)
+        elif is_last:
+            out_post_step = pp_schedule.step(target=inputs, losses=losses)
+            # Sanity check the model changed
+            assert not torch.allclose(out_post_step, out, atol=self.tol, rtol=self.tol)
+        else:
+            pp_schedule.step()
+        optim_pp.step()
+        optim_pp.zero_grad()
+
+        # Reload and check state restored
+        state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
+        dcp.load(state_dict_again, checkpoint_id=self.checkpoint_id)
+
+        if is_first:
+            pp_schedule.step(inputs)
+        elif is_last:
+            out_post_step_again = pp_schedule.step(target=inputs, losses=losses)
+            torch.testing.assert_close(out_post_step, out_post_step_again)
+        else:
+            pp_schedule.step()
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
-    def test_e2e_ep(self) -> None:
-        self.train_loop_moe(ep=self.world_size)
+    def test_ep(self) -> None:
+        self.train_loop_ep(ep=self.world_size)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_e2e_ep_replicated(self) -> None:
-        self.train_loop_moe(ep=self.world_size // 2)
+    def test_ep_replicated(self) -> None:
+        self.train_loop_ep(ep=self.world_size // 2)
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
-    def test_e2e_pp(self) -> None:
+    def test_pp(self) -> None:
         self.train_loop_pp(pp=self.world_size)
 
 
