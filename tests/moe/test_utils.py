@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mamba_ssm.modules.moe import (
     RoutedExpertsNoEPGroupedMM,
@@ -39,3 +40,7 @@ def mean_loss_fn(tensor: torch.Tensor) -> torch.Tensor:
     or small.
     """
     return tensor.pow(2).mean()
+
+
+def flattened_cross_entropy(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(input.view(-1, input.size(-1)), target.view(-1).long())
