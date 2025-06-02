@@ -26,7 +26,7 @@ class TokenCounter(nn.Module):
         super().__init__()
 
     @torch.no_grad()
-    def forward(self, indices: torch.LongTensor, n_routed_experts: int) -> None:
+    def forward(self, indices: torch.LongTensor, n_routed_experts: int) -> torch.IntTensor:
         # No grad is needed for tok idxs, a small optimization.
         counts = indices.new_zeros((indices.shape[0], n_routed_experts))
         counts.scatter_(1, indices, 1)
@@ -92,7 +92,8 @@ class Gate(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
+            tuple[torch.Tensor, torch.LongTensor, torch.IntTensor]: Routing weights, selected expert
+            indices, and the token count per expert.
         """
         scores = self.lin(x)
         if self.score_func == "softmax":
