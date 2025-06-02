@@ -487,9 +487,9 @@ class _ExpertFFNImpl(nn.Module, ABC):
         activation: Callable[[torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
         """
-        Inputs `x` are expected to be (n_toks, d_model)-shaped and unsorted. `indices` are either
-        1D and (n_toks) shaped or 2D and (n_toks, n_activated_experts) shaped. Outputs are (n_toks, d_model)
-        or (n_toks * n_activated_experts, model) shaped in the two respective cases.
+        Inputs `x` are expected to be (n_toks, d_model)-shaped and unsorted. `indices` are either 1D
+        and (n_toks) shaped or 2D and (n_toks, n_activated_experts) shaped. Outputs are (n_toks,
+        d_model) or (n_toks * n_activated_experts, model) shaped in the two respective cases.
         """
         raise NotImplementedError
 
