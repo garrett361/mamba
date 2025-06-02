@@ -587,10 +587,19 @@ def train_loop_moe(self: _TestBase, ep: int):
     state_dict = get_dcp_state_dict(model_ep, optim)
     dcp.save(state_dict, checkpoint_id="/tmp/dcp")
 
-    # Reload (just checking for no errors for now) TODO: @goon - correctness
+    # Corrupt state
+    post_save_outputs = model_ep(inputs_ep).logits
+    mean_loss_fn(post_save_outputs).backward()
+    optim.step()
+    optim.zero_grad()
+
+    # Reload and check state restored
     state_dict_again = get_dcp_state_dict(model_ep, optim)
     dcp.load(state_dict_again, checkpoint_id="/tmp/dcp")
-    model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep)
+    reloaded_outputs = model_ep(inputs_ep).logits
+    torch.testing.assert_close(
+        post_save_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
+    )
     dtype = torch.bfloat16
     mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
