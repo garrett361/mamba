@@ -44,3 +44,17 @@ def mean_loss_fn(tensor: torch.Tensor) -> torch.Tensor:
 
 def flattened_cross_entropy(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(input.view(-1, input.size(-1)), target.view(-1).long())
+
+
+@torch.no_grad
+def assert_close(
+    actual: torch.Tensor, expected: torch.Tensor, tol: float = 1e-1
+) -> None:
+    """
+    Check that actual and expected are close relative to the typical variation in expected.
+    """
+    expected_variation = expected.abs().mean()
+    diff_variation = (actual - expected).abs().mean()
+    assert diff_variation < tol * expected_variation, (
+        f"{diff_variation=} is not {tol=} smaller than {expected_variation=}"
+    )
