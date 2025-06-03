@@ -652,8 +652,8 @@ def set_pp_layers(
 
     # Divide blocks among stages. Currently giving early stages extra blocks.
     n_blocks = len(model.backbone.layers)
-    if n_blocks < n_stages:
-        raise ValueError(f"Expected n_blocks >= n_stages, but {n_blocks=}, {n_stages=}")
+    if n_blocks + 2 < n_stages:
+        raise ValueError(f"Expected n_blocks + 2 >= n_stages, but {n_blocks=}, {n_stages=}")
     all_block_idxs = set(model.backbone.layers)
     this_stage_block_idxs = {
         str(n)
