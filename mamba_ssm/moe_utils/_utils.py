@@ -621,7 +621,9 @@ def clip_grad_norm_(
         if isinstance(p, DTensor):
             norm_dict[k] = v.full_tensor()
 
-    if math.isinf(norm_type):
+    if len(norm_dict) == 1:
+        total_norm = next(iter(norm_dict.values()))
+    elif math.isinf(norm_type):
         total_norm = max(norm_dict.values())
     else:
         total_norm = _get_tensor_list_norm(list(norm_dict.values()), norm_type)
