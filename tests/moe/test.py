@@ -1264,6 +1264,18 @@ class TestMoEUtils(_TestBase):
         for stage_idx, pp_stage in enumerate(model_stages):
             set_pp_layers(pp_stage, n_stages, stage_idx)
 
+        # Sanity check that that the deleted layers don't appear in the parameters or state dict
+        assert not any("lm_head" in k for k in model_stages[0].state_dict())
+        assert not any("lm_head" in n for n, _ in model_stages[0].named_parameters())
+
+        assert not any("embedding" in k for k in model_stages[1].state_dict())
+        assert not any("embedding" in n for n, _ in model_stages[1].named_parameters())
+        assert not any("lm_head" in k for k in model_stages[1].state_dict())
+        assert not any("lm_head" in n for n, _ in model_stages[1].named_parameters())
+
+        assert not any("embedding" in k for k in model_stages[2].state_dict())
+        assert not any("embedding" in n for n, _ in model_stages[2].named_parameters())
+
         inputs = self.get_input_toks()
 
         outputs = model(inputs).logits
