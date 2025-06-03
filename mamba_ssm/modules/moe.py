@@ -432,6 +432,10 @@ class RoutedExpertsWeights(nn.Module):
         dtype=None,
     ) -> None:
         super().__init__()
+        self.n_routed_experts = n_routed_experts
+        self.out_features = out_features
+        self.in_features = in_features
+        self.ep_mesh = ep_mesh
         if ep_mesh is None:
             data = torch.empty(
                 n_routed_experts, out_features, in_features, device=device, dtype=dtype
