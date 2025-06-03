@@ -34,12 +34,12 @@ def skip_moe_impl_if_no_h100s(moe_impl: str) -> None:
         skip_if_no_h100s()
 
 
-def mean_loss_fn(tensor: torch.Tensor) -> torch.Tensor:
+def mean_loss_fn(input: torch.Tensor) -> torch.Tensor:
     """
     Dummy loss function which does a mean over the batch dim and tries to make the grads not too big
     or small.
     """
-    return tensor.pow(2).mean()
+    return input.mean(0).sum()
 
 
 def flattened_cross_entropy(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
