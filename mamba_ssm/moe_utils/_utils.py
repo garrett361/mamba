@@ -607,6 +607,10 @@ def clip_grad_norm_(
                 g_dict[p.grad.device_mesh].append(p.grad)
             else:
                 g_dict[None].append(p.grad)
+    if not g_dict:
+        # NOTE: @goon - nn.utils.clip_grad_norm_ would return a tensor(0.0) here, but we raise an
+        # error as this should never happen.
+        raise RuntimeError("parameters contain no grads")
 
     # Need to norm grads with different meshes independently; unsupported op otherwise.
     norm_dict = {
