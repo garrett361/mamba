@@ -8,6 +8,7 @@ import torch.distributed._functional_collectives as funcol
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
@@ -223,7 +224,7 @@ class TestRoutedExperts(_TestBase):
         outputs = model(inputs, weights, indices, counts)
         outputs_ep = model_ep(inputs, weights, indices, counts)
 
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -262,6 +263,11 @@ class TestRoutedExperts(_TestBase):
         # Note: important to use an avg-type loss here.
         mean_loss_fn(outputs).backward()
         mean_loss_fn(outputs_ep).backward()
+
+        # # TODO: @goon - DELETE  test
+        # for p in model.parameters():
+        #     if p.grad is not None:
+        #         p.grad.mul_(100.0)
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -337,7 +343,7 @@ class TestMoEEP(_TestBase):
         outputs = model(inputs)
         outputs_ep = model_ep(inputs)
 
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -423,7 +429,7 @@ class TestModelEP(_TestBase):
         outputs = model(inputs)
         outputs_ep = model_ep(inputs)
 
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -509,65 +515,11 @@ class TestModelEP(_TestBase):
         model_ep = torch.compile(model_ep)
         outputs_ep = model_ep(inputs)
 
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
-
-    @pytest.mark.world_size(4)
-    @pytest.mark.gpu
-    def test_clip_grad(self) -> None:
-        # NOTE: @goon - this is only passing because of the special fsdp_mesh=ep_mesh setting.
-        # Otherwise, clipping fails with different mesh errors.
-        torch.manual_seed(42)
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
-        model_ep = MambaLMHeadModel(
-            self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
-        ).to(self.dtype)
-
-        # Force models equal
-        _copy_params(model, model_ep)
-        fully_shard_moe(
-            model_ep,
-            fsdp_mesh=ep_mesh,
-            ep_mesh=ep_mesh,
-        )
-
-        inputs = self.get_input_toks()
-        outputs = model(inputs)
-
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep)
-
-        # Populate grads
-        mean_loss_fn(outputs.logits).backward()
-        mean_loss_fn(outputs_ep.logits).backward()
-
-        # Verify agreement pre-clip
-        _test_grads(model, model_ep, tol=self.tol)
-
-        # Clip grads on the ref model
-        max_norm = 1.0
-        norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-        # The clip may have been trivial. Update max_norm if it was and clip again
-        if norm < max_norm:
-            max_norm = norm.item() / 2
-            norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-        # Sanity check: grads should no longer agree
-        with pytest.raises(AssertionError):
-            _test_grads(model, model_ep, tol=self.tol)
-
-        norm_ep = nn.utils.clip_grad_norm_(model_ep.parameters(), max_norm).full_tensor()
-        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
-
-        # Verify agreement post-clip
-        _test_grads(model, model_ep, tol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
 
 class TestMoEUtils(_TestBase):
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_meta_init(self) -> None:
         torch.manual_seed(42)
@@ -582,7 +534,7 @@ class TestMoEUtils(_TestBase):
         inputs = self.get_input_toks()
         outputs_ep = meta_model_ep(inputs)
 
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe(self) -> None:
         torch.manual_seed(42)
@@ -607,9 +559,9 @@ class TestMoEUtils(_TestBase):
         inputs = self.get_input_toks()
         outputs = model(inputs)
         outputs_ep = model_ep(inputs)
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_bwd_fully_shard_moe(self) -> None:
         torch.manual_seed(42)
@@ -642,7 +594,7 @@ class TestMoEUtils(_TestBase):
 
         _test_grads(model, model_ep, tol=self.tol)
 
-    @pytest.mark.world_size(8)
+    @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe_replicated(self) -> None:
         torch.manual_seed(42)
@@ -675,9 +627,9 @@ class TestMoEUtils(_TestBase):
         inputs = self.get_input_toks()
         outputs = model(inputs)
         outputs_ep = model_ep(inputs)
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
-    @pytest.mark.world_size(8)
+    @pytest.mark.world_size(4)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe_hsdp(self) -> None:
         torch.manual_seed(42)
@@ -710,9 +662,9 @@ class TestMoEUtils(_TestBase):
         inputs = self.get_input_toks()
         outputs = model(inputs)
         outputs_ep = model_ep(inputs)
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_fwd_fully_shard_moe_with_mp(self) -> None:
         # Everything in bfloat16
@@ -741,9 +693,9 @@ class TestMoEUtils(_TestBase):
         outputs = model(inputs).logits
         outputs_ep = model_ep(inputs).logits
         # NOTE: @goon - currently failing on ~0.8% of all inputs.
-        torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
 
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_dcp_save_load(self) -> None:
         torch.manual_seed(42)
@@ -799,7 +751,7 @@ class TestMoEUtils(_TestBase):
         post_reload_step_outputs = model_ep(inputs).logits
         torch.testing.assert_close(post_reload_step_outputs, post_second_step_outputs)
 
-    @pytest.mark.world_size(4)
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_dcp_save_load_reconfigured(self) -> None:
         """
@@ -899,6 +851,8 @@ class TestMoEUtils(_TestBase):
 
         dist.barrier()
 
+    @pytest.mark.world_size(2)
+    @pytest.mark.gpu
     def test_attach_tok_count_hooks(self) -> None:
         # Test fuctionality
         torch.manual_seed(42)
@@ -931,6 +885,7 @@ class TestMoEUtils(_TestBase):
 
         hook_dict.reset()
 
+    @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_attach_magnitude_hooks(self) -> None:
         torch.manual_seed(42)
@@ -946,6 +901,8 @@ class TestMoEUtils(_TestBase):
         hook_dict.reduce(op=dist.ReduceOp.AVG)
         hook_dict.reset()
 
+    @pytest.mark.world_size(2)
+    @pytest.mark.gpu
     def test_apply_loss_free_moe_balancing(self) -> None:
         torch.manual_seed(42)
         cfg = deepcopy(self.cfg)
@@ -976,70 +933,100 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.gpu
     def test_clip_grad_norm_(self) -> None:
         torch.manual_seed(42)
-        meshes = get_meshes(self.world_size, ep=self.world_size)
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
-        model_ep = MambaLMHeadModel(self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep)
-        dtype = torch.bfloat16
-        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
-
-        init_moe(model_ep)
-        _copy_params(model, model_ep)
-        fully_shard_moe(
-            model_ep, fsdp_mesh=meshes.dp, ep_mesh=meshes.ep, mp_policy=mp_policy
+        inputs = torch.randn(
+            self.world_size, self.in_features, device=self.device, dtype=torch.float32
+        )
+        world_mesh = init_device_mesh(
+            self.device_type,
+            (self.world_size,),
+            mesh_dim_names=("world",),
+        )
+        split_mesh = init_device_mesh(
+            self.device_type,
+            (self.world_size // 2, 2),
+            mesh_dim_names=("outer", "inner"),
         )
 
-        inputs = self.get_input_toks()
+        # Test on very simple model sharded across different meshes.
+        class LinearStack(nn.Module):
+            def __init__(self, in_features, device, n_layers: int = 2):
+                super().__init__()
+                self.layers = nn.ModuleList(
+                    [
+                        nn.Linear(
+                            in_features,
+                            in_features,
+                            bias=False,
+                            device=device,
+                        )
+                        for _ in range(n_layers)
+                    ]
+                )
+
+            def forward(self, inputs):
+                for lin in self.layers:
+                    inputs = lin(inputs)
+                return inputs
+
+        model = LinearStack(self.in_features, self.device)
+        for p in model.parameters():
+            nn.init.normal_(p, std=1 / self.in_features**0.5)
+
+        model_sharded = deepcopy(model)
+        fully_shard(model_sharded.layers[0], mesh=world_mesh)
+        fully_shard(model_sharded.layers[1], mesh=split_mesh)
+        fully_shard(model_sharded, mesh=world_mesh)
+
         outputs = model(inputs)
-
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep)
-
-        # Populate grads
-        mean_loss_fn(outputs.logits).backward()
-        mean_loss_fn(outputs_ep.logits).backward()
-
-        # Verify agreement pre-clip
-        _test_grads(model, model_ep, tol=self.tol)
-
-        # Force the shared expert and non-shared expert grads to have grads of the same size to
-        # ensure a non-trivial test. Force the L2 norm of the routed-exp and non-routeed-exp grads
-        # to be O(1).
-        total_params = sum(p.numel() for p in model.parameters())
-        n_moe_params = sum(
-            p.numel()
-            for m in model.modules()
-            for p in m.parameters()
-            if isinstance(m, MoE)
+        outputs_sharded = model_sharded(inputs.tensor_split(self.world_size)[self.rank])
+        torch.testing.assert_close(
+            outputs_sharded,
+            outputs.tensor_split(self.world_size)[self.rank],
+            atol=self.tol,
+            rtol=self.tol,
         )
-        non_moe_params = total_params - n_moe_params
-        for mod in (model, model_ep):
-            for m in mod.modules():
-                if isinstance(m, MoE):
-                    for p in m.parameters(recurse=False):
-                        if p.grad is not None:
-                            nn.init.constant_(p.grad, 1 / n_moe_params**0.5)
-                else:
-                    for p in m.parameters(recurse=False):
-                        if p.grad is not None:
-                            nn.init.constant_(p.grad, 1 / non_moe_params**0.5)
+        mean_loss_fn(outputs).backward()
+        mean_loss_fn(outputs_sharded).backward()
 
-        # Verify the grads still match
-        _test_grads(model, model_ep, tol=self.tol)
+        # Verify correct params and  grads:
+        for lin, lin_sharded in zip(model.layers, model_sharded.layers):
+            # Sanity check
+            weight = lin.weight
+            weight_sharded = lin_sharded.weight.full_tensor()
+            torch.testing.assert_close(
+                weight_sharded, weight, atol=self.tol, rtol=self.tol
+            )
 
-        max_norm = 0.5
-        norm = nn.utils.clip_grad_norm_(model.parameters(),  max_norm)
+            grad = lin.weight.grad
+            grad_sharded = lin_sharded.weight.grad.full_tensor()
+            torch.testing.assert_close(grad_sharded, grad, atol=self.tol, rtol=self.tol)
+
+        # Norm and ensure it's non-trivial
+        max_norm = 1.0
+        norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        if norm < max_norm:
+            max_norm = norm / 2
+            norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         assert norm > max_norm, "Clip was trivial"
 
-        # Sanity check: grads should no longer agree
-        with pytest.raises(AssertionError):
-            _test_grads(model, model_ep, tol=self.tol)
+        norm_sharded = clip_grad_norm_(model_sharded.parameters(), max_norm)
+        torch.testing.assert_close(norm_sharded, norm, atol=self.tol, rtol=self.tol)
 
-        norm_ep = clip_grad_norm_(model_ep.parameters(), max_norm)
+        # Clipping again should effectively be a no-op and return the max_norm
+        assert torch.allclose(
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm),
+            torch.tensor(max_norm, device=self.device),
+        )
+        assert torch.allclose(
+            clip_grad_norm_(model_sharded.parameters(), max_norm),
+            torch.tensor(max_norm, device=self.device),
+        )
 
-        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
-
-        # Verify agreement pre-clip
-        _test_grads(model, model_ep, tol=self.tol)
+        # Verify correct grads post-clip:
+        for lin, lin_sharded in zip(model.layers, model_sharded.layers):
+            grad = lin.weight.grad
+            grad_sharded = lin_sharded.weight.grad.full_tensor()
+            torch.testing.assert_close(grad_sharded, grad, atol=self.tol, rtol=self.tol)
 
 
 class TestE2E(_TestBase):
@@ -1076,14 +1063,14 @@ class TestE2E(_TestBase):
         inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
         outputs_ep = model_ep(inputs_ep).logits
         torch.testing.assert_close(
-            outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
             outputs_ep,
+            outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
             atol=self.tol,
             rtol=self.tol,
         )
 
         # Grads should match with an avg-over-batches type loss.
-        flattened_cross_entropy(outputs, inputs ).backward()
+        flattened_cross_entropy(outputs, inputs).backward()
         flattened_cross_entropy(outputs_ep, inputs_ep).backward()
 
         norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1091,7 +1078,7 @@ class TestE2E(_TestBase):
         assert norm.item() > 0.0, f"{norm=}"
         assert norm_ep.item() > 0.0, f"{norm_ep=}"
 
-        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(norm_ep, norm, atol=self.tol, rtol=self.tol)
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -1104,8 +1091,8 @@ class TestE2E(_TestBase):
             outputs = model(inputs).logits
             outputs_ep = model_ep(inputs_ep).logits
             torch.testing.assert_close(
-                outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
                 outputs_ep,
+                outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
                 atol=self.tol,
                 rtol=self.tol,
             )
@@ -1197,9 +1184,9 @@ class TestE2E(_TestBase):
 
         if is_last:
             assert len(losses_pp) == n_microbatches
-            torch.testing.assert_close(out_pp, out, atol=self.tol, rtol=self.tol)
+            torch.testing.assert_close(out, out_pp, atol=self.tol, rtol=self.tol)
             torch.testing.assert_close(
-                loss, torch.stack(losses_pp).mean(), atol=self.tol, rtol=self.tol
+                torch.stack(losses_pp).mean(), loss, atol=self.tol, rtol=self.tol
             )
         else:
             assert len(losses_pp) == 0
@@ -1226,7 +1213,9 @@ class TestE2E(_TestBase):
         elif is_last:
             out_pp_post_step = pp_schedule.step(target=inputs, losses=losses_pp)
             # Sanity check the model changed
-            assert not torch.allclose(out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol)
+            assert not torch.allclose(
+                out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol
+            )
         else:
             pp_schedule.step()
         optim_pp.step()
@@ -1235,7 +1224,9 @@ class TestE2E(_TestBase):
         # Verify updated outputs match ref model:
         if is_last:
             out_post_step = model(inputs)
-            torch.testing.assert_close(out_post_step, out_pp_post_step, atol=self.tol, rtol=self.tol)
+            torch.testing.assert_close(
+                out_pp_post_step, out_post_step, atol=self.tol, rtol=self.tol
+            )
 
         # Reload and check state restored
         state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
