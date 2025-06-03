@@ -59,6 +59,7 @@ def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
 
 
 def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
+    fails = {}
     with torch.no_grad():
         for n, m_fsdp in model_fsdp.named_modules():
             m = model.get_submodule(n)
@@ -73,9 +74,13 @@ def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
                 if isinstance(grad_fsdp, DTensor):
                     grad_fsdp = grad_fsdp.full_tensor()
                 try:
-                    torch.testing.assert_close(grad, grad_fsdp, atol=tol, rtol=tol)
-                except Exception as e:
-                    raise RuntimeError(f"Failed on {m=}, {n=}") from e
+                    # Use the less-stringent assert_close
+                    # assert_close(grad_fsdp, grad, tol)
+                    torch.testing.assert_close(grad_fsdp, grad, atol=tol, rtol=tol)
+                except AssertionError as e:
+                    fails[(m, n)] = str(e)
+    if fails:
+        raise AssertionError(str(fails))
 
 
 class _TestBase(DTest):
