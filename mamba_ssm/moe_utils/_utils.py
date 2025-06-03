@@ -600,12 +600,15 @@ def clip_grad_norm_(
     Similar to torchtitan's impl, but with extra handling for EP.
     """
 
+    p_dict = defaultdict(list)
     g_dict = defaultdict(list)
     for p in parameters:
         if p.grad is not None:
             if isinstance(p, DTensor):
+                p_dict[p.device_mesh].append(p)
                 g_dict[p.grad.device_mesh].append(p.grad)
             else:
+                p_dict[None].append(p)
                 g_dict[None].append(p.grad)
     if not g_dict:
         # NOTE: @goon - nn.utils.clip_grad_norm_ would return a tensor(0.0) here, but we raise an
@@ -628,6 +631,9 @@ def clip_grad_norm_(
     else:
         total_norm = _get_tensor_list_norm(list(norm_dict.values()), norm_type)
 
+    if isinstance(total_norm, DTensor):
+        total_norm = total_norm.full_tensor()
+
     if pp_mesh is not None:
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
@@ -636,7 +642,9 @@ def clip_grad_norm_(
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    # Again need to hand different meshes independently in the general case
+    for p in p_dict.values():
+        torch.nn.utils.clip_grads_with_norm_(p, max_norm, total_norm, foreach)
     return total_norm
 
 
@@ -659,7 +667,9 @@ def set_pp_layers(
     # Divide blocks among stages. Currently giving early stages extra blocks.
     n_blocks = len(model.backbone.layers)
     if n_blocks + 2 < n_stages:
-        raise ValueError(f"Expected n_blocks + 2 >= n_stages, but {n_blocks=}, {n_stages=}")
+        raise ValueError(
+            f"Expected n_blocks + 2 >= n_stages, but {n_blocks=}, {n_stages=}"
+        )
     all_block_idxs = set(model.backbone.layers)
     this_stage_block_idxs = {
         str(n)
