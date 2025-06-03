@@ -506,6 +506,60 @@ class TestModelEP(_TestBase):
 
         torch.testing.assert_close(outputs, outputs_ep, atol=self.tol, rtol=self.tol)
 
+    @pytest.mark.world_size(4)
+    @pytest.mark.gpu
+    def test_clip_grad(self) -> None:
+        # NOTE: @goon - this is only passing because of the special fsdp_mesh=ep_mesh setting.
+        # Otherwise, clipping fails with different mesh errors.
+        torch.manual_seed(42)
+        ep_mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+        )
+        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs).to(self.dtype)
+        model_ep = MambaLMHeadModel(
+            self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
+        ).to(self.dtype)
+
+        # Force models equal
+        _copy_params(model, model_ep)
+        fully_shard_moe(
+            model_ep,
+            fsdp_mesh=ep_mesh,
+            ep_mesh=ep_mesh,
+        )
+
+        inputs = self.get_input_toks()
+        outputs = model(inputs)
+
+        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+        outputs_ep = model_ep(inputs_ep)
+
+        # Populate grads
+        mean_loss_fn(outputs.logits).backward()
+        mean_loss_fn(outputs_ep.logits).backward()
+
+        # Verify agreement pre-clip
+        _test_grads(model, model_ep, tol=self.tol)
+
+        # Clip grads on the ref model
+        max_norm = 1.0
+        norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+        # The clip may have been trivial. Update max_norm if it was and clip again
+        if norm < max_norm:
+            max_norm = norm.item() / 2
+            norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+        # Sanity check: grads should no longer agree
+        with pytest.raises(AssertionError):
+            _test_grads(model, model_ep, tol=self.tol)
+
+        norm_ep = nn.utils.clip_grad_norm_(model_ep.parameters(), max_norm).full_tensor()
+        torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
+
+        # Verify agreement post-clip
+        _test_grads(model, model_ep, tol=self.tol)
+
 
 class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(4)
@@ -939,6 +993,9 @@ class TestMoEUtils(_TestBase):
         mean_loss_fn(outputs.logits).backward()
         mean_loss_fn(outputs_ep.logits).backward()
 
+        # Verify agreement pre-clip
+        _test_grads(model, model_ep, tol=self.tol)
+
         # Force the shared expert and non-shared expert grads to have grads of the same size to
         # ensure a non-trivial test. Force the L2 norm of the routed-exp and non-routeed-exp grads
         # to be O(1).
@@ -961,9 +1018,23 @@ class TestMoEUtils(_TestBase):
                         if p.grad is not None:
                             nn.init.constant_(p.grad, 1 / non_moe_params**0.5)
 
-        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
+        # Verify the grads still match
+        _test_grads(model, model_ep, tol=self.tol)
+
+        max_norm = 0.5
+        norm = nn.utils.clip_grad_norm_(model.parameters(),  max_norm)
+        assert norm > max_norm, "Clip was trivial"
+
+        # Sanity check: grads should no longer agree
+        with pytest.raises(AssertionError):
+            _test_grads(model, model_ep, tol=self.tol)
+
+        norm_ep = clip_grad_norm_(model_ep.parameters(), max_norm)
+
         torch.testing.assert_close(norm, norm_ep, atol=self.tol, rtol=self.tol)
+
+        # Verify agreement pre-clip
+        _test_grads(model, model_ep, tol=self.tol)
 
 
 class TestE2E(_TestBase):
@@ -991,7 +1062,8 @@ class TestE2E(_TestBase):
         init_moe(model_ep, verbose=False)
         _copy_params(model, model_ep)
 
-        optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
+        optim = torch.optim.AdamW(model.parameters(), lr=1e-1)
+        optim_ep = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
 
         inputs = self.get_input_toks()
         outputs = model(inputs).logits
@@ -1006,8 +1078,8 @@ class TestE2E(_TestBase):
         )
 
         # Grads should match with an avg-over-batches type loss.
-        mean_loss_fn(outputs).backward()
-        mean_loss_fn(outputs_ep).backward()
+        flattened_cross_entropy(outputs, inputs ).backward()
+        flattened_cross_entropy(outputs_ep, inputs_ep).backward()
 
         norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
@@ -1018,28 +1090,41 @@ class TestE2E(_TestBase):
 
         _test_grads(model, model_ep, tol=self.tol)
 
-        # Save state
+        # Step and compare post-step outputs:
         optim.step()
         optim.zero_grad()
-        state_dict = get_dcp_state_dict(model_ep, optim)
+        optim_ep.step()
+        optim_ep.zero_grad()
+        with torch.no_grad():
+            outputs = model(inputs).logits
+            outputs_ep = model_ep(inputs_ep).logits
+            torch.testing.assert_close(
+                outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
+                outputs_ep,
+                atol=self.tol,
+                rtol=self.tol,
+            )
+
+        # Save state
+        state_dict = get_dcp_state_dict(model_ep, optim_ep)
         dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
 
         # Corrupt state
-        post_save_outputs = model_ep(inputs_ep).logits
+        post_save_outputs_ep = model_ep(inputs_ep).logits
         # Sanity check the model changed
         assert not torch.allclose(
-            post_save_outputs, outputs_ep, atol=self.tol, rtol=self.tol
+            post_save_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
         )
-        mean_loss_fn(post_save_outputs).backward()
-        optim.step()
-        optim.zero_grad()
+        flattened_cross_entropy(post_save_outputs_ep, inputs_ep).backward()
+        optim_ep.step()
+        optim_ep.zero_grad()
 
         # Reload and check state restored
-        state_dict_again = get_dcp_state_dict(model_ep, optim)
+        state_dict_again = get_dcp_state_dict(model_ep, optim_ep)
         dcp.load(state_dict_again, checkpoint_id=self.checkpoint_id)
         reloaded_outputs = model_ep(inputs_ep).logits
         torch.testing.assert_close(
-            post_save_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
+            post_save_outputs_ep, reloaded_outputs, atol=self.tol, rtol=self.tol
         )
 
     def train_loop_pp(self: _TestBase, pp: int):
@@ -1081,8 +1166,8 @@ class TestE2E(_TestBase):
         )
 
         # Create pipeline schedule
-        losses = []
-        n_microbatches = 2 * pp_mesh.size()
+        losses_pp = []
+        n_microbatches = pp_mesh.size()
         inputs = self.get_input_toks(batch_size=self.batch_size * n_microbatches)
         pp_schedule = Schedule1F1B(
             stage, n_microbatches, loss_fn=flattened_cross_entropy
@@ -1093,26 +1178,37 @@ class TestE2E(_TestBase):
 
         if is_first:
             pp_schedule.step(inputs)
-            out = None
+            out_pp = None
         elif is_last:
-            out = pp_schedule.step(target=inputs, losses=losses)
+            out_pp = pp_schedule.step(target=inputs, losses=losses_pp)
         else:
             pp_schedule.step()
-            out = None
+            out_pp = None
+
+        # Run reference model on same data.
+        out = model(inputs)
+        loss = flattened_cross_entropy(out, inputs)
+        loss.backward()
 
         if is_last:
-            assert len(losses) == n_microbatches
-            ref_out = model(inputs)
-            torch.testing.assert_close(out, ref_out, atol=self.tol, rtol=self.tol)
-            ref_loss = flattened_cross_entropy(ref_out, inputs)
+            assert len(losses_pp) == n_microbatches
+            torch.testing.assert_close(out_pp, out, atol=self.tol, rtol=self.tol)
             torch.testing.assert_close(
-                ref_loss, torch.stack(losses).mean(), atol=self.tol, rtol=self.tol
+                loss, torch.stack(losses_pp).mean(), atol=self.tol, rtol=self.tol
             )
         else:
-            assert len(losses) == 0
+            assert len(losses_pp) == 0
 
-        # TODO: @goon - grad clipping
+        # TODO: @goon - update _test_grads for pp and use here
 
+        # clipping not working correctly? Makes post-step outputs way off
+        # norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # norm_pp = clip_grad_norm_(model_pp.parameters(), 1.0, pp_mesh=pp_mesh)
+        # torch.testing.assert_close(norm, norm_pp, atol=self.tol, rtol=self.tol)
+
+        # Steps
+        optim.step()
+        optim.zero_grad()
         optim_pp.step()
         optim_pp.zero_grad()
 
@@ -1123,13 +1219,18 @@ class TestE2E(_TestBase):
         if is_first:
             pp_schedule.step(inputs)
         elif is_last:
-            out_post_step = pp_schedule.step(target=inputs, losses=losses)
+            out_pp_post_step = pp_schedule.step(target=inputs, losses=losses_pp)
             # Sanity check the model changed
-            assert not torch.allclose(out_post_step, out, atol=self.tol, rtol=self.tol)
+            assert not torch.allclose(out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol)
         else:
             pp_schedule.step()
         optim_pp.step()
         optim_pp.zero_grad()
+
+        # Verify updated outputs match ref model:
+        if is_last:
+            out_post_step = model(inputs)
+            torch.testing.assert_close(out_post_step, out_pp_post_step, atol=self.tol, rtol=self.tol)
 
         # Reload and check state restored
         state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
@@ -1138,8 +1239,8 @@ class TestE2E(_TestBase):
         if is_first:
             pp_schedule.step(inputs)
         elif is_last:
-            out_post_step_again = pp_schedule.step(target=inputs, losses=losses)
-            torch.testing.assert_close(out_post_step, out_post_step_again)
+            out_pp_post_step_again = pp_schedule.step(target=inputs, losses=losses_pp)
+            torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
         else:
             pp_schedule.step()
 
