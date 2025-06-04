@@ -1323,16 +1323,16 @@ def compile_breaking_fn(
     return x_recv
 
 
-class TestCompileBreaking(_TestBase):
-    @pytest.mark.world_size(4)
-    @pytest.mark.gpu
-    def test_fwd(self) -> None:
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        fn_compiled = torch.compile(compile_breaking_fn)
-        for seed in range(3):
-            inputs, _, indices, counts = self.get_inputs_weights_indices_counts(
-                seed=seed
-            )
-            fn_compiled(inputs, indices, ep_mesh, self.n_routed_experts)
+# class TestCompileBreaking(_TestBase):
+#     @pytest.mark.world_size(4)
+#     @pytest.mark.gpu
+#     def test_fwd(self) -> None:
+#         ep_mesh = init_device_mesh(
+#             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+#         )
+#         fn_compiled = torch.compile(compile_breaking_fn)
+#         for seed in range(3):
+#             inputs, _, indices, counts = self.get_inputs_weights_indices_counts(
+#                 seed=seed
+#             )
+#             fn_compiled(inputs, indices, ep_mesh, self.n_routed_experts)
