@@ -35,7 +35,6 @@ from mamba_ssm.moe_utils import (
     clip_grad_norm_,
     fully_shard_moe,
     get_dcp_state_dict,
-    get_meshes,
     init_moe,
 )
 from mamba_ssm.moe_utils._utils import apply_loss_free_moe_balancing, set_pp_layers
@@ -1141,15 +1140,6 @@ class TestMoEUtils(_TestBase):
         for b0, b1 in zip(pre_biases, post_biases):
             assert not torch.allclose(b0, b1)
 
-    @pytest.mark.world_size(4)
-    @pytest.mark.gpu
-    def test_get_meshes(self) -> None:
-        for hsdp in (False, self.world_size // 2):
-            for ep in (False, self.world_size, self.world_size // 2):
-                meshes = get_meshes(
-                    world_size=self.world_size, hsdp=hsdp, ep=ep, pp=False
-                )
-
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_clip_grad_norm_simple_model(self) -> None:
@@ -1255,13 +1245,26 @@ class TestE2E(_TestBase):
     def train_loop_ep(self: _TestBase, ep: int, attn_only: bool):
         with self.temp_dir() as checkpoint_id:
             torch.manual_seed(42)
-            meshes = get_meshes(world_size=self.world_size, ep=ep)
+            fsdp_mesh = init_device_mesh(
+                self.device_type, (self.world_size,), mesh_dim_names=("fsdp",)
+            )
+            if ep == self.world_size:
+                ep_mesh = init_device_mesh(
+                    self.device_type, (self.world_size,), mesh_dim_names=("ep_inner",)
+                )
+            else:
+                ep_mesh = init_device_mesh(
+                    self.device_type,
+                    (self.world_size // ep, ep),
+                    mesh_dim_names=("ep_outer", "ep_inner"),
+                )
+
             cfg = self.attn_only_cfg if attn_only else self.cfg
             model = MambaLMHeadModel(cfg, **self.factory_kwargs)
 
             with torch.device("meta"):
                 model_ep = MambaLMHeadModel(
-                    cfg, **self.factory_kwargs, ep_mesh=meshes.ep
+                    cfg, **self.factory_kwargs, ep_mesh=ep_mesh["ep_inner"]
                 )
 
             dtype = torch.bfloat16
@@ -1269,8 +1272,8 @@ class TestE2E(_TestBase):
 
             fully_shard_moe(
                 model_ep,
-                fsdp_mesh=meshes.dp,
-                ep_fsdp_mesh=meshes.ep,
+                fsdp_mesh=fsdp_mesh,
+                ep_fsdp_mesh=None if ep_mesh.ndim == 1 else ep_mesh["ep_outer"],
                 mp_policy=mp_policy,
             )
             init_moe(model_ep, verbose=False)
@@ -1358,7 +1361,6 @@ class TestE2E(_TestBase):
         PP only loop
         """
         with self.temp_dir() as checkpoint_id:
-            # TODO: @goon - use get_meshes
             pp_mesh = init_device_mesh(self.device_type, (pp,), mesh_dim_names=("pp",))
             # Need to avoid returning a CausalLMOutput object for PP, otherwise internal shape checks fail.
             pp_cfg = deepcopy(self.cfg)
