@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
-from warnings import warn
 
 import torch
 import torch.distributed._functional_collectives as funcol
@@ -767,6 +766,7 @@ class _EPData:
     """
     Small helper class for cleaning up API.
     """
+
     recv: Optional[torch.Tensor] = None
     send: Optional[torch.Tensor] = None
     out: Optional[torch.Tensor] = None
