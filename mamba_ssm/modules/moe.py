@@ -806,10 +806,9 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
 
         assert self.ep_mesh is not None  # mypy
-        counts = counts.to(torch.int64)
         with record_function("all2all::tok_per_exp_grp"):
             tokens_per_expert_group = funcol.all_to_all_single(
-                counts, None, None, group=self.ep_mesh
+                counts.contiguous(), None, None, group=self.ep_mesh
             )
 
         # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
