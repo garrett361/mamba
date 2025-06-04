@@ -824,6 +824,9 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
         # Receive toks from other workers
         with record_function("all2all::send0"):
+            print(f"{self.ep_mesh.get_rank()=}: {x_by_expert=}")
+            print(f"{self.ep_mesh.get_rank()=}: {recv_counts=}")
+            print(f"{self.ep_mesh.get_rank()=}: {send_counts=}")
             x_recv = funcol.all_to_all_single_autograd(
                 x_by_expert, recv_counts, send_counts, group=self.ep_mesh
             )
