@@ -1,3 +1,5 @@
+import tempfile
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -192,6 +194,25 @@ class _TestBase(DTest):
         )
         return inputs, weights, indices, TokenCounter()(indices, self.n_routed_experts)
 
+    @contextmanager
+    def temp_dir(self):
+        """
+        Create a shared temp dir for writing to.
+        """
+        if not self.rank:
+            temp_dir = tempfile.TemporaryDirectory()
+            temp_dir_name = temp_dir.name
+        else:
+            temp_dir_name = None
+        temp_dir_name_list = [temp_dir_name]
+        dist.broadcast_object_list(temp_dir_name_list, src=0)
+        try:
+            yield temp_dir_name_list[0]
+        finally:
+            # The temp dir is cleaned up once it leaves scope. The barrier ensures all procs have
+            # left the ctx manager before performing this cleanup.
+            dist.barrier()
+
 
 class TestRoutedExperts(_TestBase):
     @pytest.mark.world_size(4)
@@ -234,7 +255,13 @@ class TestRoutedExperts(_TestBase):
         # Some classes have dtype constraints:
         if cls == RoutedExpertsTorchEPGroupedMM:
             self.dtype = torch.bfloat16
+
         torch.manual_seed(42)
+        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
+        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+        weights_ep = weights.tensor_split(self.world_size, dim=0)[self.rank]
+        indices_ep = indices.tensor_split(self.world_size, dim=0)[self.rank]
+
         ep_mesh = init_device_mesh(
             self.device_type, (self.world_size,), mesh_dim_names=("ep",)
         )
@@ -250,24 +277,22 @@ class TestRoutedExperts(_TestBase):
         # Force models equal
         _copy_params(model, model_ep)
 
-        inputs, weights, indices, counts = self.get_inputs_weights_indices_counts()
         outputs = model(inputs, weights, indices, counts)
 
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        weights_ep = weights.tensor_split(self.world_size, dim=0)[self.rank]
-        indices_ep = indices.tensor_split(self.world_size, dim=0)[self.rank]
         # The counts need to be rederived from indices_ep
         counts_ep = TokenCounter()(indices_ep, self.n_routed_experts)
         outputs_ep = model_ep(inputs_ep, weights_ep, indices_ep, counts_ep)
 
+        torch.testing.assert_close(
+            outputs_ep,
+            outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
+            atol=self.tol,
+            rtol=self.tol,
+        )
+
         # Note: important to use an avg-type loss here.
         mean_loss_fn(outputs).backward()
         mean_loss_fn(outputs_ep).backward()
-
-        # # TODO: @goon - DELETE  test
-        # for p in model.parameters():
-        #     if p.grad is not None:
-        #         p.grad.mul_(100.0)
 
         _test_grads(model, model_ep, tol=self.tol)
 
@@ -698,110 +723,10 @@ class TestMoEUtils(_TestBase):
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
     def test_dcp_save_load(self) -> None:
-        torch.manual_seed(42)
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        model_ep = MambaLMHeadModel(
-            self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
-        ).to(self.dtype)
-
-        fully_shard_moe(
-            model_ep,
-            fsdp_mesh=ep_mesh,
-            ep_mesh=ep_mesh,
-        )
-        # Large LR to create big changes:
-        optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
-        torch.manual_seed(42 + self.rank)
-        inputs = self.get_input_toks()
-        pre_step_outputs = model_ep(inputs).logits
-        mean_loss_fn(pre_step_outputs).backward()
-        optim.step()
-        optim.zero_grad()
-        post_step_outputs = model_ep(inputs).logits
-        # Sanity check that the model changed:
-        assert not torch.allclose(pre_step_outputs, post_step_outputs)
-
-        # Save state
-        state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
-
-        # Corrupt the state by taking another step
-        mean_loss_fn(post_step_outputs).backward()
-        optim.step()
-        optim.zero_grad()
-
-        # And save the new outputs
-        post_second_step_outputs = model_ep(inputs).logits
-        # Sanity check:
-        assert not torch.allclose(post_step_outputs, post_second_step_outputs)
-
-        # Reload and overwrite the corrupted state
-        corrupted_state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.load(corrupted_state_dict, checkpoint_id=self.checkpoint_id)
-
-        # Check outputs agree pre- and post-taking another step
-        reloaded_outputs = model_ep(inputs).logits
-        torch.testing.assert_close(post_step_outputs, reloaded_outputs)
-
-        mean_loss_fn(reloaded_outputs).backward()
-        optim.step()
-        optim.zero_grad()
-        post_reload_step_outputs = model_ep(inputs).logits
-        torch.testing.assert_close(post_reload_step_outputs, post_second_step_outputs)
-
-    @pytest.mark.world_size(2)
-    @pytest.mark.gpu
-    def test_dcp_save_load_reconfigured(self) -> None:
-        """
-        Test reloading in a different sharded cfg.
-        """
-        # Run on all available ranks initially:
-        seed = 42
-        torch.manual_seed(seed)
-        ep_mesh = init_device_mesh(
-            self.device_type, (self.world_size,), mesh_dim_names=("ep",)
-        )
-        model_ep = MambaLMHeadModel(
-            self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
-        ).to(self.dtype)
-
-        fully_shard_moe(
-            model_ep,
-            fsdp_mesh=ep_mesh,
-            ep_mesh=ep_mesh,
-        )
-        # Large LR to create big changes:
-        lr = 1e-1
-        optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
-        torch.manual_seed(42 + self.rank)
-        inputs = self.get_input_toks()
-        pre_step_outputs = model_ep(inputs).logits
-        mean_loss_fn(pre_step_outputs).backward()
-        optim.step()
-        optim.zero_grad()
-        post_step_outputs = model_ep(inputs).logits
-        # Sanity check that the model changed:
-        assert not torch.allclose(pre_step_outputs, post_step_outputs)
-
-        # Save state
-        state_dict = get_dcp_state_dict(model_ep, optim)
-        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
-
-        # Take another step and save the outputs
-        mean_loss_fn(post_step_outputs).backward()
-        optim.step()
-        optim.zero_grad()
-        post_second_step_outputs = model_ep(inputs).logits
-        # Sanity check:
-        assert not torch.allclose(post_step_outputs, post_second_step_outputs)
-
-        # Try to reload on half the ranks.
-        if self.rank < self.world_size // 2:
-            torch.manual_seed(seed + 1)
+        with self.temp_dir() as checkpoint_id:
+            torch.manual_seed(42)
             ep_mesh = init_device_mesh(
-                self.device_type, (self.world_size // 2,), mesh_dim_names=("ep",)
+                self.device_type, (self.world_size,), mesh_dim_names=("ep",)
             )
             model_ep = MambaLMHeadModel(
                 self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
@@ -812,44 +737,149 @@ class TestMoEUtils(_TestBase):
                 fsdp_mesh=ep_mesh,
                 ep_mesh=ep_mesh,
             )
+            # Large LR to create big changes:
+            optim = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
+            torch.manual_seed(42 + self.rank)
+            inputs = self.get_input_toks()
+            pre_step_outputs = model_ep(inputs).logits
+            mean_loss_fn(pre_step_outputs).backward()
+            optim.step()
+            optim.zero_grad()
+            post_step_outputs = model_ep(inputs).logits
+            # Sanity check that the model changed:
+            assert not torch.allclose(pre_step_outputs, post_step_outputs)
 
-            optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
-            # Reload and overwrite the corrupted state
-            reconfig_state_dict = get_dcp_state_dict(model_ep, optim)
-            dcp.load(
-                reconfig_state_dict,
-                checkpoint_id=self.checkpoint_id,
-                process_group=ep_mesh.get_group(),  # NOTE: @goon - hangs, if not specified
-            )
+            # Save state
+            state_dict = get_dcp_state_dict(model_ep, optim)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            # Not sure the barrier is needed, but just in case.
+            dist.barrier()
 
-            # Check outputs agree pre- and post-taking another step
-            reloaded_outputs = model_ep(inputs).logits
-            torch.testing.assert_close(
-                post_step_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
-            )
-
-            # Re-run the backwards against the same data used originally. Requires grad-acc
-            # averaging for correctness.
-
-            (mean_loss_fn(reloaded_outputs) / 2).backward()
-
-            # And run on the data that the missing ranks previously ran on:
-            torch.manual_seed(42 + self.rank + self.world_size // 2)
-            (mean_loss_fn(model_ep(self.get_input_toks()).logits) / 2).backward()
-
+            # Corrupt the state by taking another step
+            mean_loss_fn(post_step_outputs).backward()
             optim.step()
             optim.zero_grad()
 
-            # Post-step check:
-            post_reload_step_outputs = model_ep(inputs).logits
-            torch.testing.assert_close(
-                post_reload_step_outputs,
-                post_second_step_outputs,
-                atol=self.tol,
-                rtol=self.tol,
-            )
+            # And save the new outputs
+            post_second_step_outputs = model_ep(inputs).logits
+            # Sanity check:
+            assert not torch.allclose(post_step_outputs, post_second_step_outputs)
 
-        dist.barrier()
+            # Reload and overwrite the corrupted state
+            corrupted_state_dict = get_dcp_state_dict(model_ep, optim)
+            dcp.load(corrupted_state_dict, checkpoint_id=checkpoint_id)
+
+            # Check outputs agree pre- and post-taking another step
+            reloaded_outputs = model_ep(inputs).logits
+            torch.testing.assert_close(post_step_outputs, reloaded_outputs)
+
+            mean_loss_fn(reloaded_outputs).backward()
+            optim.step()
+            optim.zero_grad()
+            post_reload_step_outputs = model_ep(inputs).logits
+            torch.testing.assert_close(post_reload_step_outputs, post_second_step_outputs)
+
+    @pytest.mark.world_size(2)
+    @pytest.mark.gpu
+    def test_dcp_save_load_reconfigured(self) -> None:
+        """
+        Test reloading in a different sharded cfg.
+        """
+        with self.temp_dir() as checkpoint_id:
+            # Run on all available ranks initially:
+            seed = 42
+            torch.manual_seed(seed)
+            ep_mesh = init_device_mesh(
+                self.device_type, (self.world_size,), mesh_dim_names=("ep",)
+            )
+            model_ep = MambaLMHeadModel(
+                self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
+            ).to(self.dtype)
+
+            fully_shard_moe(
+                model_ep,
+                fsdp_mesh=ep_mesh,
+                ep_mesh=ep_mesh,
+            )
+            # Large LR to create big changes:
+            lr = 1e-1
+            optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
+            torch.manual_seed(42 + self.rank)
+            inputs = self.get_input_toks()
+            pre_step_outputs = model_ep(inputs).logits
+            mean_loss_fn(pre_step_outputs).backward()
+            optim.step()
+            optim.zero_grad()
+            post_step_outputs = model_ep(inputs).logits
+            # Sanity check that the model changed:
+            assert not torch.allclose(pre_step_outputs, post_step_outputs)
+
+            # Save state
+            state_dict = get_dcp_state_dict(model_ep, optim)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            # Not sure the barrier is needed, but just in case.
+            dist.barrier()
+
+            # Take another step and save the outputs
+            mean_loss_fn(post_step_outputs).backward()
+            optim.step()
+            optim.zero_grad()
+            post_second_step_outputs = model_ep(inputs).logits
+            # Sanity check:
+            assert not torch.allclose(post_step_outputs, post_second_step_outputs)
+
+            # Try to reload on half the ranks.
+            if self.rank < self.world_size // 2:
+                torch.manual_seed(seed + 1)
+                ep_mesh = init_device_mesh(
+                    self.device_type, (self.world_size // 2,), mesh_dim_names=("ep",)
+                )
+                model_ep = MambaLMHeadModel(
+                    self.cfg, **self.factory_kwargs, ep_mesh=ep_mesh
+                ).to(self.dtype)
+
+                fully_shard_moe(
+                    model_ep,
+                    fsdp_mesh=ep_mesh,
+                    ep_mesh=ep_mesh,
+                )
+
+                optim = torch.optim.AdamW(model_ep.parameters(), lr=lr)
+                # Reload and overwrite the corrupted state
+                reconfig_state_dict = get_dcp_state_dict(model_ep, optim)
+                dcp.load(
+                    reconfig_state_dict,
+                    checkpoint_id=checkpoint_id,
+                    process_group=ep_mesh.get_group(),  # NOTE: @goon - hangs, if not specified
+                )
+
+                # Check outputs agree pre- and post-taking another step
+                reloaded_outputs = model_ep(inputs).logits
+                torch.testing.assert_close(
+                    post_step_outputs, reloaded_outputs, atol=self.tol, rtol=self.tol
+                )
+
+                # Re-run the backwards against the same data used originally. Requires grad-acc
+                # averaging for correctness.
+
+                (mean_loss_fn(reloaded_outputs) / 2).backward()
+
+                # And run on the data that the missing ranks previously ran on:
+                torch.manual_seed(42 + self.rank + self.world_size // 2)
+                (mean_loss_fn(model_ep(self.get_input_toks()).logits) / 2).backward()
+
+                optim.step()
+                optim.zero_grad()
+
+                # Post-step check:
+                post_reload_step_outputs = model_ep(inputs).logits
+                torch.testing.assert_close(
+                    post_reload_step_outputs,
+                    post_second_step_outputs,
+                    atol=self.tol,
+                    rtol=self.tol,
+                )
+
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
@@ -931,7 +961,7 @@ class TestMoEUtils(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_clip_grad_norm_(self) -> None:
+    def test_clip_grad_norm_simple_model(self) -> None:
         torch.manual_seed(42)
         inputs = torch.randn(
             self.world_size, self.in_features, device=self.device, dtype=torch.float32
@@ -1030,65 +1060,36 @@ class TestMoEUtils(_TestBase):
 
 
 class TestE2E(_TestBase):
-    checkpoint_id = "/tmp/dcp"
-
     def train_loop_ep(self: _TestBase, ep: int):
-        torch.manual_seed(42)
-        meshes = get_meshes(world_size=self.world_size, ep=ep)
-        model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
+        with self.temp_dir() as checkpoint_id:
+            torch.manual_seed(42)
+            meshes = get_meshes(world_size=self.world_size, ep=ep)
+            model = MambaLMHeadModel(self.cfg, **self.factory_kwargs)
 
-        with torch.device("meta"):
-            model_ep = MambaLMHeadModel(
-                self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep
+            with torch.device("meta"):
+                model_ep = MambaLMHeadModel(
+                    self.cfg, **self.factory_kwargs, ep_mesh=meshes.ep
+                )
+
+            dtype = torch.bfloat16
+            mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+
+            fully_shard_moe(
+                model_ep,
+                fsdp_mesh=meshes.dp,
+                ep_mesh=meshes.ep,
+                mp_policy=mp_policy,
             )
+            init_moe(model_ep, verbose=False)
+            _copy_params(model, model_ep)
 
-        dtype = torch.bfloat16
-        mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+            optim = torch.optim.AdamW(model.parameters(), lr=1e-1)
+            optim_ep = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
 
-        fully_shard_moe(
-            model_ep,
-            fsdp_mesh=meshes.dp,
-            ep_mesh=meshes.ep,
-            mp_policy=mp_policy,
-        )
-        init_moe(model_ep, verbose=False)
-        _copy_params(model, model_ep)
-
-        optim = torch.optim.AdamW(model.parameters(), lr=1e-1)
-        optim_ep = torch.optim.AdamW(model_ep.parameters(), lr=1e-1)
-
-        inputs = self.get_input_toks()
-        outputs = model(inputs).logits
-
-        inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
-        outputs_ep = model_ep(inputs_ep).logits
-        torch.testing.assert_close(
-            outputs_ep,
-            outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
-            atol=self.tol,
-            rtol=self.tol,
-        )
-
-        # Grads should match with an avg-over-batches type loss.
-        flattened_cross_entropy(outputs, inputs).backward()
-        flattened_cross_entropy(outputs_ep, inputs_ep).backward()
-
-        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
-        assert norm.item() > 0.0, f"{norm=}"
-        assert norm_ep.item() > 0.0, f"{norm_ep=}"
-
-        torch.testing.assert_close(norm_ep, norm, atol=self.tol, rtol=self.tol)
-
-        _test_grads(model, model_ep, tol=self.tol)
-
-        # Step and compare post-step outputs:
-        optim.step()
-        optim.zero_grad()
-        optim_ep.step()
-        optim_ep.zero_grad()
-        with torch.no_grad():
+            inputs = self.get_input_toks()
             outputs = model(inputs).logits
+
+            inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
             outputs_ep = model_ep(inputs_ep).logits
             torch.testing.assert_close(
                 outputs_ep,
@@ -1097,148 +1098,181 @@ class TestE2E(_TestBase):
                 rtol=self.tol,
             )
 
-        # Save state
-        state_dict = get_dcp_state_dict(model_ep, optim_ep)
-        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
+            # Grads should match with an avg-over-batches type loss.
+            flattened_cross_entropy(outputs, inputs).backward()
+            flattened_cross_entropy(outputs_ep, inputs_ep).backward()
 
-        # Corrupt state
-        post_save_outputs_ep = model_ep(inputs_ep).logits
-        # Sanity check the model changed
-        assert not torch.allclose(
-            post_save_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
-        )
-        flattened_cross_entropy(post_save_outputs_ep, inputs_ep).backward()
-        optim_ep.step()
-        optim_ep.zero_grad()
+            norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            norm_ep = clip_grad_norm_(model_ep.parameters(), 1.0)
+            assert norm.item() > 0.0, f"{norm=}"
+            assert norm_ep.item() > 0.0, f"{norm_ep=}"
 
-        # Reload and check state restored
-        state_dict_again = get_dcp_state_dict(model_ep, optim_ep)
-        dcp.load(state_dict_again, checkpoint_id=self.checkpoint_id)
-        reloaded_outputs = model_ep(inputs_ep).logits
-        torch.testing.assert_close(
-            post_save_outputs_ep, reloaded_outputs, atol=self.tol, rtol=self.tol
-        )
+            torch.testing.assert_close(norm_ep, norm, atol=self.tol, rtol=self.tol)
+
+            _test_grads(model, model_ep, tol=self.tol)
+
+            # Step and compare post-step outputs:
+            optim.step()
+            optim.zero_grad()
+            optim_ep.step()
+            optim_ep.zero_grad()
+            with torch.no_grad():
+                outputs = model(inputs).logits
+                outputs_ep = model_ep(inputs_ep).logits
+                torch.testing.assert_close(
+                    outputs_ep,
+                    outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
+                    atol=self.tol,
+                    rtol=self.tol,
+                )
+
+            # Save state
+            state_dict = get_dcp_state_dict(model_ep, optim_ep)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            # Not sure the barrier is needed, but just in case.
+            dist.barrier()
+
+            # Corrupt state
+            post_save_outputs_ep = model_ep(inputs_ep).logits
+            # Sanity check the model changed
+            assert not torch.allclose(
+                post_save_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
+            )
+            flattened_cross_entropy(post_save_outputs_ep, inputs_ep).backward()
+            optim_ep.step()
+            optim_ep.zero_grad()
+
+            # Reload and check state restored
+            state_dict_again = get_dcp_state_dict(model_ep, optim_ep)
+            dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
+            reloaded_outputs = model_ep(inputs_ep).logits
+            torch.testing.assert_close(
+                post_save_outputs_ep, reloaded_outputs, atol=self.tol, rtol=self.tol
+            )
 
     def train_loop_pp(self: _TestBase, pp: int):
         """
         PP only loop
         """
-        # TODO: @goon - use get_meshes
-        pp_mesh = init_device_mesh(self.device_type, (pp,), mesh_dim_names=("pp",))
-        # Need to avoid returning a CausalLMOutput object for PP, otherwise internal shape checks fail.
-        pp_cfg = deepcopy(self.cfg)
-        pp_cfg.return_logits = True
+        with self.temp_dir() as checkpoint_id:
+            # TODO: @goon - use get_meshes
+            pp_mesh = init_device_mesh(self.device_type, (pp,), mesh_dim_names=("pp",))
+            # Need to avoid returning a CausalLMOutput object for PP, otherwise internal shape checks fail.
+            pp_cfg = deepcopy(self.cfg)
+            pp_cfg.return_logits = True
 
-        model = MambaLMHeadModel(pp_cfg, **self.factory_kwargs)
-        # Create a non-sharded version of the model with proper init to first populate the ref model's
-        # weights:
-        torch.manual_seed(42)
-        with torch.device("meta"):
-            model_pp = MambaLMHeadModel(pp_cfg, **self.factory_kwargs, ep_mesh=None)
+            model = MambaLMHeadModel(pp_cfg, **self.factory_kwargs)
+            # Create a non-sharded version of the model with proper init to first populate the ref model's
+            # weights:
+            torch.manual_seed(42)
+            with torch.device("meta"):
+                model_pp = MambaLMHeadModel(pp_cfg, **self.factory_kwargs, ep_mesh=None)
 
-        init_moe(model_pp, verbose=False)
-        _copy_params(model, model_pp)
+            init_moe(model_pp, verbose=False)
+            _copy_params(model, model_pp)
 
-        # Then delete the unnecessary layers. We we would really delete these prior to moving weights
-        # to GPU with init_moe, but this is the easiest way to ensure matching weights.
-        set_pp_layers(
-            model_pp, n_stages=pp_mesh.size(), stage_idx=pp_mesh.get_local_rank()
-        )
-
-        lr = 1e-1
-        optim = torch.optim.AdamW(model.parameters(), lr=lr)
-        optim_pp = torch.optim.AdamW(model_pp.parameters(), lr=lr)
-
-        stage = PipelineStage(
-            model_pp,
-            pp_mesh.get_local_rank(),
-            pp_mesh.size(),
-            self.device,
-            group=pp_mesh.get_group(),
-        )
-
-        # Create pipeline schedule
-        losses_pp = []
-        n_microbatches = pp_mesh.size()
-        inputs = self.get_input_toks(batch_size=self.batch_size * n_microbatches)
-        pp_schedule = Schedule1F1B(
-            stage, n_microbatches, loss_fn=flattened_cross_entropy
-        )
-
-        is_first = pp_mesh.get_local_rank() == 0
-        is_last = pp_mesh.get_local_rank() == pp_mesh.size() - 1
-
-        if is_first:
-            pp_schedule.step(inputs)
-            out_pp = None
-        elif is_last:
-            out_pp = pp_schedule.step(target=inputs, losses=losses_pp)
-        else:
-            pp_schedule.step()
-            out_pp = None
-
-        # Run reference model on same data.
-        out = model(inputs)
-        loss = flattened_cross_entropy(out, inputs)
-        loss.backward()
-
-        if is_last:
-            assert len(losses_pp) == n_microbatches
-            torch.testing.assert_close(out, out_pp, atol=self.tol, rtol=self.tol)
-            torch.testing.assert_close(
-                torch.stack(losses_pp).mean(), loss, atol=self.tol, rtol=self.tol
-            )
-        else:
-            assert len(losses_pp) == 0
-
-        # TODO: @goon - update _test_grads for pp and use here
-
-        # clipping not working correctly? Makes post-step outputs way off
-        # norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # norm_pp = clip_grad_norm_(model_pp.parameters(), 1.0, pp_mesh=pp_mesh)
-        # torch.testing.assert_close(norm, norm_pp, atol=self.tol, rtol=self.tol)
-
-        # Steps
-        optim.step()
-        optim.zero_grad()
-        optim_pp.step()
-        optim_pp.zero_grad()
-
-        state_dict = get_dcp_state_dict(model_pp, optim_pp)
-        dcp.save(state_dict, checkpoint_id=self.checkpoint_id)
-
-        # Corrupt state
-        if is_first:
-            pp_schedule.step(inputs)
-        elif is_last:
-            out_pp_post_step = pp_schedule.step(target=inputs, losses=losses_pp)
-            # Sanity check the model changed
-            assert not torch.allclose(
-                out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol
-            )
-        else:
-            pp_schedule.step()
-        optim_pp.step()
-        optim_pp.zero_grad()
-
-        # Verify updated outputs match ref model:
-        if is_last:
-            out_post_step = model(inputs)
-            torch.testing.assert_close(
-                out_pp_post_step, out_post_step, atol=self.tol, rtol=self.tol
+            # Then delete the unnecessary layers. We we would really delete these prior to moving weights
+            # to GPU with init_moe, but this is the easiest way to ensure matching weights.
+            set_pp_layers(
+                model_pp, n_stages=pp_mesh.size(), stage_idx=pp_mesh.get_local_rank()
             )
 
-        # Reload and check state restored
-        state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
-        dcp.load(state_dict_again, checkpoint_id=self.checkpoint_id)
+            lr = 1e-1
+            optim = torch.optim.AdamW(model.parameters(), lr=lr)
+            optim_pp = torch.optim.AdamW(model_pp.parameters(), lr=lr)
 
-        if is_first:
-            pp_schedule.step(inputs)
-        elif is_last:
-            out_pp_post_step_again = pp_schedule.step(target=inputs, losses=losses_pp)
-            torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
-        else:
-            pp_schedule.step()
+            stage = PipelineStage(
+                model_pp,
+                pp_mesh.get_local_rank(),
+                pp_mesh.size(),
+                self.device,
+                group=pp_mesh.get_group(),
+            )
+
+            # Create pipeline schedule
+            losses_pp = []
+            n_microbatches = pp_mesh.size()
+            inputs = self.get_input_toks(batch_size=self.batch_size * n_microbatches)
+            pp_schedule = Schedule1F1B(
+                stage, n_microbatches, loss_fn=flattened_cross_entropy
+            )
+
+            is_first = pp_mesh.get_local_rank() == 0
+            is_last = pp_mesh.get_local_rank() == pp_mesh.size() - 1
+
+            if is_first:
+                pp_schedule.step(inputs)
+                out_pp = None
+            elif is_last:
+                out_pp = pp_schedule.step(target=inputs, losses=losses_pp)
+            else:
+                pp_schedule.step()
+                out_pp = None
+
+            # Run reference model on same data.
+            out = model(inputs)
+            loss = flattened_cross_entropy(out, inputs)
+            loss.backward()
+
+            if is_last:
+                assert len(losses_pp) == n_microbatches
+                torch.testing.assert_close(out, out_pp, atol=self.tol, rtol=self.tol)
+                torch.testing.assert_close(
+                    torch.stack(losses_pp).mean(), loss, atol=self.tol, rtol=self.tol
+                )
+            else:
+                assert len(losses_pp) == 0
+
+            # TODO: @goon - update _test_grads for pp and use here
+
+            # clipping not working correctly? Makes post-step outputs way off
+            # norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # norm_pp = clip_grad_norm_(model_pp.parameters(), 1.0, pp_mesh=pp_mesh)
+            # torch.testing.assert_close(norm, norm_pp, atol=self.tol, rtol=self.tol)
+
+            # Steps
+            optim.step()
+            optim.zero_grad()
+            optim_pp.step()
+            optim_pp.zero_grad()
+
+            state_dict = get_dcp_state_dict(model_pp, optim_pp)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            # Not sure the barrier is needed, but just in case.
+            dist.barrier()
+
+            # Corrupt state
+            if is_first:
+                pp_schedule.step(inputs)
+            elif is_last:
+                out_pp_post_step = pp_schedule.step(target=inputs, losses=losses_pp)
+                # Sanity check the model changed
+                assert not torch.allclose(
+                    out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol
+                )
+            else:
+                pp_schedule.step()
+            optim_pp.step()
+            optim_pp.zero_grad()
+
+            # Verify updated outputs match ref model:
+            if is_last:
+                out_post_step = model(inputs)
+                torch.testing.assert_close(
+                    out_pp_post_step, out_post_step, atol=self.tol, rtol=self.tol
+                )
+
+            # Reload and check state restored
+            state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
+            dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
+
+            if is_first:
+                pp_schedule.step(inputs)
+            elif is_last:
+                out_pp_post_step_again = pp_schedule.step(target=inputs, losses=losses_pp)
+                torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
+            else:
+                pp_schedule.step()
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
