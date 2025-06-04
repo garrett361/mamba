@@ -6,7 +6,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Iterable, Optional
-from warnings import warn
 
 import torch
 import torch.distributed as dist
@@ -35,15 +34,18 @@ from mamba_ssm.modules.moe import MoE, TokenCounter
 def fully_shard_moe(
     model: MambaLMHeadModel,
     fsdp_mesh: DeviceMesh,
-    ep_mesh: Optional[DeviceMesh] = None,
+    ep_fsdp_mesh: Optional[DeviceMesh] = None,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     reshard_lm_head_after_fwd: bool = False,
     explicit_fwd_prefetch: bool = True,
     explicit_bwd_prefetch: bool = False,
+    mean_loss: bool = True,
 ) -> None:
     # TODO: @goon - hsdp?
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
+    # TODO: @goon - use set_unshard_in_backward(False) for embedding? Not sure it really helps.
+    # https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.FSDPModule.set_unshard_in_backward
     fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
     fully_shard(
         model.lm_head,
@@ -53,38 +55,37 @@ def fully_shard_moe(
     )
     for idx, block in model.backbone.layers.items():
         # Cases:
-        # 1. ep_mesh is None: full replication, fully shard with the fsdp_mesh
-        # 2. ep_mesh.ndim == 1: no expert replication at all. Ignore experts in fully_shard
-        # 3. ep_mesh.ndim == 2: DP replication over outer dim, EP over inner dim
+        # 1. ep_fsdp_mesh is None: Assumed to be world-EP
+        # 2. ep_fsdp_mesh is not None: mesh is used to average grads over the routed experts.
 
         # The ignored_params arg requires torch nightly (> 2.6.0)
         ignored_params = set()
         if isinstance(block.mlp, MoE):
-            if ep_mesh is None:
-                pass
-            elif ep_mesh.ndim == 1:
-                assert ep_mesh.ndim == 1, f"{ep_mesh.dim=}"
-                # No replication in this case.
+            if ep_fsdp_mesh is None:
+                # Two things needed for correctness:
+                # 1) fully_shard needs to ignore the routed experts
+                # 2) A backward hook is needed to implement the correct division factor for
+                #    mean-type losses. fully_shard does this for all other params, but the routed
+                #    experts miss out on this when ignored.
                 for p in block.mlp.experts.parameters():
                     ignored_params.add(p)
-            elif ep_mesh.ndim == 2:
+                    if mean_loss:
+                        p.register_hook(lambda g: g / block.mlp.experts.ep_mesh_size)
+
+            else:
                 # Don't reshard due to comms costs
-                assert ep_mesh.ndim == 2, f"{ep_mesh.dim=}"
-                outer_ep_mesh_dim = ep_mesh.mesh_dim_names[0]
-                # Expectation: the inner dim is EP, outer DP
-                warn(
-                    f"Received 2D {ep_mesh=}, applying fully_shard over the outer mesh dim: {outer_ep_mesh_dim}.",
-                    stacklevel=1,
-                )
+                # We again need a different grad division factor for correctness.
+                # div factors!
                 fully_shard(
                     block.mlp.experts,
-                    mesh=ep_mesh[outer_ep_mesh_dim],
+                    mesh=ep_fsdp_mesh,
                     mp_policy=mp_policy,
                     reshard_after_forward=False,
                 )
-            else:
-                raise ValueError(
-                    f"Expected ep_mesh to be None or a 1- or 2-D DeviceMesh, got {ep_mesh=}"
+                # By default the grads are reduce-statter averaged over the inner ep_fsdp_mesh dim,
+                # and we need to increase this by a factor of the mesh size
+                block.mlp.experts.set_reduce_scatter_divide_factor(
+                    block.mlp.experts.ep_mesh_size * ep_fsdp_mesh.size(-1)
                 )
         is_not_last_block = int(idx) < len(model.backbone.layers) - 1
         fully_shard(
@@ -94,6 +95,8 @@ def fully_shard_moe(
             mp_policy=mp_policy,
             reshard_after_forward=is_not_last_block,
         )
+    # The only params owned by the root FSDP instance should be the final norm weights.
+    # TODO: @goon - wrap these with the lm head?
     fully_shard(
         model,
         mesh=fsdp_mesh,
