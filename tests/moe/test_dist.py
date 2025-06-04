@@ -45,6 +45,13 @@ from tests.moe.test_utils import (
     skip_moe_impl_if_no_h100s,
 )
 
+"""
+Notes:
+- Safer to use SGD with momentum than Adam in tests because the former is more sensitive to
+  accidentally errors in multiplicative factors of param grads, which can easily occur with EP
+  sharding.
+"""
+
 
 def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
     """
