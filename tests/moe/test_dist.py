@@ -158,6 +158,24 @@ class _TestBase(DTest):
         )
 
     @property
+    def attn_only_cfg(self) -> MambaConfig:
+        """
+        For testing attn-only models.
+        """
+        return MambaConfig(
+            d_model=self.in_features,
+            d_intermediate=self.d_intermediate,
+            n_layer=self.n_layer,
+            vocab_size=self.vocab_size,
+            tie_embeddings=self.tie_embeddings,
+            attn_layer_idx=list(range(self.n_layer)),
+            attn_cfg=self.attn_cfg,
+            moe_layer_idx=self.moe_layer_idx,
+            moe_cfg=self.moe_cfg,
+            ssm_cfg=self.ssm_cfg,
+        )
+
+    @property
     def factory_kwargs(self) -> dict[str, Any]:
         return {"device": self.device, "dtype": self.dtype}
 
