@@ -1305,7 +1305,7 @@ class TestE2E(_TestBase):
             # Clip and make sure the clip is non-trivial:
             max_norm = 1.0
             norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            if norm.item() > max_norm:
+            if norm.item() < max_norm:
                 max_norm = norm / 2
                 norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             norm_ep = clip_grad_norm_(model_ep.parameters(), max_norm)
@@ -1434,7 +1434,7 @@ class TestE2E(_TestBase):
 
             max_norm = 1.0
             norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            if norm.item() > max_norm:
+            if norm.item() < max_norm:
                 max_norm = norm / 2
                 norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             norm_pp = clip_grad_norm_(model_pp.parameters(), max_norm)
