@@ -199,16 +199,8 @@ class MoE(nn.Module):
             raise ValueError(
                 f"{n_routed_experts=} must be divisible by {ep_mesh.size()=}"
             )
-        if ep_mesh is not None:
-            if ep_mesh.ndim == 2:
-                inner_ep_mesh_dim = ep_mesh.mesh_dim_names[1]
-                ep_mesh = ep_mesh[inner_ep_mesh_dim]
-                warn(
-                    f"Received 2D {ep_mesh=}, using inner mesh dim ({inner_ep_mesh_dim}) as the EP mesh.",
-                    stacklevel=1,
-                )
-            elif ep_mesh.ndim > 2:
-                raise ValueError(f"Expected 1D or 2D ep_mesh, received {ep_mesh}")
+        if ep_mesh is not None and ep_mesh.ndim != 1:
+            raise ValueError(f"{ep_mesh} must be one-dimensional")
 
         super().__init__()
         self.in_features = in_features
