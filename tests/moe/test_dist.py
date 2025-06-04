@@ -117,6 +117,7 @@ class _TestBase(DTest):
     # Put the tolerances pretty high. Should still catch egregious errors, while allowing for
     # sharding inaccuracies.
     tol = 1e-1
+    hi_tol = 1e-3
 
     @property
     def n_routed_experts(self) -> int:
@@ -407,6 +408,12 @@ class TestMoEEP(_TestBase):
             model_ep, mesh=ep_mesh, ignored_params=set(model_ep.experts.parameters())
         )
 
+        # Fully shard averages grads for all wrapped layers, as is required for mean-type losses.
+        # The EP expert weights aren't wrapped and so they miss out on these averaged factors.
+        # Correctness then requires tensor hooks:
+        for p in model_ep.parameters():
+            p.register_hook(lambda g: g / self.world_size)
+
         inputs = self.get_inputs()
         outputs = model(inputs)
 
@@ -417,7 +424,7 @@ class TestMoEEP(_TestBase):
         mean_loss_fn(outputs).backward()
         mean_loss_fn(outputs_ep).backward()
 
-        _test_grads(model, model_ep, tol=self.tol)
+        _test_grads(model, model_ep, tol=self.hi_tol)
 
 
 class TestModelEP(_TestBase):
