@@ -77,8 +77,6 @@ def _test_grads(model: nn.Module, model_fsdp: nn.Module, tol: float) -> None:
                 if isinstance(grad_fsdp, DTensor):
                     grad_fsdp = grad_fsdp.full_tensor()
                 try:
-                    # Use the less-stringent assert_close
-                    # assert_close(grad_fsdp, grad, tol)
                     torch.testing.assert_close(grad_fsdp, grad, atol=tol, rtol=tol)
                 except AssertionError as e:
                     fails[(m, n)] = str(e)
@@ -116,7 +114,7 @@ class _TestBase(DTest):
 
     # Put the tolerances pretty high. Should still catch egregious errors, while allowing for
     # sharding inaccuracies.
-    tol = 1e-1
+    tol = 1e-2
     hi_tol = 1e-3
 
     @property
@@ -246,7 +244,7 @@ class TestRoutedExperts(_TestBase):
         outputs = model(inputs, weights, indices, counts)
         outputs_ep = model_ep(inputs, weights, indices, counts)
 
-        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.hi_tol, rtol=self.hi_tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
@@ -287,15 +285,16 @@ class TestRoutedExperts(_TestBase):
         torch.testing.assert_close(
             outputs_ep,
             outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[self.rank],
-            atol=self.tol,
-            rtol=self.tol,
+            atol=self.hi_tol,
+            rtol=self.hi_tol,
         )
 
-        # Note: important to use an avg-type loss here.
-        mean_loss_fn(outputs).backward()
-        mean_loss_fn(outputs_ep).backward()
+        # Note: important to use a sum-type loss function because this test is not using any grad
+        # averaging mechanism like fully_shard.
+        sum_loss_fn(outputs).backward()
+        sum_loss_fn(outputs_ep).backward()
 
-        _test_grads(model, model_ep, tol=self.tol)
+        _test_grads(model, model_ep, tol=self.hi_tol)
 
     @pytest.mark.parametrize("cls", list(EP_EXPERT_CLASSES.values()))
     def test_zero_toks(self, cls) -> None:
@@ -369,7 +368,7 @@ class TestMoEEP(_TestBase):
         outputs = model(inputs)
         outputs_ep = model_ep(inputs)
 
-        torch.testing.assert_close(outputs_ep, outputs, atol=self.tol, rtol=self.tol)
+        torch.testing.assert_close(outputs_ep, outputs, atol=self.hi_tol, rtol=self.hi_tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
