@@ -30,10 +30,8 @@ class TokenCounter(nn.Module):
     def forward(
         self, indices: torch.LongTensor, n_routed_experts: int
     ) -> torch.IntTensor:
-        counts = torch.zeros(
-            indices.shape[0], n_routed_experts, device=indices.device, dtype=torch.int32
-        )
-        counts.scatter_(1, indices, 1)
+        counts = indices.new_zeros((indices.shape[0], n_routed_experts))
+        counts.scatter_(1, indices.contiguous(), 1)
         counts = counts.sum(dim=0, dtype=torch.int32)
         return counts
 
