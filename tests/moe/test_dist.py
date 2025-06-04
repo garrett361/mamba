@@ -774,7 +774,6 @@ class TestMoEUtils(_TestBase):
         # Force models equal
         _copy_params(model, model_ep)
 
-
         torch.manual_seed(42 + self.rank)
         inputs = self.get_input_toks()
         outputs = model(inputs)
@@ -785,7 +784,8 @@ class TestMoEUtils(_TestBase):
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_bwd_fully_shard_moe_replicated(self) -> None:
+    @pytest.mark.parametrize("mp", [False, True])
+    def test_bwd_fully_shard_moe_replicated(self, mp: bool) -> None:
         torch.manual_seed(42)
         ep_mesh = init_device_mesh(
             "cuda",
@@ -809,14 +809,14 @@ class TestMoEUtils(_TestBase):
             model_ep,
             fsdp_mesh=fsdp_mesh,
             ep_fsdp_mesh=ep_mesh["outer"],
+            mp_policy=None
+            if not mp
+            else MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
+            ),
         )
         init_moe(model_ep)
         _copy_params(model, model_ep)
-
-        # for mod in model_ep.modules():
-        #     if isinstance(mod, MoE):
-        #         for p in mod.experts.parameters():
-        #             p.register_hook(lambda g: g / mod.experts.ep_mesh_size)
 
         inputs = self.get_input_toks()
         outputs = model(inputs)
@@ -828,7 +828,7 @@ class TestMoEUtils(_TestBase):
         flattened_cross_entropy(outputs.logits, inputs).backward()
         flattened_cross_entropy(outputs_ep.logits, inputs_ep).backward()
 
-        _test_grads(model, model_ep, tol=self.hi_tol)
+        _test_grads(model, model_ep, tol=self.tol if mp else self.hi_tol)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu

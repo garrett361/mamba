@@ -66,7 +66,6 @@ def fully_shard_moe(
                 # Ignore the routed experts
                 for p in block.mlp.experts.parameters():
                     ignored_params.add(p)
-
             else:
                 # Don't reshard due to comms costs
                 # We again need a different grad division factor for correctness.
@@ -97,12 +96,18 @@ def fully_shard_moe(
     # losses, as there is no mechanism to divide grads by the size of the ep_mesh dim.
     # When ep_fsdp_mesh is non-trivial, set_reduce_scatter_divide_factor could in principle
     # be used, but I found that this errors when mp_policy is non-trivial.
-    # NOTE: @goon - not working when the experts are wrapped with fully_shard :(
-
-    for mod in model.modules():
-        if isinstance(mod, MoE):
-            for p in block.mlp.experts.parameters():
-                p.register_hook(lambda g: g / block.mlp.experts.ep_mesh_size)
+    if mean_loss:
+        if ep_fsdp_mesh is None:
+            for mod in model.modules():
+                if isinstance(mod, MoE):
+                    for p in block.mlp.experts.parameters():
+                        p.register_hook(lambda g: g / block.mlp.experts.ep_mesh_size)
+        else:
+            for mod in model.modules():
+                if isinstance(mod, MoE):
+                    block.mlp.experts.set_all_reduce_hook(
+                        lambda g: g.div_(block.mlp.experts.ep_mesh_size)
+                    )
 
     if explicit_fwd_prefetch:
         blocks = list(model.backbone.layers.values())
