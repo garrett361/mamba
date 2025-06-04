@@ -30,7 +30,9 @@ class TokenCounter(nn.Module):
     def forward(
         self, indices: torch.LongTensor, n_routed_experts: int
     ) -> torch.IntTensor:
-        counts = indices.new_zeros((indices.shape[0], n_routed_experts))
+        counts = torch.zeros(
+            indices.shape[0], n_routed_experts, device=indices.device, dtype=torch.int32
+        )
         counts.scatter_(1, indices, 1)
         counts = counts.sum(dim=0, dtype=torch.int32)
         return counts
@@ -506,7 +508,7 @@ class ExpertFFNForLoop(_ExpertFFNImpl):
         activation: Callable[[torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
         x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
-        z = torch.empty_like(x_by_expert)
+        z = torch.zeros_like(x_by_expert)
 
         # Build the idx map
         n_local_experts = fc1_weight.shape[0]
@@ -808,7 +810,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         assert self.ep_mesh is not None  # mypy
         with record_function("all2all::tok_per_exp_grp"):
             tokens_per_expert_group = funcol.all_to_all_single(
-                counts.contiguous(), None, None, group=self.ep_mesh
+                counts, None, None, group=self.ep_mesh
             )
 
         # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
