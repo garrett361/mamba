@@ -41,6 +41,8 @@ def mean_loss_fn(input: torch.Tensor) -> torch.Tensor:
     """
     return input.mean(0).sum()
 
+def sum_loss_fn(input: torch.Tensor) -> torch.Tensor:
+    return input.sum()
 
 def flattened_cross_entropy(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(input.view(-1, input.size(-1)), target.view(-1).long())
