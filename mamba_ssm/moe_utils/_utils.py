@@ -63,15 +63,9 @@ def fully_shard_moe(
         ignored_params = set()
         if isinstance(block.mlp, MoE):
             if ep_fsdp_mesh is None:
-                # Two things needed for correctness:
-                # 1) fully_shard needs to ignore the routed experts
-                # 2) A backward hook is needed to implement the correct division factor for
-                #    mean-type losses. fully_shard does this for all other params, but the routed
-                #    experts miss out on this when ignored.
+                # Ignore the routed experts
                 for p in block.mlp.experts.parameters():
                     ignored_params.add(p)
-                    if mean_loss:
-                        p.register_hook(lambda g: g / block.mlp.experts.ep_mesh_size)
 
             else:
                 # Don't reshard due to comms costs
@@ -81,11 +75,6 @@ def fully_shard_moe(
                     mesh=ep_fsdp_mesh,
                     mp_policy=mp_policy,
                     reshard_after_forward=False,
-                )
-                # By default the grads are reduce-scatter averaged over the inner ep_fsdp_mesh dim,
-                # and we need to increase this by a factor of the mesh size
-                block.mlp.experts.set_reduce_scatter_divide_factor(
-                    block.mlp.experts.ep_mesh_size * ep_fsdp_mesh.size(-1)
                 )
         is_not_last_block = int(idx) < len(model.backbone.layers) - 1
         fully_shard(
@@ -103,6 +92,18 @@ def fully_shard_moe(
         reshard_after_forward=False,
         mp_policy=mp_policy,
     )
+
+    # A backward hook is needed to implement the correct division factor for mean-type
+    # losses, as there is no mechanism to divide grads by the size of the ep_mesh dim.
+    # When ep_fsdp_mesh is non-trivial, set_reduce_scatter_divide_factor could in principle
+    # be used, but I found that this errors when mp_policy is non-trivial.
+    # NOTE: @goon - not working when the experts are wrapped with fully_shard :(
+
+    for mod in model.modules():
+        if isinstance(mod, MoE):
+            for p in block.mlp.experts.parameters():
+                p.register_hook(lambda g: g / block.mlp.experts.ep_mesh_size)
+
     if explicit_fwd_prefetch:
         blocks = list(model.backbone.layers.values())
         blocks.append(model.lm_head)
