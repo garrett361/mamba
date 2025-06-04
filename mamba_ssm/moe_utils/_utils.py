@@ -25,6 +25,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
+from torch.profiler import record_function
 
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel, _init_weights
 from mamba_ssm.modules.mamba2 import Mamba2
@@ -542,52 +543,57 @@ def clip_grad_norm_(
     Similar to torchtitan's impl, but with extra handling for EP.
     """
 
-    p_dict = defaultdict(list)
-    g_dict = defaultdict(list)
-    for p in parameters:
-        if p.grad is not None:
+    with record_function("moe_utils::clip_grad_norm_"):
+        p_dict = defaultdict(list)
+        g_dict = defaultdict(list)
+        for p in parameters:
+            if p.grad is not None:
+                if isinstance(p, DTensor):
+                    p_dict[p.device_mesh].append(p)
+                    g_dict[p.grad.device_mesh].append(p.grad)
+                else:
+                    p_dict[None].append(p)
+                    g_dict[None].append(p.grad)
+        if not g_dict:
+            # NOTE: @goon - nn.utils.clip_grad_norm_ would return a tensor(0.0) here, but we raise an
+            # error as this should never happen.
+            raise RuntimeError("parameters contain no grads")
+
+        # Need to norm grads with different meshes independently; unsupported op otherwise.
+        norm_dict = {
+            k: torch.nn.utils.get_total_norm(g, norm_type, error_if_nonfinite, foreach)
+            for k, g in g_dict.items()
+        }
+        for k, v in norm_dict.items():
             if isinstance(p, DTensor):
-                p_dict[p.device_mesh].append(p)
-                g_dict[p.grad.device_mesh].append(p.grad)
-            else:
-                p_dict[None].append(p)
-                g_dict[None].append(p.grad)
-    if not g_dict:
-        # NOTE: @goon - nn.utils.clip_grad_norm_ would return a tensor(0.0) here, but we raise an
-        # error as this should never happen.
-        raise RuntimeError("parameters contain no grads")
+                norm_dict[k] = v.full_tensor()
 
-    # Need to norm grads with different meshes independently; unsupported op otherwise.
-    norm_dict = {
-        k: torch.nn.utils.get_total_norm(g, norm_type, error_if_nonfinite, foreach)
-        for k, g in g_dict.items()
-    }
-    for k, v in norm_dict.items():
-        if isinstance(p, DTensor):
-            norm_dict[k] = v.full_tensor()
-
-    if len(norm_dict) == 1:
-        total_norm = next(iter(norm_dict.values()))
-    elif math.isinf(norm_type):
-        total_norm = max(norm_dict.values())
-    else:
-        total_norm = _get_tensor_list_norm(list(norm_dict.values()), norm_type)
-
-    if isinstance(total_norm, DTensor):
-        total_norm = total_norm.full_tensor()
-
-    if pp_mesh is not None:
-        if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
+        if len(norm_dict) == 1:
+            total_norm = next(iter(norm_dict.values()))
+        elif math.isinf(norm_type):
+            total_norm = max(norm_dict.values())
         else:
-            total_norm **= norm_type
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type
+            total_norm = _get_tensor_list_norm(list(norm_dict.values()), norm_type)
 
-    # Again need to hand different meshes independently in the general case
-    for p in p_dict.values():
-        torch.nn.utils.clip_grads_with_norm_(p, max_norm, total_norm, foreach)
-    return total_norm
+        if isinstance(total_norm, DTensor):
+            total_norm = total_norm.full_tensor()
+
+        if pp_mesh is not None:
+            if math.isinf(norm_type):
+                dist.all_reduce(
+                    total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group()
+                )
+            else:
+                total_norm **= norm_type
+                dist.all_reduce(
+                    total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group()
+                )
+                total_norm **= 1.0 / norm_type
+
+        # Again need to hand different meshes independently in the general case
+        for p in p_dict.values():
+            torch.nn.utils.clip_grads_with_norm_(p, max_norm, total_norm, foreach)
+        return total_norm
 
 
 def set_pp_layers(
