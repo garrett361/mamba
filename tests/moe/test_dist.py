@@ -1438,7 +1438,7 @@ class TestE2E(_TestBase):
             if norm.item() < max_norm:
                 max_norm = norm / 2
                 norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            norm_pp = clip_grad_norm_(model_pp.parameters(), max_norm)
+            norm_pp = clip_grad_norm_(model_pp.parameters(), max_norm, pp_mesh=pp_mesh)
             torch.testing.assert_close(norm, norm_pp, atol=self.tol, rtol=self.tol)
 
             # Steps
