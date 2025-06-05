@@ -1309,6 +1309,10 @@ class TestE2E(_TestBase):
             init_moe(model_ep)
             _copy_params(model, model_ep)
 
+            # For balancing loss:
+            tok_hook_dict = attach_tok_count_hooks(model)
+            tok_hook_dict_ep = attach_tok_count_hooks(model_ep)
+
             optim = torch.optim.SGD(
                 model.parameters(), lr=self.lr, momentum=self.momentum
             )
@@ -1331,6 +1335,13 @@ class TestE2E(_TestBase):
             # Grads should match with an avg-over-batches type loss.
             flattened_cross_entropy(outputs, inputs).backward()
             flattened_cross_entropy(outputs_ep, inputs_ep).backward()
+
+            # balancing loss
+            apply_loss_free_moe_balancing(
+                self.lr, model, tok_hook_dict, verify_reduced=False
+            )
+            tok_hook_dict_ep.all_reduce()
+            apply_loss_free_moe_balancing(self.lr, model_ep, tok_hook_dict_ep)
 
             # Clip and make sure the clip is non-trivial:
             max_norm = 1.0
@@ -1412,6 +1423,10 @@ class TestE2E(_TestBase):
                 model_pp, n_stages=pp_mesh.size(), stage_idx=pp_mesh.get_local_rank()
             )
 
+            # For balancing loss:
+            tok_hook_dict = attach_tok_count_hooks(model)
+            tok_hook_dict_pp = attach_tok_count_hooks(model_pp)
+
             act_ckpt_moe(model_pp)
 
             lr = 1e-1
@@ -1461,6 +1476,14 @@ class TestE2E(_TestBase):
                 )
             else:
                 assert len(losses_pp) == 0
+
+            # balancing loss. No need to reduce since there is no EP dim
+            apply_loss_free_moe_balancing(
+                self.lr, model, tok_hook_dict, verify_reduced=False
+            )
+            apply_loss_free_moe_balancing(
+                self.lr, model_pp, tok_hook_dict_pp, verify_reduced=False
+            )
 
             # TODO: @goon - update _test_grads for pp and use here
             _test_grads(model, model_pp, tol=self.tol)
