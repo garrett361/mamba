@@ -807,6 +807,8 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
 
         assert self.ep_mesh is not None  # mypy
+        layer_idx = self.layer_idx if hasattr(self, "layer_idx") else None
+        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {counts=}")
         with record_function("all2all::tok_per_exp_grp"):
             tokens_per_expert_group = funcol.all_to_all_single(
                 counts, None, None, group=self.ep_mesh
@@ -822,11 +824,11 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             .sum(dim=1)
             .tolist()
         )
+        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {recv_counts=}")
+        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {send_counts=}")
 
         # Receive toks from other workers
         with record_function("all2all::send0"):
-            print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {recv_counts=}")
-            print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {send_counts=}")
             x_recv = funcol.all_to_all_single_autograd(
                 x_by_expert, recv_counts, send_counts, group=self.ep_mesh
             )
