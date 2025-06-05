@@ -1412,6 +1412,8 @@ class TestE2E(_TestBase):
                 model_pp, n_stages=pp_mesh.size(), stage_idx=pp_mesh.get_local_rank()
             )
 
+            act_ckpt_moe(model_pp)
+
             lr = 1e-1
             optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=self.momentum)
             optim_pp = torch.optim.SGD(
