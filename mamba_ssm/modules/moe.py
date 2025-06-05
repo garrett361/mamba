@@ -812,8 +812,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             tokens_per_expert_group = funcol.all_to_all_single(
                 counts, None, None, group=self.ep_mesh
             )
-        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {counts=}")
-        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {tokens_per_expert_group=}")
 
         # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
         # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
@@ -825,8 +823,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             .sum(dim=1)
             .tolist()
         )
-        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {recv_counts=}")
-        print(f"{self.ep_mesh.get_rank()=}, {layer_idx=}: {send_counts=}")
 
         # Receive toks from other workers
         with record_function("all2all::send0"):
