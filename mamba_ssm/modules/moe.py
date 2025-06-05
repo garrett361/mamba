@@ -812,9 +812,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             tokens_per_expert_group = funcol.all_to_all_single(
                 counts, None, None, group=self.ep_mesh
             )
-        print(
-            f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {tokens_per_expert_group=}"
-        )
 
         # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
         # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
@@ -852,6 +849,9 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
         local_indices, local_counts = _get_local_indices_and_counts(
             tokens_per_expert_group, self.n_local_experts
+        )
+        print(
+            f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {local_counts=}"
         )
         data = _EPData(
             recv=x_recv,
