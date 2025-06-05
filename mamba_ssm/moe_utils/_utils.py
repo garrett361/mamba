@@ -47,13 +47,18 @@ def fully_shard_moe(
         mp_policy = MixedPrecisionPolicy()
     # TODO: @goon - use set_unshard_in_backward(False) for embedding? Not sure it really helps.
     # https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.FSDPModule.set_unshard_in_backward
-    fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
-    fully_shard(
-        model.lm_head,
-        mesh=fsdp_mesh,
-        mp_policy=mp_policy,
-        reshard_after_forward=reshard_lm_head_after_fwd,
-    )
+
+    if model.backbone.embedding is not None:
+        # PP guard
+        fully_shard(model.backbone.embedding, mesh=fsdp_mesh, mp_policy=mp_policy)
+    if model.lm_head is not None:
+        # PP guard
+        fully_shard(
+            model.lm_head,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=reshard_lm_head_after_fwd,
+        )
     for idx, block in model.backbone.layers.items():
         # Cases:
         # 1. ep_fsdp_mesh is None: Assumed to be world-EP
@@ -75,6 +80,7 @@ def fully_shard_moe(
                     mp_policy=mp_policy,
                     reshard_after_forward=False,
                 )
+        # TODO: @goon - needs modifying w/ PP?
         is_not_last_block = int(idx) < len(model.backbone.layers) - 1
         fully_shard(
             block,
@@ -111,12 +117,18 @@ def fully_shard_moe(
 
     if explicit_fwd_prefetch:
         blocks = list(model.backbone.layers.values())
-        blocks.append(model.lm_head)
+        if model.lm_head is not None:
+            # PP guard
+            blocks.append(model.lm_head)
         for b_prev, b_next in zip(blocks[:-1], blocks[1:]):
             b_prev.set_modules_to_forward_prefetch([b_next])
 
     if explicit_bwd_prefetch:
-        blocks = [model.lm_head, *model.backbone.layers.values()]
+        if model.lm_head is not None:
+            # PP guard
+            blocks = [model.lm_head, *model.backbone.layers.values()]
+        else:
+            blocks = list(model.backbone.layers.values())
         reversed_blocks = list(reversed(blocks))
         for b_prev, b_next in zip(reversed_blocks[:-1], reversed_blocks[1:]):
             b_prev.set_modules_to_backward_prefetch([b_next])
