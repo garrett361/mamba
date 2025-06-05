@@ -38,7 +38,7 @@ def fully_shard_moe(
     ep_fsdp_mesh: Optional[DeviceMesh] = None,
     mp_policy: Optional[MixedPrecisionPolicy] = None,
     reshard_lm_head_after_fwd: bool = False,
-    explicit_fwd_prefetch: bool = True,
+    explicit_fwd_prefetch: bool = False,
     explicit_bwd_prefetch: bool = False,
     mean_loss: bool = True,
 ) -> None:
