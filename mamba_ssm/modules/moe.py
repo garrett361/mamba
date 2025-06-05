@@ -854,8 +854,8 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         recv_count_per_ep_rank = tokens_per_expert_group.reshape(self.ep_mesh_size, -1).sum(
             dim=-1, dtype=torch.int32
         )
-        print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {local_counts=}")
-        print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {recv_count_per_ep_rank=}")
+        # print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {local_counts=}")
+        # print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {recv_count_per_ep_rank=}")
         data = _EPData(
             recv=x_recv,
             send=None,
