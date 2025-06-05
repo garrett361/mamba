@@ -111,6 +111,9 @@ def create_block(
         residual_in_fp32=residual_in_fp32,
     )
     block.layer_idx = layer_idx
+    # TODO: @goon - DELETE
+    if isinstance(block.mlp, MoE):
+        block.mlp.experts.layer_idx=layer_idx
     return block
 
 

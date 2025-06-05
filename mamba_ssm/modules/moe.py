@@ -30,8 +30,9 @@ class TokenCounter(nn.Module):
     def forward(
         self, indices: torch.LongTensor, n_routed_experts: int
     ) -> torch.IntTensor:
+        assert indices.ndim == 2
         counts = indices.new_zeros((indices.shape[0], n_routed_experts))
-        counts.scatter_(1, indices.contiguous(), 1)
+        counts.scatter_(1, indices, 1)
         counts = counts.sum(dim=0, dtype=torch.int32)
         return counts
 
@@ -824,9 +825,8 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
         # Receive toks from other workers
         with record_function("all2all::send0"):
-            print(f"{self.ep_mesh.get_rank()=}: {x_by_expert=}")
-            print(f"{self.ep_mesh.get_rank()=}: {recv_counts=}")
-            print(f"{self.ep_mesh.get_rank()=}: {send_counts=}")
+            print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {recv_counts=}")
+            print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {send_counts=}")
             x_recv = funcol.all_to_all_single_autograd(
                 x_by_expert, recv_counts, send_counts, group=self.ep_mesh
             )
