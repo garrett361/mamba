@@ -808,7 +808,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
 
         assert self.ep_mesh is not None  # mypy
         layer_idx = self.layer_idx if hasattr(self, "layer_idx") else None
-        with record_function("all2all::tok_per_exp_grp"):
+        with record_function("all2all::counts"):
             tokens_per_expert_group = funcol.all_to_all_single(
                 counts, None, None, group=self.ep_mesh
             )
