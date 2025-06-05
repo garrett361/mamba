@@ -341,6 +341,14 @@ class Hook(ABC):
     @abstractmethod
     def remove(self) -> None: ...
 
+    @property
+    @abstractmethod
+    def is_reduced(self) -> bool: ...
+
+    @is_reduced.setter
+    @abstractmethod
+    def is_reduced(self, value: bool) -> None: ...
+
 
 class HookDict(dict):
     # TODO: @goon - reduce, reset, remove
@@ -389,6 +397,11 @@ class HookDict(dict):
         in_place_coll(all_values, group=group, **coll_kwargs)
         for hook, val_chunk in zip(self.values(), all_values.chunk(len(self))):
             hook.value = val_chunk[..., 0]  # Remove trailing dim, complete HACK
+            hook.is_reduced = True
+
+    @property
+    def is_reduced(self) -> bool:
+        return all(h.is_reduced for h in self.values())
 
 
 class TokenCounterHook(Hook):
@@ -400,6 +413,7 @@ class TokenCounterHook(Hook):
                 f" one TokenCounter instance, not {module=}"
             )
         self._handle = counter_modules[0].register_forward_hook(self)
+        self._is_reduced = False
         self.reset()
 
     @property
@@ -414,6 +428,15 @@ class TokenCounterHook(Hook):
 
     def reset(self) -> None:
         self._count = 0
+        self._is_reduced = False
+
+    @property
+    def is_reduced(self) -> bool:
+        return self._is_reduced
+
+    @is_reduced.setter
+    def is_reduced(self, value: bool) -> None:
+        self._is_reduced = value
 
     @torch.no_grad
     def __call__(self, module: nn.Module, args, output: torch.Tensor) -> None:
@@ -455,10 +478,20 @@ class TensorMeanAbsHook(Hook):
     ) -> None:
         self.reset()
         self._handle = module.register_forward_hook(self)
+        self._is_reduced = False
 
     def reset(self) -> None:
         self._mag = 0
         self._iters = 0
+        self._is_reduced = False
+
+    @property
+    def is_reduced(self) -> bool:
+        return self._is_reduced
+
+    @is_reduced.setter
+    def is_reduced(self, value: bool) -> None:
+        self._is_reduced = value
 
     @property
     def value(self) -> torch.Tensor:
@@ -508,12 +541,12 @@ def apply_loss_free_moe_balancing(
     lr: float,
     model: nn.Module,
     hook_dict: HookDict[str, TokenCounterHook],
-    group: Optional[dist.ProcessGroup] = None,
 ) -> None:
     """
     Apply loss-free moe balancing: arXiv:2408.15664.
     """
-    hook_dict.all_reduce(group=group)
+    if not hook_dict.is_reduced:
+        RuntimeError("hook_dict is expected to be all-reduced. Call hook_dict.all_reduce first.")
     for fqn, hook in hook_dict.items():
         moe = model.get_submodule(fqn)
         assert moe.gate.bias is not None

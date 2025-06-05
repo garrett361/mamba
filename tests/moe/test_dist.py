@@ -1085,8 +1085,11 @@ class TestMoEUtils(_TestBase):
         assert len(hook_dict) == sum(isinstance(m, MoE) for m in model.modules())
         inputs = self.get_input_toks()
         model(inputs)
+        assert not hook_dict.is_reduced
         hook_dict.all_reduce()
+        assert hook_dict.is_reduced
         hook_dict.reduce()
+        assert hook_dict.is_reduced
 
         # Test collectives correctness
         for h in hook_dict.values():
@@ -1107,6 +1110,7 @@ class TestMoEUtils(_TestBase):
                 )
 
         hook_dict.reset()
+        assert not hook_dict.is_reduced
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
@@ -1117,12 +1121,15 @@ class TestMoEUtils(_TestBase):
         init_moe(model)
         # Attach to blocks, mixers, and the lm head instance
         hook_dict = attach_magnitude_hooks(model, [Block, MHA, Mamba2, model.lm_head])
+        assert not hook_dict.is_reduced
         assert len(hook_dict) == 2 * len(model.backbone.layers) + 1
         inputs = self.get_input_toks()
         model(inputs)
         hook_dict.all_reduce(op=dist.ReduceOp.AVG)
         hook_dict.reduce(op=dist.ReduceOp.AVG)
+        assert hook_dict.is_reduced
         hook_dict.reset()
+        assert not hook_dict.is_reduced
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
@@ -1136,6 +1143,7 @@ class TestMoEUtils(_TestBase):
         pre_biases = [
             m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)
         ]
+        hook_dict.all_reduce()
         apply_loss_free_moe_balancing(1.0, model, hook_dict)
         post_biases = [
             m.gate.bias.detach().clone() for m in model.modules() if isinstance(m, MoE)
