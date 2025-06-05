@@ -37,7 +37,11 @@ from mamba_ssm.moe_utils import (
     get_dcp_state_dict,
     init_moe,
 )
-from mamba_ssm.moe_utils._utils import apply_loss_free_moe_balancing, set_pp_layers
+from mamba_ssm.moe_utils._utils import (
+    act_ckpt_moe,
+    apply_loss_free_moe_balancing,
+    set_pp_layers,
+)
 from tests.moe.test_utils import (
     flattened_cross_entropy,
     mean_loss_fn,
@@ -57,11 +61,18 @@ def _copy_params(model: nn.Module, model_fsdp: nn.Module) -> None:
     """
     Copy prams from the sharded model to the local model.
     """
-    for n, m_fsdp in model_fsdp.named_modules():
-        m = model.get_submodule(n)
+    for mod_name, mod_fsdp in model_fsdp.named_modules():
+        # Act-ckpt wrapper handling
+        try:
+            mod = model.get_submodule(mod_name)
+        except AttributeError:
+            mod = model.get_submodule(
+                mod_name.replace("._checkpoint_wrapped_module", "")
+            )
+
         with torch.no_grad():
             for p_dest, p_src in zip(
-                m.parameters(recurse=False), m_fsdp.parameters(recurse=False)
+                mod.parameters(recurse=False), mod_fsdp.parameters(recurse=False)
             ):
                 if isinstance(p_src, DTensor):
                     p_src = p_src.full_tensor()
@@ -81,8 +92,17 @@ def _test_grads(
 
     fails = {}
     with torch.no_grad():
+        # NOTE: @goon - by iterating over the model_fsdp modules, and not the model modules, this
+        # function also handles PP.
         for mod_name, mod_fsdp in model_fsdp.named_modules():
-            mod = model.get_submodule(mod_name)
+            # Act-ckpt wrapper handling
+            try:
+                mod = model.get_submodule(mod_name)
+            except AttributeError:
+                mod = model.get_submodule(
+                    mod_name.replace("._checkpoint_wrapped_module", "")
+                )
+
             for (n, p), (_, p_fsdp) in zip(
                 mod.named_parameters(recurse=False),
                 mod_fsdp.named_parameters(recurse=False),
@@ -1279,6 +1299,7 @@ class TestE2E(_TestBase):
             dtype = torch.bfloat16
             mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
+            act_ckpt_moe(model_ep)
             fully_shard_moe(
                 model_ep,
                 fsdp_mesh=fsdp_mesh,
@@ -1311,59 +1332,59 @@ class TestE2E(_TestBase):
             flattened_cross_entropy(outputs, inputs).backward()
             flattened_cross_entropy(outputs_ep, inputs_ep).backward()
 
-            # # Clip and make sure the clip is non-trivial:
-            # max_norm = 1.0
-            # norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            # if norm.item() < max_norm:
-            #     max_norm = norm / 2
-            #     norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            # norm_ep = clip_grad_norm_(model_ep.parameters(), max_norm)
-            # assert norm.item() > 0.0, f"{norm=}"
-            # assert norm_ep.item() > 0.0, f"{norm_ep=}"
-            # torch.testing.assert_close(norm_ep, norm, atol=self.tol, rtol=self.tol)
-            #
-            # _test_grads(model, model_ep, tol=self.tol)
-            #
-            # # Step and compare post-step outputs:
-            # optim.step()
-            # optim.zero_grad()
-            # optim_ep.step()
-            # optim_ep.zero_grad()
-            # with torch.no_grad():
-            #     outputs = model(inputs).logits
-            #     outputs_ep = model_ep(inputs_ep).logits
-            #     torch.testing.assert_close(
-            #         outputs_ep,
-            #         outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[
-            #             self.rank
-            #         ],
-            #         atol=self.tol,
-            #         rtol=self.tol,
-            #     )
-            #
-            # # Save state
-            # state_dict = get_dcp_state_dict(model_ep, optim_ep)
-            # dcp.save(state_dict, checkpoint_id=checkpoint_id)
-            # # Not sure the barrier is needed, but just in case.
-            # dist.barrier()
-            #
-            # # Corrupt state
-            # flattened_cross_entropy(model_ep(inputs_ep).logits, inputs_ep).backward()
-            # optim_ep.step()
-            # optim_ep.zero_grad()
-            # corrupted_outputs_ep = model_ep(inputs_ep).logits
-            # # Sanity check the model changed
-            # assert not torch.allclose(
-            #     corrupted_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
-            # )
-            #
-            # # Reload and check state restored
-            # state_dict_again = get_dcp_state_dict(model_ep, optim_ep)
-            # dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
-            # reloaded_outputs_ep = model_ep(inputs_ep).logits
-            # torch.testing.assert_close(
-            #     reloaded_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
-            # )
+            # Clip and make sure the clip is non-trivial:
+            max_norm = 1.0
+            norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            if norm.item() < max_norm:
+                max_norm = norm / 2
+                norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            norm_ep = clip_grad_norm_(model_ep.parameters(), max_norm)
+            assert norm.item() > 0.0, f"{norm=}"
+            assert norm_ep.item() > 0.0, f"{norm_ep=}"
+            torch.testing.assert_close(norm_ep, norm, atol=self.tol, rtol=self.tol)
+
+            _test_grads(model, model_ep, tol=self.tol)
+
+            # Step and compare post-step outputs:
+            optim.step()
+            optim.zero_grad()
+            optim_ep.step()
+            optim_ep.zero_grad()
+            with torch.no_grad():
+                outputs = model(inputs).logits
+                outputs_ep = model_ep(inputs_ep).logits
+                torch.testing.assert_close(
+                    outputs_ep,
+                    outputs.to(outputs_ep).tensor_split(self.world_size, dim=0)[
+                        self.rank
+                    ],
+                    atol=self.tol,
+                    rtol=self.tol,
+                )
+
+            # Save state
+            state_dict = get_dcp_state_dict(model_ep, optim_ep)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            # Not sure the barrier is needed, but just in case.
+            dist.barrier()
+
+            # Corrupt state
+            flattened_cross_entropy(model_ep(inputs_ep).logits, inputs_ep).backward()
+            optim_ep.step()
+            optim_ep.zero_grad()
+            corrupted_outputs_ep = model_ep(inputs_ep).logits
+            # Sanity check the model changed
+            assert not torch.allclose(
+                corrupted_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
+            )
+
+            # Reload and check state restored
+            state_dict_again = get_dcp_state_dict(model_ep, optim_ep)
+            dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
+            reloaded_outputs_ep = model_ep(inputs_ep).logits
+            torch.testing.assert_close(
+                reloaded_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
+            )
 
     def train_loop_pp(self: _TestBase, pp: int):
         """
@@ -1440,6 +1461,7 @@ class TestE2E(_TestBase):
                 assert len(losses_pp) == 0
 
             # TODO: @goon - update _test_grads for pp and use here
+            _test_grads(model, model_pp, tol=self.tol)
 
             max_norm = 1.0
             norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
