@@ -255,6 +255,26 @@ class _TestBase(DTest):
         )
         return inputs, weights, indices, TokenCounter()(indices, self.n_routed_experts)
 
+    def get_pp_input_output_args(
+        self, is_first: bool, is_last: bool, batch_size: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Creates the meta-device input/output args which allow for skipping PP shape-inference.
+        """
+        batch_size = batch_size or self.batch_size
+        if is_first:
+            input_args = self.get_input_toks(batch_size=batch_size).to(device="meta")
+        else:
+            input_args = self.get_inputs(batch_size=batch_size).to(device="meta")
+        if is_last:
+            output_args = torch.randn(
+                batch_size, self.seqlen, self.vocab_size, device="meta"
+            )
+        else:
+            output_args = self.get_inputs(batch_size=batch_size).to(device="meta")
+
+        return input_args, output_args
+
     @contextmanager
     def temp_dir(self):
         """
@@ -1435,12 +1455,20 @@ class TestE2E(_TestBase):
                 model_pp.parameters(), lr=lr, momentum=self.momentum
             )
 
+            # Set input/output forms. Lets us avoid the stage attempting to auto-determine shapes.
+            is_first = pp_mesh.get_local_rank() == 0
+            is_last = pp_mesh.get_local_rank() == pp_mesh.size() - 1
+
+            input_args, output_args = self.get_pp_input_output_args(is_first, is_last)
+
             stage = PipelineStage(
                 model_pp,
                 pp_mesh.get_local_rank(),
                 pp_mesh.size(),
                 self.device,
                 group=pp_mesh.get_group(),
+                input_args=input_args,
+                output_args=output_args,
             )
 
             # Create pipeline schedule
