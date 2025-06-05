@@ -541,12 +541,15 @@ def apply_loss_free_moe_balancing(
     lr: float,
     model: nn.Module,
     hook_dict: HookDict[str, TokenCounterHook],
+    verify_reduced: bool = True,
 ) -> None:
     """
     Apply loss-free moe balancing: arXiv:2408.15664.
     """
-    if not hook_dict.is_reduced:
-        RuntimeError("hook_dict is expected to be all-reduced. Call hook_dict.all_reduce first.")
+    if verify_reduced and not hook_dict.is_reduced:
+        RuntimeError(
+            "hook_dict is expected to be all-reduced. Call hook_dict.all_reduce first."
+        )
     for fqn, hook in hook_dict.items():
         moe = model.get_submodule(fqn)
         assert moe.gate.bias is not None
