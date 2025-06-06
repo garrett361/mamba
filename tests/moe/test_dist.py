@@ -265,8 +265,8 @@ class _TestBase(DTest):
         self,
         is_first: bool,
         is_last: bool,
+        dtype=torch.dtype,
         batch_size: Optional[int] = None,
-        dtype=torch.bfloat16,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Creates the meta-device input/output args which allow for skipping PP shape-inference.
@@ -1354,10 +1354,10 @@ class TestE2E(_TestBase):
                 model_ep.parameters(), lr=self.lr, momentum=self.momentum
             )
 
-            inputs = self.get_input_toks()
-            outputs = model(inputs).logits
+            input_toks = self.get_input_toks()
+            outputs = model(input_toks).logits
 
-            inputs_ep = inputs.tensor_split(self.world_size, dim=0)[self.rank]
+            inputs_ep = input_toks.tensor_split(self.world_size, dim=0)[self.rank]
             outputs_ep = model_ep(inputs_ep).logits
             torch.testing.assert_close(
                 outputs_ep,
@@ -1367,7 +1367,7 @@ class TestE2E(_TestBase):
             )
 
             # Grads should match with an avg-over-batches type loss.
-            flattened_cross_entropy(outputs, inputs).backward()
+            flattened_cross_entropy(outputs, input_toks).backward()
             flattened_cross_entropy(outputs_ep, inputs_ep).backward()
 
             # balancing loss
@@ -1396,7 +1396,7 @@ class TestE2E(_TestBase):
             optim_ep.step()
             optim_ep.zero_grad()
             with torch.no_grad():
-                outputs = model(inputs).logits
+                outputs = model(input_toks).logits
                 outputs_ep = model_ep(inputs_ep).logits
                 torch.testing.assert_close(
                     outputs_ep,
@@ -1431,14 +1431,15 @@ class TestE2E(_TestBase):
                 reloaded_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
             )
 
-    def train_loop_pp(self: _TestBase, pp: int) -> None:
+    def train_loop_pp(self: _TestBase, pp: int, attn_only: bool) -> None:
         """
         PP only loop
         """
         with self.temp_dir() as checkpoint_id:
             pp_mesh = init_device_mesh(self.device_type, (pp,), mesh_dim_names=("pp",))
             # Need to avoid returning a CausalLMOutput object for PP, otherwise internal shape checks fail.
-            pp_cfg = deepcopy(self.cfg)
+            cfg = self.attn_only_cfg if attn_only else self.cfg
+            pp_cfg = deepcopy(cfg)
             pp_cfg.return_logits = True
 
             model = MambaLMHeadModel(pp_cfg, **self.factory_kwargs)
@@ -1472,7 +1473,9 @@ class TestE2E(_TestBase):
             is_first = pp_mesh.get_local_rank() == 0
             is_last = pp_mesh.get_local_rank() == pp_mesh.size() - 1
             # Set input/output forms. Lets us avoid the stage attempting to auto-determine shapes.
-            input_args, output_args = self.get_pp_input_output_args(is_first, is_last)
+            input_args, output_args = self.get_pp_input_output_args(
+                is_first, is_last, dtype=torch.float32
+            )
 
             stage = PipelineStage(
                 model_pp,
@@ -1487,23 +1490,25 @@ class TestE2E(_TestBase):
             # Create pipeline schedule
             losses_pp = []
             n_microbatches = pp_mesh.size()
-            inputs = self.get_input_toks(batch_size=self.batch_size * n_microbatches)
+            input_toks = self.get_input_toks(
+                batch_size=self.batch_size * n_microbatches
+            )
             pp_schedule = Schedule1F1B(
                 stage, n_microbatches, loss_fn=flattened_cross_entropy
             )
 
             if is_first:
-                pp_schedule.step(inputs)
+                pp_schedule.step(input_toks)
                 out_pp = None
             elif is_last:
-                out_pp = pp_schedule.step(target=inputs, losses=losses_pp)
+                out_pp = pp_schedule.step(target=input_toks, losses=losses_pp)
             else:
                 pp_schedule.step()
                 out_pp = None
 
             # Run reference model on same data.
-            out = model(inputs)
-            loss = flattened_cross_entropy(out, inputs)
+            out = model(input_toks)
+            loss = flattened_cross_entropy(out, input_toks)
             loss.backward()
 
             if is_last:
@@ -1548,9 +1553,9 @@ class TestE2E(_TestBase):
 
             # Corrupt state
             if is_first:
-                pp_schedule.step(inputs)
+                pp_schedule.step(input_toks)
             elif is_last:
-                out_pp_post_step = pp_schedule.step(target=inputs, losses=losses_pp)
+                out_pp_post_step = pp_schedule.step(target=input_toks, losses=losses_pp)
                 # Sanity check the model changed
                 assert not torch.allclose(
                     out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol
@@ -1562,7 +1567,7 @@ class TestE2E(_TestBase):
 
             # Verify updated outputs match ref model:
             if is_last:
-                out_post_step = model(inputs)
+                out_post_step = model(input_toks)
                 torch.testing.assert_close(
                     out_pp_post_step, out_post_step, atol=self.tol, rtol=self.tol
                 )
@@ -1572,16 +1577,16 @@ class TestE2E(_TestBase):
             dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
 
             if is_first:
-                pp_schedule.step(inputs)
+                pp_schedule.step(input_toks)
             elif is_last:
                 out_pp_post_step_again = pp_schedule.step(
-                    target=inputs, losses=losses_pp
+                    target=input_toks, losses=losses_pp
                 )
                 torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
             else:
                 pp_schedule.step()
 
-    def train_loop_ep_pp(self: _TestBase, ep: int, pp: int) -> None:
+    def train_loop_ep_pp(self: _TestBase, ep: int, pp: int, attn_only: bool) -> None:
         """
         EP+PP
         """
@@ -1593,6 +1598,7 @@ class TestE2E(_TestBase):
                 self.device_type, (pp, ep), mesh_dim_names=("pp", "ep")
             )
             # Need to avoid returning a CausalLMOutput object for PP, otherwise internal shape checks fail.
+            cfg = self.attn_only_cfg if attn_only else self.cfg
             pp_cfg = deepcopy(self.cfg)
             pp_cfg.return_logits = True
 
@@ -1616,7 +1622,7 @@ class TestE2E(_TestBase):
                 stage_idx=mesh["pp"].get_local_rank(),
             )
 
-            # act_ckpt_moe(model_pp)
+            act_ckpt_moe(model_pp)
             dtype = torch.bfloat16
             mp_policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
             fully_shard_moe(
@@ -1626,9 +1632,9 @@ class TestE2E(_TestBase):
                 mp_policy=mp_policy,
             )
 
-            # # For balancing loss:
-            # tok_hook_dict = attach_tok_count_hooks(model)
-            # tok_hook_dict_pp = attach_tok_count_hooks(model_pp)
+            # For balancing loss:
+            tok_hook_dict = attach_tok_count_hooks(model)
+            tok_hook_dict_pp = attach_tok_count_hooks(model_pp)
 
             lr = 1e-1
             optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=self.momentum)
@@ -1638,16 +1644,19 @@ class TestE2E(_TestBase):
 
             is_first = mesh["pp"].get_local_rank() == 0
             is_last = mesh["pp"].get_local_rank() == mesh["pp"].size() - 1
-            # Set input/output forms. Lets us avoid the stage attempting to auto-determine shapes.
+            # Set input/output forms. Lets us avoid the stage attempting to auto-determine shapes
+            # (which was leading to hangs for ee + pp).
+
+            # NOTE: @goon - super important to get the dtypes correct here. Silent hangs, otherwise.
             input_args, output_args = self.get_pp_input_output_args(
                 is_first, is_last, dtype=dtype
             )
 
             # Split the input/outputs per EP size:
-            input_args = input_args.tensor_split(mesh["ep"].size())[
+            input_args_ep = input_args.tensor_split(mesh["ep"].size())[
                 mesh["ep"].get_local_rank()
             ]
-            output_args = output_args.tensor_split(mesh["ep"].size())[
+            output_args_ep = output_args.tensor_split(mesh["ep"].size())[
                 mesh["ep"].get_local_rank()
             ]
 
@@ -1657,15 +1666,17 @@ class TestE2E(_TestBase):
                 mesh["pp"].size(),
                 self.device,
                 group=mesh["pp"].get_group(),
-                input_args=input_args,
-                output_args=output_args,
+                input_args=input_args_ep,
+                output_args=output_args_ep,
             )
 
             # Create pipeline schedule
             losses_pp = []
             n_microbatches = mesh["pp"].size()
-            inputs = self.get_input_toks(batch_size=self.batch_size * n_microbatches)
-            inputs_ep = inputs.tensor_split(mesh["ep"].size())[
+            input_toks = self.get_input_toks(
+                batch_size=self.batch_size * n_microbatches
+            )
+            input_toks_ep = input_toks.tensor_split(mesh["ep"].size())[
                 mesh["ep"].get_local_rank()
             ]
 
@@ -1673,122 +1684,113 @@ class TestE2E(_TestBase):
                 stage, n_microbatches, loss_fn=flattened_cross_entropy
             )
 
-            # Run warmups?
             if is_first:
-                warm_out = model_pp(inputs_ep).sum()
-                warm_out.backward()
-                model_pp.zero_grad()
-            else:
-                inputs = torch.randn(
-                    inputs_ep.shape[0],
-                    self.seqlen,
-                    self.in_features,
-                    device=inputs_ep.device,
-                )
-                warm_out = model_pp(inputs).sum()
-                warm_out.backward()
-                model_pp.zero_grad()
-
-            if is_first:
-                pp_schedule.step(inputs_ep)
+                pp_schedule.step(input_toks_ep)
                 out_pp = None
             elif is_last:
-                out_pp = pp_schedule.step(target=inputs_ep, losses=losses_pp)
+                out_pp = pp_schedule.step(target=input_toks_ep, losses=losses_pp)
             else:
                 pp_schedule.step()
                 out_pp = None
 
-            # # Run reference model on same data.
-            # out = model(inputs)
-            # loss = flattened_cross_entropy(out, inputs)
-            # loss.backward()
-            #
-            # if is_last:
-            #     assert len(losses_pp) == n_microbatches
-            #     out_pp_expected = out.tensor_split(mesh["ep"].size())[
-            #         mesh["ep"].get_local_rank()
-            #     ]
-            #     torch.testing.assert_close(
-            #         out_pp, out_pp_expected, atol=self.tol, rtol=self.tol
-            #     )
-            #     torch.testing.assert_close(
-            #         torch.stack(losses_pp).mean(), loss, atol=self.tol, rtol=self.tol
-            #     )
-            # else:
-            #     assert len(losses_pp) == 0
-            #
-            # # # balancing loss. No need to reduce since there is no EP dim
-            # # apply_loss_free_moe_balancing(
-            # #     self.lr, model, tok_hook_dict, verify_reduced=False
-            # # )
-            # # apply_loss_free_moe_balancing(
-            # #     self.lr, model_pp, tok_hook_dict_pp, verify_reduced=False
-            # # )
-            #
-            # # TODO: @goon - update _test_grads for pp and use here
-            # _test_grads(model, model_pp, tol=self.tol)
-            #
-            # max_norm = 1.0
-            # norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            # # Ensure non-trivial clip
-            # if norm.item() < max_norm:
-            #     max_norm = norm / 2
-            #     norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            # norm_pp = clip_grad_norm_(
-            #     model_pp.parameters(), max_norm, pp_mesh=mesh["pp"]
-            # )
-            # torch.testing.assert_close(norm, norm_pp, atol=self.tol, rtol=self.tol)
-            #
-            # # Steps
-            # optim.step()
-            # optim.zero_grad()
-            # optim_pp.step()
-            # optim_pp.zero_grad()
-            #
-            # state_dict = get_dcp_state_dict(model_pp, optim_pp)
-            # dcp.save(state_dict, checkpoint_id=checkpoint_id)
-            # # Not sure the barrier is needed, but just in case.
-            # dist.barrier()
-            #
-            # # Corrupt state
-            # if is_first:
-            #     pp_schedule.step(inputs)
-            # elif is_last:
-            #     out_pp_post_step = pp_schedule.step(target=inputs, losses=losses_pp)
-            #     # Sanity check the model changed
-            #     assert not torch.allclose(
-            #         out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol
-            #     )
-            # else:
-            #     pp_schedule.step()
-            # optim_pp.step()
-            # optim_pp.zero_grad()
-            #
-            # # Verify updated outputs match ref model:
-            # if is_last:
-            #     out_post_step_expected = model(inputs).tensor_split(mesh["ep"].size())[
-            #         mesh["ep"].get_local_rank()
-            #     ]
-            #     torch.testing.assert_close(
-            #         out_pp_post_step,
-            #         out_post_step_expected,
-            #         atol=self.tol,
-            #         rtol=self.tol,
-            #     )
-            #
-            # # Reload and check state restored
-            # state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
-            # dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
-            #
-            # if is_first:
-            #     pp_schedule.step(inputs)
-            # elif is_last:
-            #     out_pp_post_step_again = pp_schedule.step(
-            #         target=inputs, losses=losses_pp
-            #     )
-            #     torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
-            # else:
-            #     pp_schedule.step()
+            # Run reference model on same data.
+            out = model(input_toks)
+            loss = flattened_cross_entropy(out, input_toks)
+            loss.backward()
+
+            if is_last:
+                assert len(losses_pp) == n_microbatches
+                out_pp_expected = out.tensor_split(mesh["ep"].size())[
+                    mesh["ep"].get_local_rank()
+                ]
+                torch.testing.assert_close(
+                    out_pp, out_pp_expected.to(out_pp), atol=self.tol, rtol=self.tol
+                )
+                losses_pp_mean = torch.stack(losses_pp).mean()
+                torch.testing.assert_close(
+                    losses_pp_mean,
+                    loss.to(losses_pp_mean),
+                    atol=self.tol,
+                    rtol=self.tol,
+                )
+            else:
+                assert len(losses_pp) == 0
+
+            # balancing loss. No need to reduce since there is no EP dim
+            apply_loss_free_moe_balancing(
+                self.lr, model, tok_hook_dict, verify_reduced=False
+            )
+            apply_loss_free_moe_balancing(
+                self.lr, model_pp, tok_hook_dict_pp, verify_reduced=False
+            )
+
+            # TODO: @goon - update _test_grads for pp and use here
+            _test_grads(model, model_pp, tol=self.tol)
+
+            max_norm = 1.0
+            norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            # Ensure non-trivial clip
+            if norm.item() < max_norm:
+                max_norm = norm / 2
+                norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            norm_pp = clip_grad_norm_(
+                model_pp.parameters(), max_norm, pp_mesh=mesh["pp"]
+            )
+            torch.testing.assert_close(norm, norm_pp, atol=self.tol, rtol=self.tol)
+
+            # Steps
+            optim.step()
+            optim.zero_grad()
+            optim_pp.step()
+            optim_pp.zero_grad()
+
+            state_dict = get_dcp_state_dict(model_pp, optim_pp)
+            dcp.save(state_dict, checkpoint_id=checkpoint_id)
+            # Not sure the barrier is needed, but just in case.
+            dist.barrier()
+
+            # Corrupt state
+            if is_first:
+                pp_schedule.step(input_toks_ep)
+            elif is_last:
+                out_pp_post_step = pp_schedule.step(
+                    target=input_toks_ep, losses=losses_pp
+                )
+                # Sanity check the model changed
+                assert not torch.allclose(
+                    out_pp_post_step, out_pp, atol=self.tol, rtol=self.tol
+                )
+            else:
+                pp_schedule.step()
+
+            optim_pp.step()
+            optim_pp.zero_grad()
+
+            # Verify updated outputs match ref model:
+            if is_last:
+                out_post_step_expected = model(input_toks).tensor_split(
+                    mesh["ep"].size()
+                )[mesh["ep"].get_local_rank()]
+                torch.testing.assert_close(
+                    out_pp_post_step,
+                    out_post_step_expected.to(out_pp_post_step),
+                    atol=self.tol,
+                    rtol=self.tol,
+                )
+
+            # Reload and check state restored
+            state_dict_again = get_dcp_state_dict(model_pp, optim_pp)
+            dcp.load(state_dict_again, checkpoint_id=checkpoint_id)
+
+            if is_first:
+                pp_schedule.step(input_toks_ep)
+            elif is_last:
+                out_pp_post_step_again = pp_schedule.step(
+                    target=input_toks_ep, losses=losses_pp
+                )
+                torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
+            else:
+                pp_schedule.step()
 
     # NOTE: @goon - currently using self.attn_only_cfg in fully_shard_moe tests to avoid
     # complications with non-deterministic mamba D grads. The fully_shard_moe util is independent of
@@ -1809,13 +1811,15 @@ class TestE2E(_TestBase):
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
-    def test_pp(self) -> None:
-        self.train_loop_pp(pp=self.world_size)
+    @pytest.mark.parametrize("attn_only", [True])
+    def test_pp(self, attn_only: bool) -> None:
+        self.train_loop_pp(pp=self.world_size, attn_only=attn_only)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
-    def test_ep_pp(self) -> None:
-        self.train_loop_ep_pp(ep=self.world_size // 2, pp=2)
+    @pytest.mark.parametrize("attn_only", [True])
+    def test_ep_pp(self, attn_only: bool) -> None:
+        self.train_loop_ep_pp(ep=self.world_size // 2, pp=2, attn_only=attn_only)
 
 
 def compile_breaking_fn(
