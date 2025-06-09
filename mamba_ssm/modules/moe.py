@@ -1,6 +1,5 @@
 import math
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
@@ -784,9 +783,9 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         super().__init__(*args, **kwargs)
         assert self.ep_mesh is not None
 
-    def _get_ep_toks_and_routing_data(
+    def _ep_dispatch(
         self, x_by_expert: torch.Tensor, counts: torch.IntTensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[int], list[int], torch.LongTensor, torch.IntTensor]:
         # [EP Routing and Indexing]
         # To perform EP routing with torch comms primitives, each EP rank needs to know how many
         # tokens EP rank `r` will be sending to its local expert `l`. This can be done by exchanging
@@ -823,57 +822,25 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             .sum(dim=1)
             .tolist()
         )
+        local_indices, local_counts = _get_local_indices_and_counts(
+            tokens_per_expert_group, self.n_local_experts
+        )
 
         # Receive toks from other workers
         with record_function("all2all::send0"):
             x_recv = funcol.all_to_all_single_autograd(
                 x_by_expert, recv_counts, send_counts, group=self.ep_mesh
             )
-        return x_recv, send_counts, recv_counts, tokens_per_expert_group
+        return x_recv, send_counts, recv_counts, local_indices, local_counts
 
-    @contextmanager
-    def _ep_context(
-        self,
-        x: torch.Tensor,
-        indices: torch.LongTensor,
-        counts: torch.IntTensor,
-    ):
-        """
-        Helper context manager which performs the all-to-all dispatch and combine ops. Requires
-        the caller to write and read from the yielded _EPData object.
-        """
-        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
-        x_recv, send_counts, recv_counts, tokens_per_expert_group = (
-            self._get_ep_toks_and_routing_data(x_by_expert, counts)
-        )
-
-        local_indices, local_counts = _get_local_indices_and_counts(
-            tokens_per_expert_group, self.n_local_experts
-        )
-        # TODO: @goon - DELETE
-        recv_count_per_ep_rank = tokens_per_expert_group.reshape(self.ep_mesh_size, -1).sum(
-            dim=-1, dtype=torch.int32
-        )
-        # print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {local_counts=}")
-        # print(f"{self.ep_mesh.get_rank()=}, {self.layer_idx=}: {recv_count_per_ep_rank=}")
-        data = _EPData(
-            recv=x_recv,
-            send=None,
-            out=x_by_expert,
-            indices=local_indices,
-            counts=local_counts,
-        )
-        try:
-            yield data
-        finally:
-            # Send results back to original ranks (reversed send/recv count data)
-            with record_function("all2all::send1"):
-                x_out = funcol.all_to_all_single_autograd(
-                    data.send, send_counts, recv_counts, group=self.ep_mesh
-                )
-
-            # Save an allocation: store the unsorted results back in x_by_expert.
-            data.out[flat_sorted_indices] = x_out
+    def _ep_combine(
+        self, x_send: torch.Tensor, send_counts: list[int], recv_counts: list[int]
+    ) -> torch.Tensor:
+        with record_function("all2all::send1"):
+            x_out = funcol.all_to_all_single_autograd(
+                x_send, send_counts, recv_counts, group=self.ep_mesh
+            )
+        return x_out
 
     def forward(
         self,
@@ -882,19 +849,30 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         indices: torch.LongTensor,
         counts: torch.IntTensor,
     ) -> torch.Tensor:
-        with self._ep_context(x, indices, counts) as data:
-            # Only use locally available EP weights
-            data.send = self.ffn_impl(
-                data.recv,
-                self.fc1.weight.to_local(),
-                self.fc2.weight.to_local(),
-                data.indices,
-                data.counts,
-                self.activation,
-            )
+        # Sort by token, dispatch to the correct experts, and get other necessary metadata:
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
+        x_recv, send_counts, recv_counts, local_indices, local_counts = (
+            self._ep_dispatch(x_by_expert, counts)
+        )
+
+        # EP compute with locally available weights
+        x_send = self.ffn_impl(
+            x_recv,
+            self.fc1.weight.to_local(),
+            self.fc2.weight.to_local(),
+            local_indices,
+            local_counts,
+            self.activation,
+        )
+
+        # Route EP results back to senders and combine.
+        # Save an allocation: store the unsorted results back in x_by_expert.
+        x_by_expert[flat_sorted_indices] = self._ep_combine(
+            x_send, send_counts, recv_counts
+        )
 
         # Reshape and weight
-        x_by_expert = data.out.reshape(*(weights.shape + data.out.shape[-1:]))
+        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
         z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
         return z
 
