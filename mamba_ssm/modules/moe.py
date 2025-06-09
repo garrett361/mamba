@@ -824,7 +824,7 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         )
         # NOTE: @goon - testing if a sync removes intermittent all-to-all errors
         # torch.cuda.synchronize()
-        print(f"{self.ep_mesh.get_local_rank()=}: {tokens_per_expert_group=}")
+        # print(f"{self.ep_mesh.get_local_rank()=}: {tokens_per_expert_group=}")
         local_indices, local_counts = _get_local_indices_and_counts(
             tokens_per_expert_group, self.n_local_experts
         )
