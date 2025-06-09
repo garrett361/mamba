@@ -822,6 +822,8 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             .sum(dim=1)
             .tolist()
         )
+        # NOTE: @goon - testing if a sync removes intermittent all-to-all errors
+        torch.cuda.synchronize()
         local_indices, local_counts = _get_local_indices_and_counts(
             tokens_per_expert_group, self.n_local_experts
         )
