@@ -1,5 +1,3 @@
-import tempfile
-from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Optional
 from warnings import warn
@@ -10,7 +8,12 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed._composable.fsdp import fully_shard
+from test_utils import (
+    flattened_cross_entropy,
+    mean_loss_fn,
+    skip_moe_impl_if_no_h100s,
+    sum_loss_fn,
+)
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
@@ -41,12 +44,6 @@ from mamba_ssm.moe_utils._utils import (
     act_ckpt_moe,
     apply_loss_free_moe_balancing,
     set_pp_layers,
-)
-from tests.moe.test_utils import (
-    flattened_cross_entropy,
-    mean_loss_fn,
-    skip_moe_impl_if_no_h100s,
-    sum_loss_fn,
 )
 
 """
@@ -288,25 +285,6 @@ class _TestBase(DTest):
             )
 
         return input_args, output_args
-
-    @contextmanager
-    def temp_dir(self):
-        """
-        Create a shared temp dir for writing to.
-        """
-        if not self.rank:
-            temp_dir = tempfile.TemporaryDirectory()
-            temp_dir_name = temp_dir.name
-        else:
-            temp_dir_name = None
-        temp_dir_name_list = [temp_dir_name]
-        dist.broadcast_object_list(temp_dir_name_list, src=0)
-        try:
-            yield temp_dir_name_list[0]
-        finally:
-            # The temp dir is cleaned up once it leaves scope. The barrier ensures all procs have
-            # left the ctx manager before performing this cleanup.
-            dist.barrier()
 
 
 class TestRoutedExperts(_TestBase):
@@ -1430,6 +1408,7 @@ class TestE2E(_TestBase):
             torch.testing.assert_close(
                 reloaded_outputs_ep, outputs_ep, atol=self.tol, rtol=self.tol
             )
+            dist.barrier()
 
     def train_loop_pp(self: _TestBase, pp: int, attn_only: bool) -> None:
         """
@@ -1585,8 +1564,9 @@ class TestE2E(_TestBase):
                 torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
             else:
                 pp_schedule.step()
+            dist.barrier()
 
-    def train_loop_ep_pp(self: _TestBase, ep: int, pp: int, attn_only: bool) -> None:
+    def train_loop_ep_pp(self, ep: int, pp: int, attn_only: bool) -> None:
         """
         EP+PP
         """
@@ -1791,6 +1771,7 @@ class TestE2E(_TestBase):
                 torch.testing.assert_close(out_pp_post_step, out_pp_post_step_again)
             else:
                 pp_schedule.step()
+            dist.barrier()
 
     # NOTE: @goon - currently using self.attn_only_cfg in fully_shard_moe tests to avoid
     # complications with non-deterministic mamba D grads. The fully_shard_moe util is independent of
@@ -1811,12 +1792,14 @@ class TestE2E(_TestBase):
 
     @pytest.mark.world_size(2)
     @pytest.mark.gpu
+    # @pytest.mark.parametrize("attn_only", [True, False])
     @pytest.mark.parametrize("attn_only", [True])
     def test_pp(self, attn_only: bool) -> None:
         self.train_loop_pp(pp=self.world_size, attn_only=attn_only)
 
     @pytest.mark.world_size(4)
     @pytest.mark.gpu
+    # @pytest.mark.parametrize("attn_only", [True, False])
     @pytest.mark.parametrize("attn_only", [True])
     def test_ep_pp(self, attn_only: bool) -> None:
         self.train_loop_ep_pp(ep=self.world_size // 2, pp=2, attn_only=attn_only)
