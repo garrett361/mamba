@@ -1,5 +1,6 @@
 import math
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
@@ -760,6 +761,25 @@ class RoutedExpertsNoEPCGGroupedGemmTriton(_RoutedExpertsNoEP):
 
 ### Start of EP Classes
 
+# [EP Routing and Indexing]
+# To perform EP routing with torch comms primitives, each EP rank needs to know how many
+# tokens EP rank `r` will be sending to its local expert `l`. This can be done by exchanging
+# information about each rank's `counts`.
+#
+# Each rank then sorts their tokens in order of global expert idx (x_by_expert) and sends as
+# appropriate. The received tokens are **not** in expert order: they are first ordered by
+# the sending rank, and then by local order. Schematically: recv ~ cat([recv_from_rank_0] +
+# [recv_from_rank_1] + ...) where recv_from_rank_r will contain the tokens for each of the L
+# local experts sorted by local expert order.
+#
+# In order to use GEMM kernels, the received tokens must be re-sorted in local expert
+# order, so that tokens belonging to the same local expert are all contiguous. This is a
+# data-dependent resorting and it does not appear possible to implement this with torch
+# primitives without incurring a CUDA sync.
+#
+# Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
+# self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
+
 
 @dataclass
 class _EPData:
@@ -786,25 +806,6 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
     def _ep_dispatch(
         self, x_by_expert: torch.Tensor, counts: torch.IntTensor
     ) -> tuple[torch.Tensor, list[int], list[int], torch.LongTensor, torch.IntTensor]:
-        # [EP Routing and Indexing]
-        # To perform EP routing with torch comms primitives, each EP rank needs to know how many
-        # tokens EP rank `r` will be sending to its local expert `l`. This can be done by exchanging
-        # information about each rank's `counts`.
-        #
-        # Each rank then sorts their tokens in order of global expert idx (x_by_expert) and sends as
-        # appropriate. The received tokens are **not** in expert order: they are first ordered by
-        # the sending rank, and then by local order. Schematically: recv ~ cat([recv_from_rank_0] +
-        # [recv_from_rank_1] + ...) where recv_from_rank_r will contain the tokens for each of the L
-        # local experts sorted by local expert order.
-        #
-        # In order to use GEMM kernels, the received tokens must be re-sorted in local expert
-        # order, so that tokens belonging to the same local expert are all contiguous. This is a
-        # data-dependent resorting and it does not appear possible to implement this with torch
-        # primitives without incurring a CUDA sync.
-
-        # Get counts of incoming tensors. tokens_per_expert_group.reshape(self.ep_mesh.size(),
-        # self.n_local_experts)[r, l] = num tokens rank r sent to local expert l
-
         assert self.ep_mesh is not None  # mypy
         layer_idx = self.layer_idx if hasattr(self, "layer_idx") else None
         with record_function("all2all::counts"):
@@ -845,6 +846,37 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
             )
         return x_out
 
+    @contextmanager
+    def _ep_context(
+        self,
+        x: torch.Tensor,
+        indices: torch.LongTensor,
+        counts: torch.IntTensor,
+    ):
+        """
+        Helper context manager which performs the all-to-all dispatch and combine ops. Requires
+        the caller to write and read from the yielded _EPData object.
+        """
+        # Sort by token, dispatch to the correct experts, and get other necessary metadata:
+        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
+        x_recv, send_counts, recv_counts, local_indices, local_counts = (
+            self._ep_dispatch(x_by_expert, counts)
+        )
+        data = _EPData(
+            recv=x_recv,
+            send=None,
+            out=x_by_expert,
+            indices=local_indices,
+            counts=local_counts,
+        )
+        yield data
+
+        # Send results back to original ranks (reversed send/recv count data)
+        x_out = self._ep_combine(data.send, send_counts, recv_counts)
+
+        # Save an allocation: store the unsorted results back in data.out
+        data.out[flat_sorted_indices] = x_out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -852,30 +884,19 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         indices: torch.LongTensor,
         counts: torch.IntTensor,
     ) -> torch.Tensor:
-        # Sort by token, dispatch to the correct experts, and get other necessary metadata:
-        x_by_expert, flat_sorted_indices = _sort_by_exp_idx(x, indices)
-        x_recv, send_counts, recv_counts, local_indices, local_counts = (
-            self._ep_dispatch(x_by_expert, counts)
-        )
-
-        # EP compute with locally available weights
-        x_send = self.ffn_impl(
-            x_recv,
-            self.fc1.weight.to_local(),
-            self.fc2.weight.to_local(),
-            local_indices,
-            local_counts,
-            self.activation,
-        )
-
-        # Route EP results back to senders and combine.
-        # Save an allocation: store the unsorted results back in x_by_expert.
-        x_by_expert[flat_sorted_indices] = self._ep_combine(
-            x_send, send_counts, recv_counts
-        )
+        with self._ep_context(x, indices, counts) as data:
+            # Only use locally available EP weights
+            data.send = self.ffn_impl(
+                data.recv,
+                self.fc1.weight.to_local(),
+                self.fc2.weight.to_local(),
+                data.indices,
+                data.counts,
+                self.activation,
+            )
 
         # Reshape and weight
-        x_by_expert = x_by_expert.reshape(*(weights.shape + x_by_expert.shape[-1:]))
+        x_by_expert = data.out.reshape(*(weights.shape + data.out.shape[-1:]))
         z = torch.bmm(weights[:, None], x_by_expert).squeeze(1)
         return z
 
