@@ -504,7 +504,7 @@ class Mamba2CP(Mamba2):
         self,
         *args,
         cp_mesh: dist.device_mesh.DeviceMesh,
-        cp_mamba_impl: Literal["serial", "allgather"] = "zigzag",
+        cp_mamba_impl: Literal["serial", "allgather"] = "allgather",
         **kwargs,
     ) -> None:
         self.cp_mesh = cp_mesh
