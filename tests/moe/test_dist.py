@@ -40,7 +40,7 @@ from mamba_ssm.moe_utils import (
     get_dcp_state_dict,
     init_moe,
 )
-from mamba_ssm.moe_utils._utils import (
+from mamba_ssm.moe_utils import (
     act_ckpt_moe,
     apply_loss_free_moe_balancing,
     set_pp_layers,
