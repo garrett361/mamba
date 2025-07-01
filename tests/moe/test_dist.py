@@ -1627,7 +1627,7 @@ class TestE2E(_TestBase):
             # Set input/output forms. Lets us avoid the stage attempting to auto-determine shapes
             # (which was leading to hangs for ee + pp).
 
-            # NOTE: @goon - super important to get the dtypes correct here. Silent hangs, otherwise.
+            # NOTE: @goon - super important to get the dtypes correct here.
             input_args, output_args = self.get_pp_input_output_args(
                 is_first, is_last, dtype=dtype
             )
@@ -1700,6 +1700,7 @@ class TestE2E(_TestBase):
             apply_loss_free_moe_balancing(
                 self.lr, model, tok_hook_dict, verify_reduced=False
             )
+            # NOTE: @goon - should be reducing here!
             apply_loss_free_moe_balancing(
                 self.lr, model_pp, tok_hook_dict_pp, verify_reduced=False
             )
