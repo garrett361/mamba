@@ -818,6 +818,9 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
         send_counts = (
             counts.reshape(self.ep_mesh_size, self.n_local_experts).sum(dim=1).tolist()
         )
+        # Test if waiting on tokens_per_expert_group removes intermittent
+        # all-to-all/repeat_interleave errors
+        tokens_per_expert_group.wait()
         recv_counts = (
             tokens_per_expert_group.reshape(self.ep_mesh_size, self.n_local_experts)
             .sum(dim=1)
