@@ -102,11 +102,13 @@ def fully_shard_moe(
     # losses, as there is no mechanism to divide grads by the size of the ep_mesh dim.
     # When ep_fsdp_mesh is non-trivial, set_reduce_scatter_divide_factor could in principle
     # be used, but I found that this errors when mp_policy is non-trivial.
+    # NOTE: @goon - fixed on nightly July 7, 2025
+    # https://github.com/pytorch/pytorch/commit/9e5f4a844c0aebf964a435094005c92713fbe99a
     if mean_loss:
         if ep_fsdp_mesh is None:
             for mod in model.modules():
                 if isinstance(mod, MoE):
-                    for p in block.mlp.experts.parameters():
+                    for p in mod.experts.parameters():
                         p.register_hook(lambda g: g / block.mlp.experts.ep_mesh_size)
         else:
             for mod in model.modules():
