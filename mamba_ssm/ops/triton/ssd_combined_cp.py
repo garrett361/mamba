@@ -15,7 +15,6 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional, Type
 
 import torch
-from torch.profiler import record_function
 import torch.distributed as dist
 import triton
 from einops import rearrange
@@ -659,16 +658,12 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 # NOTE: @goon - For some reason, plain dist.isend(...).wait() calls are erroring out for me. Don't
 # think is should be necessary to use the `batch_isend_irecv` wrapper.
 def send(tensor, dst=None, group=None) -> None:
-    for op in dist.batch_isend_irecv(
-        [dist.P2POp(dist.isend, tensor, dist.get_global_rank(group, dst), group)]
-    ):
+    for op in dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)]):
         op.wait()
 
 
 def recv(tensor, src=None, group=None) -> None:
-    for op in dist.batch_isend_irecv(
-        [dist.P2POp(dist.irecv, tensor, dist.get_global_rank(group, src), group)]
-    ):
+    for op in dist.batch_isend_irecv([dist.P2POp(dist.irecv, tensor, src, group)]):
         op.wait()
 
 
