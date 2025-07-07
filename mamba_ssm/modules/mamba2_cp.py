@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.profiler import record_function
 
-
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined_cp import (
@@ -613,7 +612,12 @@ class MHACP(MHA):
             local_cp_rank = self.cp_mesh.get_local_rank()
             num_tok_per_rank = x.shape[self.seq_dim]
             seqlen_offset = local_cp_rank * num_tok_per_rank
-            q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+            q, kv = self.rotary_emb(
+                q,
+                kv,
+                seqlen_offset=seqlen_offset,
+                max_seqlen=num_tok_per_rank * self.cp_mesh.size(),
+            )
 
         if self.cp_attn_impl == "zigzag":
             # Important: change to zigzag sharding *after* applying RoPE.
