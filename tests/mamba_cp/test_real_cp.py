@@ -633,8 +633,6 @@ class TestConvCP(_DTestModelBase):
         torch.testing.assert_close(
             outputs_cp,
             outputs.tensor_split(self.world_size, dim=1)[self.rank],
-            atol=self.tol,
-            rtol=self.tol,
         )
 
     def test_bwd(self):
@@ -652,8 +650,6 @@ class TestConvCP(_DTestModelBase):
         torch.testing.assert_close(
             outputs_cp,
             outputs.tensor_split(self.world_size, dim=1)[self.rank],
-            atol=self.tol,
-            rtol=self.tol,
         )
         outputs.sum().backward()
         outputs_cp.sum().backward()
@@ -661,7 +657,7 @@ class TestConvCP(_DTestModelBase):
         xBC_grad_shard = self.get_cp_shard(xBC.grad)
         xBC_cp_grad_shard = self.get_cp_shard(xBC_copy.grad)
         torch.testing.assert_close(
-            xBC_grad_shard, xBC_cp_grad_shard, atol=self.tol, rtol=self.tol
+            xBC_cp_grad_shard, xBC_grad_shard, atol=self.tol, rtol=self.tol
         )
 
 
@@ -696,7 +692,7 @@ class TestScanCP(_DTestModelBase):
             outputs_cp_all_gathered, "r b l ... -> b (r l) ..."
         )
         torch.testing.assert_close(
-            outputs, outputs_cp_all_gathered, atol=self.tol, rtol=self.tol
+            outputs_cp_all_gathered, outputs, atol=self.tol, rtol=self.tol
         )
 
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
@@ -726,7 +722,7 @@ class TestScanCP(_DTestModelBase):
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
 
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=self.tol, rtol=self.tol
+            inputs_cp_grad_shard, inputs_grad_shard, atol=self.tol, rtol=self.tol
         )
 
         # Parameter grads should match after all-reducing.
@@ -771,7 +767,7 @@ class TestMamba2CP(_DTestModelBase):
         inputs_grad_shard = self.get_cp_shard(inputs.grad)
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=self.tol, rtol=self.tol
+            inputs_cp_grad_shard, inputs_grad_shard, atol=self.tol, rtol=self.tol
         )
 
         # Parameter grads should match after all-reducing.
@@ -819,7 +815,7 @@ class TestMHACP(_DTestModelBase):
         inputs_cp_grad_shard = self.get_cp_shard(inputs_copy.grad)
         dist.barrier()
         torch.testing.assert_close(
-            inputs_grad_shard, inputs_cp_grad_shard, atol=self.tol, rtol=self.tol
+            inputs_cp_grad_shard, inputs_grad_shard, atol=self.tol, rtol=self.tol
         )
 
         # Parameter grads should match after all-reducing.
@@ -896,13 +892,13 @@ class TestFSDP1MambaCP(_DTestModelBase):
             dist.all_reduce(loss_cp_fsdp)
             mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
             torch.testing.assert_close(
-                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+                mean_loss_cp_fsdp, loss, atol=self.tol, rtol=self.tol
             )
 
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
         torch.testing.assert_close(
-            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+            grad_norm_cp_fsdp, grad_norm, atol=self.tol, rtol=self.tol
         )
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
@@ -983,13 +979,13 @@ class TestFSDP1MHACP(_DTestModelBase):
             dist.all_reduce(loss_cp_fsdp)
             mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
             torch.testing.assert_close(
-                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+                mean_loss_cp_fsdp, loss, atol=self.tol, rtol=self.tol
             )
 
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
         torch.testing.assert_close(
-            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+            grad_norm_cp_fsdp, grad_norm, atol=self.tol, rtol=self.tol
         )
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
@@ -1083,13 +1079,13 @@ class TestHSDP1MambaCP(_DTestModelBase):
             dist.all_reduce(loss_cp_hsdp)
             mean_loss_cp_hsdp = loss_cp_hsdp / self.world_size
             torch.testing.assert_close(
-                loss, mean_loss_cp_hsdp, atol=self.tol, rtol=self.tol
+                mean_loss_cp_hsdp, loss, atol=self.tol, rtol=self.tol
             )
 
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         grad_norm_cp_hsdp = model_cp_hsdp.clip_grad_norm_(1.0)
         torch.testing.assert_close(
-            grad_norm, grad_norm_cp_hsdp, atol=self.tol, rtol=self.tol
+            grad_norm_cp_hsdp, grad_norm, atol=self.tol, rtol=self.tol
         )
 
         inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
@@ -1197,13 +1193,13 @@ class TestHSDP1MHACP(_DTestModelBase):
             dist.all_reduce(loss_cp_hsdp)
             mean_loss_cp_hsdp = loss_cp_hsdp / self.world_size
             torch.testing.assert_close(
-                loss, mean_loss_cp_hsdp, atol=self.tol, rtol=self.tol
+                mean_loss_cp_hsdp, loss, atol=self.tol, rtol=self.tol
             )
 
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         grad_norm_cp_hsdp = model_cp_hsdp.clip_grad_norm_(1.0)
         torch.testing.assert_close(
-            grad_norm, grad_norm_cp_hsdp, atol=self.tol, rtol=self.tol
+            grad_norm_cp_hsdp, grad_norm, atol=self.tol, rtol=self.tol
         )
 
         inputs_grad_shard = self.get_cp_hsdp_shard(inputs.grad, mesh)
@@ -1290,13 +1286,13 @@ class TestModelCPFSDP1(_DTestModelBase):
             dist.all_reduce(loss_cp_fsdp)
             mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
             torch.testing.assert_close(
-                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+                mean_loss_cp_fsdp, loss, atol=self.tol, rtol=self.tol
             )
 
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         grad_norm_cp_fsdp = model_cp_fsdp.clip_grad_norm_(1.0)
         torch.testing.assert_close(
-            grad_norm, grad_norm_cp_fsdp, atol=self.tol, rtol=self.tol
+            grad_norm_cp_fsdp, grad_norm, atol=self.tol, rtol=self.tol
         )
 
         with FSDP.summon_full_params(model_cp_fsdp, with_grads=True):
@@ -1368,7 +1364,7 @@ class TestModelCPFSDP2(_DTestModelBase):
             dist.all_reduce(loss_cp_fsdp)
             mean_loss_cp_fsdp = loss_cp_fsdp / self.world_size
             torch.testing.assert_close(
-                loss, mean_loss_cp_fsdp, atol=self.tol, rtol=self.tol
+                mean_loss_cp_fsdp, loss, atol=self.tol, rtol=self.tol
             )
 
         # TODO: @goon - FSDP2 grad clipping is more involved; see torch-titan.

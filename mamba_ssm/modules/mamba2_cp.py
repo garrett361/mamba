@@ -370,10 +370,10 @@ def conv(xBC, mamba2: Mamba2, conv_state=None, seq_idx=None) -> torch.Tensor:
         conv_state_seq_len = conv_state.shape[1]
         assert conv_state_seq_len == mamba2.d_conv - 1
         conv_state_inputs = torch.cat([conv_state, xBC[:, :conv_state_seq_len]], dim=1)
-        cont_state_out = conv(conv_state_inputs, mamba2, None, seq_idx)[
+        conv_state_out = conv(conv_state_inputs, mamba2, None, seq_idx)[
             :, -conv_state_seq_len:
         ]
-        out[:, :conv_state_seq_len] = cont_state_out
+        out[:, :conv_state_seq_len] = conv_state_out
     return out
 
 
