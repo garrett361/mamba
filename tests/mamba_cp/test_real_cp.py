@@ -325,7 +325,9 @@ class TestIdentityFwdAllGatherBwdFn(DTest):
             inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
 
             output = inputs * weight
-            output_shard = inputs_shard * _identity_fwd_all_reduce_bwd(weight_copy, mesh)
+            output_shard = inputs_shard * _identity_fwd_all_reduce_bwd(
+                weight_copy, mesh
+            )
 
             all_gathered_output_shards = torch.empty_like(inputs)
             dist.all_gather_into_tensor(
@@ -1260,6 +1262,12 @@ class TestModelCPFSDP1(_DTestModelBase):
                 atol=self.tol,
                 rtol=self.tol,
             )
+            greedy_preds_match = (
+                outputs_cp.max(dim=-1).indices == outputs_shard.max(dim=-1).indices
+            )
+            assert greedy_preds_match.all(), (
+                f"{greedy_preds_match.numel()=}, {(~greedy_preds_match).sum()=}"
+            )
 
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
@@ -1341,6 +1349,12 @@ class TestModelCPFSDP2(_DTestModelBase):
                 outputs_shard,
                 atol=self.tol,
                 rtol=self.tol,
+            )
+            greedy_preds_match = (
+                outputs_cp.max(dim=-1).indices == outputs_shard.max(dim=-1).indices
+            )
+            assert greedy_preds_match.all(), (
+                f"{greedy_preds_match.numel()=}, {(~greedy_preds_match).sum()=}"
             )
 
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
