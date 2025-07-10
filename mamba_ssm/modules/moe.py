@@ -813,22 +813,27 @@ class _RoutedExpertsTorchEP(_RoutedExperts):
                 counts, None, None, group=self.ep_mesh
             )
 
+        # [Torch and NCCL version errors]
+        # NOTE: @goon - I found that when using torch nightly versions > 2.8 or so, the _ep_dispatch
+        # could would break at seemingly non-deterministic points, particularly when testing on
+        # larger model an using several nodes. The errors would manifest at NCCL timeouts on some
+        # ranks, while others would die due to either attempting to allocate an absurdly large
+        # tensor (many TiB) or a tensor with negative dimension size. In both cases, the error
+        # looked like corrupted data was being read in. After rolling back to the 2.7.1 torch
+        # release version, I have not seen this error again. A potentially relevant piece of data is
+        # that the NCCL version packaged with torch also differs between these builds: 2.7.1 has
+        # NCCL 2.26.2 while the nightlies around July 7, 2025 have NCCL 2.27.3.
+
         # We need the list version of the counts due to NCCL signatures. This incurs a CUDA sync.
         # TODO: avoid https://github.com/NVIDIA/nccl/issues/1648
         send_counts = (
             counts.reshape(self.ep_mesh_size, self.n_local_experts).sum(dim=1).tolist()
         )
-        # Test if waiting on tokens_per_expert_group removes intermittent
-        # all-to-all/repeat_interleave errors
-        tokens_per_expert_group.wait()
         recv_counts = (
             tokens_per_expert_group.reshape(self.ep_mesh_size, self.n_local_experts)
             .sum(dim=1)
             .tolist()
         )
-        # NOTE: @goon - testing if a sync removes intermittent all-to-all errors
-        # torch.cuda.synchronize()
-        # print(f"{self.ep_mesh.get_local_rank()=}: {tokens_per_expert_group=}")
         local_indices, local_counts = _get_local_indices_and_counts(
             tokens_per_expert_group, self.n_local_experts
         )
