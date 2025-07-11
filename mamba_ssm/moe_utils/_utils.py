@@ -415,6 +415,8 @@ class HookDict(dict):
 
     @property
     def is_reduced(self) -> bool:
+        if not self:
+            return False
         return all(h.is_reduced for h in self.values())
 
 
