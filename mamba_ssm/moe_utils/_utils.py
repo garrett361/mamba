@@ -365,7 +365,9 @@ class Hook(ABC):
 
 
 class HookDict(dict):
-    # TODO: @goon - reduce, reset, remove
+    """
+    Container for handling Hook classes and reducing their statistics.
+    """
     def __setitem__(self, key: str, value: Hook, /) -> None:
         if not isinstance(key, str):
             raise TypeError(f"All keys must be strings, not {key=}")
