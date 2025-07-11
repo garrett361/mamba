@@ -368,6 +368,7 @@ class HookDict(dict):
     """
     Container for handling Hook classes and reducing their statistics.
     """
+
     def __setitem__(self, key: str, value: Hook, /) -> None:
         if not isinstance(key, str):
             raise TypeError(f"All keys must be strings, not {key=}")
@@ -662,7 +663,8 @@ def set_pp_layers(
     stage_idx: int,
 ) -> None:
     """
-    Deletes and/or sets appropriate layers to None. Ideally acts on a meta-device model.
+    Deletes and/or sets appropriate layers to None. Ideally acts on a meta-device model. Returns a
+    sorted list of the block indices retained by the current pp rank.
     """
     is_first = stage_idx == 0
     is_last = stage_idx == n_stages - 1
@@ -685,3 +687,4 @@ def set_pp_layers(
     }
     for k in all_block_idxs - this_stage_block_idxs:
         del model.backbone.layers[k]
+    return sorted([int(n) for n in this_stage_block_idxs])
