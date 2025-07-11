@@ -1697,18 +1697,18 @@ class TestE2E(_TestBase):
             else:
                 assert len(losses_pp) == 0
 
-            # # TODO: @goon - fix this; hanging for some reason
-            # # balancing loss.
-            # # No need to reduce on the non-ep/pp-model since there is no EP dim
-            # apply_loss_free_moe_balancing(
-            #     self.lr, model, tok_hook_dict, verify_reduced=False
-            # )
-            # # Not all PP shards are guaranteed to have MoE layers:
-            # if tok_hook_dict_pp:
-            #     tok_hook_dict_pp.all_reduce(group=mesh["ep"])
-            #     apply_loss_free_moe_balancing(
-            #         self.lr, model_pp, tok_hook_dict_pp, verify_reduced=True
-            #     )
+            # TODO: @goon - fix this; hanging for some reason
+            # balancing loss.
+            # No need to reduce on the non-ep/pp-model since there is no EP dim
+            apply_loss_free_moe_balancing(
+                self.lr, model, tok_hook_dict, verify_reduced=False
+            )
+            # Not all PP shards are guaranteed to have MoE layers:
+            if tok_hook_dict_pp:
+                tok_hook_dict_pp.all_reduce(group=mesh["ep"].get_group())
+                apply_loss_free_moe_balancing(
+                    self.lr, model_pp, tok_hook_dict_pp, verify_reduced=True
+                )
 
             _test_grads(model, model_pp, tol=self.tol)
 
