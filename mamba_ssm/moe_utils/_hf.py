@@ -3,19 +3,93 @@ import re
 
 import torch
 from safetensors.torch import save_file
-from transformers.models.bamba import BambaConfig
+from transformers.activations import ACT2FN
 from transformers.models.granitemoehybrid import GraniteMoeHybridConfig
 from transformers.utils import SAFE_WEIGHTS_NAME
+
+from mamba_ssm.models.config_mamba import MambaConfig
+
+
+def convert_hf_config_to_ssm_config(
+    hf_config: GraniteMoeHybridConfig,
+    **kwargs,
+) -> MambaConfig:
+    assert isinstance(hf_config, GraniteMoeHybridConfig)
+    ssm_kwargs = {}
+    ssm_kwargs["d_model"] = hf_config.hidden_size
+    ssm_kwargs["d_intermediate"] = hf_config.intermediate_size
+    ssm_kwargs["n_layer"] = hf_config.num_hidden_layers
+    ssm_kwargs["tie_embeddings"] = hf_config.tie_word_embeddings
+
+    # Set important values from config and recalculate other resulting entries
+    hf_config.mamba_n_heads = (
+        hf_config.hidden_size * hf_config.mamba_expand
+    ) // hf_config.mamba_d_head
+
+    attn_cfg = {
+        "causal": True,
+        "d_conv": 0,
+        "num_heads": hf_config.num_attention_heads,
+        "num_heads_kv": hf_config.num_key_value_heads,
+        "out_proj_bias": False,
+        "qkv_proj_bias": False,
+    }
+    if hf_config.rope_scaling is None:
+        attn_cfg["rotary_emb_dim"] = 0
+    else:
+        raise ValueError(f"Expected no rope, got {hf_config.rope_scaling=}")
+
+    ssm_kwargs["attn_cfg"] = attn_cfg
+
+    ssm_cfg = {
+        "layer": "Mamba2",
+        "chunk_size": hf_config.mamba_chunk_size,
+        "conv_bias": hf_config.mamba_conv_bias,
+        "d_conv": hf_config.mamba_d_conv,
+        "d_head": hf_config.mamba_d_head,
+        "d_state": hf_config.mamba_d_state,
+        "expand": hf_config.mamba_expand,
+        "n_groups": hf_config.mamba_n_groups,
+        "n_heads": hf_config.mamba_n_heads,
+        "proj_bias": hf_config.mamba_proj_bias,
+    }
+    ssm_kwargs["ssm_cfg"] = ssm_cfg
+
+    moe_cfg = {
+        "in_feaures": hf_config.hidden_size,
+        "d_intermediate": hf_config.intermediate_size,
+        "n_routed_experts": hf_config.num_local_experts,
+        "n_shared_experts": 0,
+        "n_activated_experts": hf_config.num_experts_per_tok,
+        "multiple_of": 1,
+        "activation": ACT2FN[hf_config.hidden_act],
+        "gate_bias": False,
+    }
+    ssm_kwargs["moe_cfg"] = moe_cfg
+
+    if hf_config.layer_types is None:
+        ssm_kwargs["attn_layer_idx"] = []
+    else:
+        ssm_kwargs["attn_layer_idx"] = [
+            idx
+            for idx, l_type in enumerate(hf_config.layer_types)
+            if l_type == "attention"
+        ]
+
+    # Padded vocab size, mostly of 16 but 32 is also very common in different models
+    ssm_kwargs["vocab_size"] = hf_config.vocab_size
+
+    return MambaConfig(**ssm_kwargs, **kwargs)
 
 
 def convert_ssm_config_to_hf_config(
     config_ssm: dict,
     **kwargs,
 ) -> GraniteMoeHybridConfig:
-    """Convert a config from mamba_ssm to a BambaConfig from here."""
-    hf_config: BambaConfig = BambaConfig(**kwargs)
+    """Convert a config from mamba_ssm to a GraniteMoeHybridConfig from here."""
+    hf_config: GraniteMoeHybridConfig = GraniteMoeHybridConfig(**kwargs)
 
-    hf_config.architectures = ["BambaForCausalLM"]
+    hf_config.architectures = ["GraniteMoeHybridForCausalLM"]
 
     # Set important values from config and recalculate other resulting entries
     hf_config.hidden_size = config_ssm["d_model"]

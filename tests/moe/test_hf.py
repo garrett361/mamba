@@ -2,6 +2,9 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, set_seed
 from transformers.models.granitemoehybrid import GraniteMoeHybridConfig
 
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from mamba_ssm.moe_utils import convert_hf_config_to_ssm_config
+
 
 class TestHF:
     def test_granite_4_tiny_preview(self) -> None:
@@ -45,4 +48,8 @@ class TestHF:
         model_path = "ibm-granite/granite-4.0-tiny-preview"
         hf_config = AutoConfig.from_pretrained(model_path)
         assert isinstance(hf_config, GraniteMoeHybridConfig)
-        print("hf_config")
+        print(hf_config)
+        ssm_cfg = convert_hf_config_to_ssm_config(hf_config)
+        print(ssm_cfg)
+        model = MambaLMHeadModel(ssm_cfg)
+        print(model)

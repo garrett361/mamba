@@ -1,3 +1,7 @@
+from mamba_ssm.moe_utils._hf import (
+    convert_hf_config_to_ssm_config,
+    convert_ssm_config_to_hf_config,
+)
 from mamba_ssm.moe_utils._utils import (
     TensorMeanAbsHook,
     TokenCounterHook,
