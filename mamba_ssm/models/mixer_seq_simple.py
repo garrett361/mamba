@@ -1,25 +1,24 @@
 # Copyright (c) 2023, Albert Gu, Tri Dao.
 
-import math
-from functools import partial
-import json
-import os
 import copy
-from typing import Optional
-from torch.distributed.device_mesh import DeviceMesh
-
+import json
+import math
+import os
 from collections import namedtuple
+from functools import partial
+from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.modules.block import Block
 from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import MHACP, Mamba2CP
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.modules.mlp import GatedMLP
-from mamba_ssm.modules.block import Block
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 
@@ -43,6 +42,7 @@ def create_block(
     cp_mesh: Optional[DeviceMesh] = None,
     cp_mamba_impl: Optional[str] = None,
     cp_attn_impl: Optional[str] = None,
+    cp_mamba_recompute: bool = False,
     device=None,
     dtype=None,
 ):
@@ -68,6 +68,7 @@ def create_block(
                 raise NotImplementedError("Context parallel not implemented for Mamba1")
             ssm_cls_kwargs["cp_mesh"] = cp_mesh
             ssm_cls_kwargs["cp_mamba_impl"] = cp_mamba_impl
+            ssm_cls_kwargs["cp_mamba_recompute"] = cp_mamba_recompute
             ssm_cls = Mamba2CP
         else:
             ssm_cls = Mamba if ssm_layer == "Mamba1" else Mamba2
@@ -156,6 +157,7 @@ class MixerModel(nn.Module):
         cp_mesh: Optional[DeviceMesh] = None,
         cp_mamba_impl: Optional[str] = None,
         cp_attn_impl: Optional[str] = None,
+        cp_mamba_recompute: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -191,6 +193,7 @@ class MixerModel(nn.Module):
                     cp_mesh=cp_mesh,
                     cp_mamba_impl=cp_mamba_impl,
                     cp_attn_impl=cp_attn_impl,
+                    cp_mamba_recompute=cp_mamba_recompute,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -260,6 +263,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         cp_mesh: Optional[DeviceMesh] = None,
         cp_mamba_impl: Optional[str] = None,
         cp_attn_impl: Optional[str] = None,
+        cp_mamba_recompute: bool = False,
     ) -> None:
         self.config = config
         d_model = config.d_model
@@ -295,6 +299,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             cp_mesh=cp_mesh,
             cp_mamba_impl=cp_mamba_impl,
             cp_attn_impl=cp_attn_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)

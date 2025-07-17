@@ -12,7 +12,8 @@ After defining the `_StatePassingImpl.{fwd,bwd}` methods of an implementation, t
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Type
+from itertools import pairwise
+from typing import Optional, Type
 
 import torch
 import torch.distributed as dist
@@ -37,13 +38,23 @@ from mamba_ssm.ops.triton.ssd_combined import (
     _chunk_state_fwd,
     _state_passing_bwd,
     _state_passing_fwd,
-    chunk_state_varlen,
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
 class _StatePassingImpl(ABC):
+    """
+    The _StatePassingImpl class represents different implementations of the _state_passing_{fwd,bwd}
+    kernel implementations, modified to enable different capabilities (such as implementing
+    context-parallelism). Two classmethods are provided which generate the associated
+    autograd.Function classes which serve as replacements for the `mamba_chunk_scan_combined`
+    Function
+    * `get_chunk_scan_autograd_fn`: recomputes the forwards pass in the backwards pass.
+    * `get_chunk_scan_autograd_no_recompute_fn`: caches data to avoid recomputing the forwards pass
+      in the backwards.
+    """
+
     @staticmethod
     @abstractmethod
     def fwd(
@@ -54,10 +65,10 @@ class _StatePassingImpl(ABC):
         seq_idx=None,
         out_dtype=None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Any]:
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[Optional[torch.Tensor]]]:
         """
-        Returns a tuple of (out_states, final_states, bwd_args), where bwd_args is anything that
-        _StatePassingImpl.bwd might require for its backwards pass.
+        Returns a tuple of (out_states, final_states, bwd_args), where bwd_args is any tuple of
+        tensors that _StatePassingImpl.bwd might require for its backwards pass.
 
         Shapes:
         - out_states: (batch, nchunks, nheads, headdim, d_state)
@@ -82,7 +93,7 @@ class _StatePassingImpl(ABC):
         ] = None,  # Optional[(batch, nheads, headdim, d_state)]
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[Any] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
     ) -> tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
     ]:
@@ -98,7 +109,7 @@ class _StatePassingImpl(ABC):
         ...
 
     @classmethod
-    def get_chunk_scan_autograd_fn(cls):
+    def get_chunk_scan_autograd_fn(cls, recompute_fwd_in_bwd: bool):
         class _Fn(torch.autograd.Function):
             @staticmethod
             def forward(
@@ -121,6 +132,10 @@ class _StatePassingImpl(ABC):
                 return_varlen_states=False,
                 cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
             ):
+                if cu_seqlens is not None or seq_idx is not None:
+                    raise NotImplementedError
+                if return_varlen_states:
+                    raise NotImplementedError
                 ctx.dt_dtype = dt.dtype
                 if not return_varlen_states:
                     cu_seqlens = None
@@ -128,54 +143,61 @@ class _StatePassingImpl(ABC):
                     assert cu_seqlens is not None, (
                         "cu_seqlens must be provided if return_varlen_states is True"
                     )
-                out, out_x, _, _, _, final_states, *rest = (
-                    _mamba_chunk_scan_combined_fwd_template(
-                        cls,
-                        x,
-                        dt,
-                        A,
-                        B,
-                        C,
-                        chunk_size,
-                        D=D,
-                        z=z,
-                        dt_bias=dt_bias,
-                        initial_states=initial_states,
-                        seq_idx=seq_idx,
-                        cu_seqlens=cu_seqlens,
-                        dt_softplus=dt_softplus,
-                        dt_limit=dt_limit,
-                        cp_mesh=cp_mesh,
-                    )
-                )
-                ctx.save_for_backward(
-                    out if z is None else out_x,
+                fwd_outputs = _mamba_chunk_scan_combined_fwd_template(
+                    cls,
                     x,
                     dt,
                     A,
                     B,
                     C,
-                    D,
-                    z,
-                    dt_bias,
-                    initial_states,
-                    seq_idx,
+                    chunk_size,
+                    D=D,
+                    z=z,
+                    dt_bias=dt_bias,
+                    initial_states=initial_states,
+                    seq_idx=seq_idx,
+                    cu_seqlens=cu_seqlens,
+                    dt_softplus=dt_softplus,
+                    dt_limit=dt_limit,
+                    cp_mesh=cp_mesh,
                 )
+                out, out_x, _, _, _, final_states, *_ = fwd_outputs
+                if recompute_fwd_in_bwd:
+                    ctx.save_for_backward(
+                        out if z is None else out_x,
+                        x,
+                        dt,
+                        A,
+                        B,
+                        C,
+                        D,
+                        z,
+                        dt_bias,
+                        initial_states,
+                        seq_idx,
+                    )
+                else:
+                    ctx.save_for_backward(
+                        out if z is None else out_x,
+                        x,
+                        dt,
+                        A,
+                        B,
+                        C,
+                        D,
+                        z,
+                        dt_bias,
+                        initial_states,
+                        seq_idx,
+                        *fwd_outputs,
+                    )
                 ctx.dt_softplus = dt_softplus
                 ctx.chunk_size = chunk_size
                 ctx.dt_limit = dt_limit
                 ctx.return_final_states = return_final_states
                 ctx.return_varlen_states = return_varlen_states
                 ctx.cp_mesh = cp_mesh
-                if not return_varlen_states:
-                    return out if not return_final_states else (out, final_states)
-                else:
-                    varlen_states = rest[0]
-                    return (
-                        (out, varlen_states)
-                        if not return_final_states
-                        else (out, final_states, varlen_states)
-                    )
+                return out if not return_final_states else (out, final_states)
 
             @staticmethod
             def backward(ctx, dout, *args):
@@ -191,32 +213,37 @@ class _StatePassingImpl(ABC):
                     dt_bias,
                     initial_states,
                     seq_idx,
+                    *fwd_outputs,
                 ) = ctx.saved_tensors
                 assert not ctx.return_varlen_states, (
                     "return_varlen_states is not supported in backward"
                 )
                 dfinal_states = args[0] if ctx.return_final_states else None
-                dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = (
-                    _mamba_chunk_scan_combined_bwd_template(
-                        cls,
-                        dout,
-                        x,
-                        dt,
-                        A,
-                        B,
-                        C,
-                        out,
-                        ctx.chunk_size,
-                        D=D,
-                        z=z,
-                        dt_bias=dt_bias,
-                        initial_states=initial_states,
-                        dfinal_states=dfinal_states,
-                        seq_idx=seq_idx,
-                        dt_softplus=ctx.dt_softplus,
-                        dt_limit=ctx.dt_limit,
-                        cp_mesh=ctx.cp_mesh,
-                    )
+                bwd_impl = (
+                    _mamba_chunk_scan_combined_bwd_template
+                    if recompute_fwd_in_bwd
+                    else _mamba_chunk_scan_combined_bwd_no_recompute_template
+                )
+                dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = bwd_impl(
+                    cls,
+                    dout,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    out,
+                    ctx.chunk_size,
+                    *fwd_outputs,
+                    D=D,
+                    z=z,
+                    dt_bias=dt_bias,
+                    initial_states=initial_states,
+                    dfinal_states=dfinal_states,
+                    seq_idx=seq_idx,
+                    dt_softplus=ctx.dt_softplus,
+                    dt_limit=ctx.dt_limit,
+                    cp_mesh=ctx.cp_mesh,
                 )
                 return (
                     dx,
@@ -237,8 +264,6 @@ class _StatePassingImpl(ABC):
                     None,
                     None,
                 )
-
-        _Fn.__name__ = f"{cls.__name__}Fn"
 
         def fn(
             x,
@@ -323,37 +348,39 @@ def _mamba_chunk_scan_combined_fwd_template(
     dt_limit=(0.0, float("inf")),
     cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
+    if cu_seqlens is not None or seq_idx is not None:
+        raise NotImplementedError
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    assert nheads % ngroups == 0
+    assert B.shape == (batch, seqlen, ngroups, dstate)
+    assert x.shape == (batch, seqlen, nheads, headdim)
+    assert dt.shape == (batch, seqlen, nheads)
+    assert A.shape == (nheads,)
+    assert C.shape == B.shape
+    if z is not None:
+        assert z.shape == x.shape
+    if D is not None:
+        assert D.shape == (nheads, headdim) or D.shape == (nheads,)
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    if B.stride(-1) != 1:
+        B = B.contiguous()
+    if C.stride(-1) != 1:
+        C = C.contiguous()
+    if (
+        x.stride(-1) != 1 and x.stride(1) != 1
+    ):  # Either M or K dimension should be contiguous
+        x = x.contiguous()
+    if (
+        z is not None and z.stride(-1) != 1 and z.stride(1) != 1
+    ):  # Either M or K dimension should be contiguous
+        z = z.contiguous()
+    if D is not None and D.stride(-1) != 1:
+        D = D.contiguous()
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, headdim, dstate)
     with record_function("pre_state_passing_impl_fwd"):
-        batch, seqlen, nheads, headdim = x.shape
-        _, _, ngroups, dstate = B.shape
-        assert nheads % ngroups == 0
-        assert B.shape == (batch, seqlen, ngroups, dstate)
-        assert x.shape == (batch, seqlen, nheads, headdim)
-        assert dt.shape == (batch, seqlen, nheads)
-        assert A.shape == (nheads,)
-        assert C.shape == B.shape
-        if z is not None:
-            assert z.shape == x.shape
-        if D is not None:
-            assert D.shape == (nheads, headdim) or D.shape == (nheads,)
-        if seq_idx is not None:
-            assert seq_idx.shape == (batch, seqlen)
-        if B.stride(-1) != 1:
-            B = B.contiguous()
-        if C.stride(-1) != 1:
-            C = C.contiguous()
-        if (
-            x.stride(-1) != 1 and x.stride(1) != 1
-        ):  # Either M or K dimension should be contiguous
-            x = x.contiguous()
-        if (
-            z is not None and z.stride(-1) != 1 and z.stride(1) != 1
-        ):  # Either M or K dimension should be contiguous
-            z = z.contiguous()
-        if D is not None and D.stride(-1) != 1:
-            D = D.contiguous()
-        if initial_states is not None:
-            assert initial_states.shape == (batch, nheads, headdim, dstate)
         dA_cumsum, dt = _chunk_cumsum_fwd(
             dt,
             A,
@@ -367,7 +394,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         )
 
     with record_function("state_passing_impl_fwd"):
-        states, final_states, _ = state_passing_impl.fwd(
+        states, final_states, bwd_args = state_passing_impl.fwd(
             chunk_size=chunk_size,
             states=states,
             dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
@@ -384,21 +411,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         out, out_x = _chunk_scan_fwd(
             CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx
         )
-        if cu_seqlens is None:
-            return out, out_x, dt, dA_cumsum, states, final_states
-        else:
-            assert batch == 1, (
-                "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
-            )
-            varlen_states = chunk_state_varlen(
-                B.squeeze(0),
-                x.squeeze(0),
-                dt.squeeze(0),
-                dA_cumsum.squeeze(0),
-                cu_seqlens,
-                states.squeeze(0),
-            )
-            return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+        return out, out_x, dt, dA_cumsum, states, final_states, CB, *bwd_args
 
 
 def _mamba_chunk_scan_combined_bwd_template(
@@ -427,69 +440,61 @@ def _mamba_chunk_scan_combined_bwd_template(
     recompute_output=False,
     cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
-    with record_function("pre_state_passing_impl_fwd"):
-        if dout.stride(-1) != 1:
-            dout = dout.contiguous()
-        batch, seqlen, nheads, headdim = x.shape
-        _, _, ngroups, dstate = B.shape
-        assert dout.shape == (batch, seqlen, nheads, headdim)
-        assert dt.shape == (batch, seqlen, nheads)
-        assert A.shape == (nheads,)
-        assert nheads % ngroups == 0
-        assert B.shape == (batch, seqlen, ngroups, dstate)
-        assert C.shape == B.shape
-        assert out.shape == x.shape
-        if initial_states is not None:
-            assert initial_states.shape == (batch, nheads, headdim, dstate)
-        if seq_idx is not None:
-            assert seq_idx.shape == (batch, seqlen)
-        if dx is not None:
-            assert dx.shape == x.shape
-        if dB is not None:
-            assert dB.shape == B.shape
-            dB_given = dB
-        else:
-            dB_given = torch.empty_like(B)
-        if dC is not None:
-            assert dC.shape == C.shape
-            dC_given = dC
-        else:
-            dC_given = torch.empty_like(C)
-        if dz is not None:
-            assert z is not None
-            assert dz.shape == z.shape
-        if ddt is not None:
-            assert ddt.shape == dt.shape
-            ddt_given = ddt
-        else:
-            ddt_given = torch.empty_like(dt)
-        # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
-        # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
-        dt_in = dt.clone()
-        dA_cumsum, dt = _chunk_cumsum_fwd(
-            dt_in,
-            A,
-            chunk_size,
-            dt_bias=dt_bias,
-            dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
-        )
-        CB = _bmm_chunk_fwd(
-            C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32
-        )
-        states = _chunk_state_fwd(
-            B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True
-        )
+    if dout.stride(-1) != 1:
+        dout = dout.contiguous()
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    assert dout.shape == (batch, seqlen, nheads, headdim)
+    assert dt.shape == (batch, seqlen, nheads)
+    assert out.shape == x.shape
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, headdim, dstate)
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    if dx is not None:
+        assert dx.shape == x.shape
+    if dB is not None:
+        assert dB.shape == B.shape
+        dB_given = dB
+    else:
+        dB_given = torch.empty_like(B)
+    if dC is not None:
+        assert dC.shape == C.shape
+        dC_given = dC
+    else:
+        dC_given = torch.empty_like(C)
+    if dz is not None:
+        assert z is not None
+        assert dz.shape == z.shape
+    if ddt is not None:
+        assert ddt.shape == dt.shape
+        ddt_given = ddt
+    else:
+        ddt_given = torch.empty_like(dt)
+    # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
+    # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
+    dt_in = dt.clone()
 
-    with record_function("state_passing_impl_fwd"):
-        states, _, bwd_args = state_passing_impl.fwd(
-            chunk_size=chunk_size,
-            states=states,
-            dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
-            initial_states=initial_states,
-            seq_idx=seq_idx,
-            out_dtype=None,
-            cp_mesh=cp_mesh,
+    with record_function("_mamba_chunk_scan_combined_fwd_in_bwd"):
+        out, out_x, dt, dA_cumsum, states, final_states, CB, *bwd_args = (
+            _mamba_chunk_scan_combined_fwd_template(
+                state_passing_impl,
+                x=x,
+                dt=dt_in,
+                A=A,
+                B=B,
+                C=C,
+                chunk_size=chunk_size,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                cu_seqlens=None,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                cp_mesh=cp_mesh,
+            )
         )
 
     with record_function("pre_state_passing_impl_bwd"):
@@ -580,10 +585,168 @@ def _mamba_chunk_scan_combined_bwd_template(
         return return_vals if not recompute_output else (*return_vals, outz)
 
 
-##### Non-CP impls. For testing and components of other impls.  #####
+def _mamba_chunk_scan_combined_bwd_no_recompute_template(
+    state_passing_impl: Type[_StatePassingImpl],
+    dout,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    chunk_size,
+    *fwd_outputs,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dfinal_states=None,
+    seq_idx=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    dx=None,
+    ddt=None,
+    dB=None,
+    dC=None,
+    dz=None,
+    recompute_output=False,
+    cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+):
+    """
+    Perform the backwards pass assuming the outputs of the forward template were cached
+    """
+    if dout.stride(-1) != 1:
+        dout = dout.contiguous()
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    assert dout.shape == (batch, seqlen, nheads, headdim)
+    assert dt.shape == (batch, seqlen, nheads)
+    assert out.shape == x.shape
+    if initial_states is not None:
+        assert initial_states.shape == (batch, nheads, headdim, dstate)
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    if dx is not None:
+        assert dx.shape == x.shape
+    if dB is not None:
+        assert dB.shape == B.shape
+        dB_given = dB
+    else:
+        dB_given = torch.empty_like(B)
+    if dC is not None:
+        assert dC.shape == C.shape
+        dC_given = dC
+    else:
+        dC_given = torch.empty_like(C)
+    if dz is not None:
+        assert z is not None
+        assert dz.shape == z.shape
+    if ddt is not None:
+        assert ddt.shape == dt.shape
+        ddt_given = ddt
+    else:
+        ddt_given = torch.empty_like(dt)
+    # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
+    # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
+    dt_in = dt.clone()
+    out, out_x, dt, dA_cumsum, states, final_states, CB, *bwd_args = fwd_outputs
+
+    with record_function("pre_state_passing_impl_bwd"):
+        if z is not None:
+            dz, dout, dD, *rest = _chunk_scan_bwd_dz(
+                x,
+                z,
+                out,
+                dout,
+                chunk_size=chunk_size,
+                has_ddAcs=False,
+                D=D,
+                dz=dz,
+                recompute_output=recompute_output,
+            )
+            outz = rest[0] if recompute_output else out
+        else:
+            dz = None
+            outz = out
+        dstates = _chunk_scan_bwd_dstates(
+            C, dA_cumsum, dout, seq_idx=seq_idx, dtype=states.dtype
+        )
+
+    with record_function("state_passing_impl_bwd"):
+        dstates, ddA_chunk_cumsum, dinitial_states, states = state_passing_impl.bwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
+            dstates=dstates,
+            dstates_dtype=x.dtype,
+            states_dtype=x.dtype,
+            initial_states=initial_states,
+            dfinal_states=dfinal_states,
+            seq_idx=seq_idx,
+            cp_mesh=cp_mesh,
+            bwd_args=bwd_args,
+        )
+
+    with record_function("post_state_passing_impl_bwd"):
+        dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(
+            x, dt, dA_cumsum, B, CB, dout, dstates, D=D, seq_idx=seq_idx, dx=dx
+        )
+        dB, ddA_next = _chunk_state_bwd_db(
+            x, dt, dA_cumsum, dstates, seq_idx=seq_idx, B=B, ngroups=ngroups
+        )
+        dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(
+            states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups
+        )
+        dCB = _chunk_scan_bwd_dcb(
+            x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups
+        )
+        dCB = dCB.to(CB.dtype)
+        _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given)
+        _bmm_chunk_bwd(
+            B, rearrange(dCB, "... l s -> ... s l"), residual=dC, out=dC_given
+        )
+        # If we have z, then dout_x is recomputed in fp32 so dD = (dout_x * x).sum() is more accurate
+        # than dD_from_x = (dout_x * x).sum() where dout_x is in fp16/bf16
+        if z is None:
+            dD = dD_from_x
+        ddA_cumsum_prev[..., -1] += ddA_chunk_cumsum
+        ddA_prev = ddA_cumsum_prev.flip([-1]).cumsum(dim=-1).flip([-1])
+        ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
+        ddA += ddA_next + ddA_prev
+
+        ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(
+            ddA,
+            ddt,
+            dt_in,
+            A,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            ddt=ddt_given,
+        )
+
+        return_vals = (
+            dx,
+            ddt_given,
+            dA,
+            dB_given,
+            dC_given,
+            dD,
+            dz,
+            ddt_bias,
+            dinitial_states,
+        )
+        return return_vals if not recompute_output else (*return_vals, outz)
+
+
+##### Non-CP impls. #####
 
 
 class StatePassingNonCP(_StatePassingImpl):
+    """
+    A wrapper around of _state_passing_{fwd,bwd} for testing and reusing in CP implementations.
+    """
+
     @staticmethod
     def fwd(
         chunk_size,
@@ -609,7 +772,7 @@ class StatePassingNonCP(_StatePassingImpl):
             rearrange(t, "... (p n) -> ... p n", n=d_state)
             for t in [out_states, final_states]
         ]
-        return out_states, final_states, None
+        return out_states, final_states, (None,)
 
     @staticmethod
     def bwd(
@@ -623,7 +786,7 @@ class StatePassingNonCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[Any] = None,  # Intentionally unused
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),  # Intentionally unused
     ):
         d_state = states.shape[-1]
         dstates_out, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
@@ -648,7 +811,12 @@ class StatePassingNonCP(_StatePassingImpl):
         return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
-mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn()
+mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
+    recompute_fwd_in_bwd=False
+)
+mamba_chunk_scan_combined_non_cp_recompute = (
+    StatePassingNonCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
+)
 
 
 #### Start CP Impls ####
@@ -656,7 +824,7 @@ mamba_chunk_scan_combined_non_cp = StatePassingNonCP.get_chunk_scan_autograd_fn(
 
 # Async send/recv wrappers.
 # NOTE: @goon - For some reason, plain dist.isend(...).wait() calls are erroring out for me. Don't
-# think is should be necessary to use the `batch_isend_irecv` wrapper.
+# think it should be necessary to use the `batch_isend_irecv` wrapper.
 def send(tensor, dst=None, group=None) -> None:
     for op in dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)]):
         op.wait()
@@ -667,9 +835,14 @@ def recv(tensor, src=None, group=None) -> None:
         op.wait()
 
 
-class StatePassingSerialCP(_StatePassingImpl):
+class StatePassingSerialNaiveCP(_StatePassingImpl):
     """
-    TODO: @goon - seq_idx probably not being treated correctly
+    Context Parallelism implemented as in https://arxiv.org/abs/2405.21060: ranks complete their
+    _state_passing_fwd passes in order, each waiting to receive the final_states from the previous
+    rank, which are used as the initial_states of the subsequent rank, and similar for the backwards
+    pass.
+
+    TODO: @goon - seq_idx handling
     """
 
     @staticmethod
@@ -685,6 +858,8 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         Serially compute the final state on each rank and pass as initial_states to the next.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         group = cp_mesh.get_group()
@@ -695,7 +870,7 @@ class StatePassingSerialCP(_StatePassingImpl):
             )
         recv_init_states = None
         mesh_size = cp_mesh.size()
-        for send_rank, recv_rank in zip(range(mesh_size - 1), range(1, mesh_size)):
+        for send_rank, recv_rank in pairwise(range(mesh_size)):
             if local_rank == send_rank:
                 out_states, final_states, _ = StatePassingNonCP.fwd(
                     chunk_size=chunk_size,
@@ -729,7 +904,7 @@ class StatePassingSerialCP(_StatePassingImpl):
                 seq_idx=seq_idx,
                 out_dtype=out_dtype,
             )
-        bwd_args = recv_init_states
+        bwd_args = (recv_init_states,)
         return out_states, final_states, bwd_args
 
     @staticmethod
@@ -744,12 +919,14 @@ class StatePassingSerialCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[Any] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
     ):
         """
         Starting from the final rank to compute in _state_passing_serial_cp_fwd, compute
         dinitial_states and pass these back as the dfinal_states of the preceding rank.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         mesh_size = cp_mesh.size()
@@ -764,11 +941,9 @@ class StatePassingSerialCP(_StatePassingImpl):
             raise ValueError(
                 "dfinal_states can only be non-trival on the last CP rank."
             )
-        recv_init_states = bwd_args
+        recv_init_states = bwd_args[0]
         recv_dfinal_states = None
-        for send_rank, recv_rank in zip(
-            range(mesh_size - 1, 0, -1), range(mesh_size - 2, -1, -1)
-        ):
+        for send_rank, recv_rank in pairwise(reversed(range(mesh_size))):
             if local_rank == send_rank:
                 dstates_out, ddA_chunk_cumsum, send_dinitial_states, states = (
                     StatePassingNonCP.bwd(
@@ -822,12 +997,27 @@ class StatePassingSerialCP(_StatePassingImpl):
         return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
-mamba_chunk_scan_combined_serial_cp = StatePassingSerialCP.get_chunk_scan_autograd_fn()
+mamba_chunk_scan_combined_serial_naive_cp = (
+    StatePassingSerialNaiveCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=False)
+)
+mamba_chunk_scan_combined_serial_naive_cp_recompute = (
+    StatePassingSerialNaiveCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
+)
 
 
 class StatePassingAllGatherCP(_StatePassingImpl):
     """
-    TODO: @goon - seq_idx probably not being treated correctly
+    Alternative CP implemementation:
+    1. Every rank completes its _state_passing_fwd with initial_states = None.
+    2. final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+    3. The above data can be passed through _state_passing_fwd again to get the corrected
+       initial_states that each rank should have started with.
+    4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
+
+    Uses additional compute to swap P2P comms for collectives and reduces typical blocking wait
+    times.
+
+    TODO: @goon - seq_idx handling
     """
 
     @staticmethod
@@ -840,13 +1030,8 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         out_dtype=None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
-        """
-        1. Every rank completes its _state_passing_fwd with initial_sates = None.
-        2. final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
-        3. The above data can be passed through _state_passing_fwd again to get the corrected
-           initial_states that each rank should have started with.
-        4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
-        """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         is_lead_rank = local_rank == 0
@@ -950,7 +1135,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[Any] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
     ):
         """
         1. Every rank completes its _state_passing_bwd with dfinal_states = None (except maybe on
@@ -960,6 +1145,8 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         3. Every rank recomputes its _state_passing_bwd with the proper {dfinal,initial}_states
         values.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         is_lead_rank = local_rank == 0
@@ -979,7 +1166,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         # Compute dinitial_states with the locally available information. I.e. use trivial
         # dfinal_states on all but, maybe, the last rank. These can be used to compute the
         # corrected dfinal_states each rank should have started with.
-        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, _ = (
+        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, states = (
             StatePassingNonCP.bwd(
                 chunk_size=chunk_size,
                 states=states,
@@ -1065,5 +1252,232 @@ class StatePassingAllGatherCP(_StatePassingImpl):
 
 
 mamba_chunk_scan_combined_allgather_cp = (
-    StatePassingAllGatherCP.get_chunk_scan_autograd_fn()
+    StatePassingAllGatherCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=False)
+)
+mamba_chunk_scan_combined_allgather_cp_recompute = (
+    StatePassingAllGatherCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
+)
+
+
+@torch.compile
+def _get_corrected_state(
+    partial_state: torch.Tensor,
+    state_correction: torch.Tensor,
+    dA_chunk_cumsum: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        partial_state
+        + state_correction * dA_chunk_cumsum.sum(dim=2, keepdim=True).exp()[..., None]
+    )
+
+
+class StatePassingSerialCP(_StatePassingImpl):
+    """
+    Alternative CP implemementation:
+    1. Every rank completes its _state_passing_fwd with initial_states = None.
+    2. Ranks sequentially recv the final state from the preceding rank, use this to correct
+       their initial_states/final_states
+    3. Every rank computes its _state_passing_fwd again, now with its proper initial_states
+
+    Reduces the amount of waiting time relative to StatePassingSerialNaiveCP in exchange for
+    additional non-blocking compute.
+
+    TODO: @goon - seq_idx handling
+    """
+
+    @staticmethod
+    def fwd(
+        chunk_size,
+        states,
+        dA_chunk_cumsum,
+        initial_states=None,
+        seq_idx=None,
+        out_dtype=None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
+    ):
+        """ """
+        if seq_idx is not None:
+            raise NotImplementedError
+        assert cp_mesh is not None
+        local_rank = cp_mesh.get_local_rank()
+        group = cp_mesh.get_group()
+        is_lead_rank = local_rank == 0
+        if not is_lead_rank and initial_states is not None:
+            raise ValueError(
+                "initial_states can only be non-trival on the lead CP rank."
+            )
+
+        # Compute the partial states with the locally available information. I.e. use trivial
+        # initial_states on all but, maybe, the lead rank.
+        states_partial, final_states_partial, _ = StatePassingNonCP.fwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            out_dtype=out_dtype,
+        )
+
+        initial_states_corrected = initial_states
+        mesh_size = cp_mesh.size()
+        for send_rank, recv_rank in pairwise(range(mesh_size)):
+            if local_rank == send_rank:
+                if initial_states_corrected is None:
+                    assert is_lead_rank
+                    final_states = final_states_partial
+                else:
+                    final_states = _get_corrected_state(
+                        final_states_partial, initial_states_corrected, dA_chunk_cumsum
+                    )
+                send(
+                    final_states.to(dtype=states.dtype).contiguous(),
+                    dst=dist.get_global_rank(group, recv_rank),
+                    group=group,
+                )
+            elif local_rank == recv_rank:
+                initial_states_corrected = torch.empty_like(states[:, 0])
+                recv(
+                    initial_states_corrected,
+                    src=dist.get_global_rank(group, send_rank),
+                    group=group,
+                )
+
+        if is_lead_rank:
+            final_states = final_states_partial
+            out_states = states_partial
+        else:
+            # And repeat the forward with the now-corrected initial_states
+            out_states, final_states, _ = StatePassingNonCP.fwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_chunk_cumsum=dA_chunk_cumsum,
+                initial_states=initial_states_corrected,
+                seq_idx=seq_idx,
+                out_dtype=out_dtype,
+            )
+
+        bwd_args = (initial_states_corrected,)
+
+        return out_states, final_states, bwd_args
+
+    @staticmethod
+    def bwd(
+        chunk_size: int,
+        states: torch.Tensor,
+        dA_chunk_cumsum: torch.Tensor,
+        dstates: torch.Tensor,
+        dstates_dtype: torch.dtype,
+        states_dtype: torch.dtype,
+        initial_states: Optional[torch.Tensor] = None,
+        dfinal_states: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
+    ):
+        """
+        1. Every rank completes its _state_passing_bwd with dfinal_states = None (except maybe on
+            the final cp rank) and with the corrected initial_states from the forward.
+        2. In reversed rank order, recv the dfinal_states from rank + 1's dinitial_state, use these
+           to correct dinitial_state, and continue passing.
+        3. Every rank recomputes its _state_passing_bwd with the proper {dfinal,initial}_states
+           values.
+        """
+        if seq_idx is not None:
+            raise NotImplementedError
+        assert cp_mesh is not None
+        local_rank = cp_mesh.get_local_rank()
+        mesh_size = cp_mesh.size()
+        group = cp_mesh.get_group()
+        is_lead_rank = local_rank == 0
+        if not is_lead_rank and initial_states is not None:
+            raise ValueError(
+                "initial_states can only be non-trival on the lead CP rank."
+            )
+        is_last_rank = local_rank == cp_mesh.size() - 1
+        if not is_last_rank and dfinal_states is not None:
+            raise ValueError(
+                "dfinal_states can only be non-trival on the last CP rank."
+            )
+
+        assert bwd_args is not None
+        initial_states_corrected = bwd_args[0]
+
+        # Compute dinitial_states with the locally available information, i.e. use trivial
+        # dfinal_states on all but, maybe, the last rank. These can be used to compute the corrected
+        # dfinal_states each rank should have started with.
+        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, states = (
+            StatePassingNonCP.bwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_chunk_cumsum=dA_chunk_cumsum,
+                dstates=dstates,
+                # HACK: initial_states=True ensures dinitial_states_partial is never None, maybe
+                # just zeros
+                initial_states=True,
+                dfinal_states=dfinal_states,
+                seq_idx=seq_idx,
+                dstates_dtype=dstates_dtype,
+                states_dtype=states_dtype,
+                cp_mesh=cp_mesh,
+            )
+        )
+
+        recv_dfinal_states = None
+        for send_rank, recv_rank in pairwise(reversed(range(mesh_size))):
+            if local_rank == send_rank:
+                if recv_dfinal_states is None:
+                    assert is_last_rank
+                    dinitial_states = dinitial_states_partial
+                else:
+                    dinitial_states = _get_corrected_state(
+                        dinitial_states_partial, recv_dfinal_states, dA_chunk_cumsum
+                    )
+                # Careful: P2P will hang if the dtypes don't match!
+                send(
+                    dinitial_states.to(dtype=dstates_dtype).contiguous(),
+                    dst=dist.get_global_rank(group, recv_rank),
+                    group=group,
+                )
+            elif local_rank == recv_rank:
+                recv_dfinal_states = torch.empty(
+                    *states[:, 0].shape, dtype=dstates_dtype, device=states.device
+                )
+                recv(
+                    recv_dfinal_states,
+                    src=dist.get_global_rank(group, send_rank),
+                    group=group,
+                )
+
+        # Then re-run state passing bwd with correct inputs on all ranks, except the final cp rank
+        # which doesn't require a correction.
+        if is_last_rank:
+            dstates_out, ddA_chunk_cumsum = dstates_partial, ddA_chunk_cumsum_partial
+            dinitial_states = None
+        else:
+            dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
+                StatePassingNonCP.bwd(
+                    chunk_size=chunk_size,
+                    states=states,
+                    dA_chunk_cumsum=dA_chunk_cumsum,
+                    dstates=dstates,
+                    initial_states=initial_states_corrected,
+                    dfinal_states=recv_dfinal_states,
+                    seq_idx=seq_idx,
+                    dstates_dtype=dstates_dtype,
+                    states_dtype=states_dtype,
+                    cp_mesh=cp_mesh,
+                )
+            )
+            # Only the first rank potentially had non-trivial initial_states as proper inputs, so
+            # all other ranks get dinitial_states = None.
+            if not is_lead_rank:
+                dinitial_states = None
+        return dstates_out, ddA_chunk_cumsum, dinitial_states, states
+
+
+mamba_chunk_scan_combined_serial_cp = StatePassingSerialCP.get_chunk_scan_autograd_fn(
+    recompute_fwd_in_bwd=False
+)
+mamba_chunk_scan_combined_serial_cp_recompute = (
+    StatePassingSerialCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
 )

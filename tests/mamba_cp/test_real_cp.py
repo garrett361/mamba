@@ -22,7 +22,6 @@ from mamba_ssm.modules.mamba2_cp import (
     CP_MAMBA_IMPLS,
     MHACP,
     Mamba2CP,
-    _identity_fwd_all_reduce_bwd,
     causal_passing_comms,
     conv,
     conv_cp,
@@ -120,7 +119,7 @@ class TestCausalPassingFn(DTest):
     def test_fwd(self):
         with torch.no_grad():
             torch.manual_seed(42)
-            dim = 16
+            dim = 256
             t_send = torch.randn(
                 self.world_size,
                 dim,
@@ -142,7 +141,7 @@ class TestCausalPassingFn(DTest):
 
     def test_bwd(self):
         torch.manual_seed(42)
-        dim = 16
+        dim = 256
         t_send = torch.randn(
             self.world_size,
             dim,
@@ -170,41 +169,40 @@ class TestCausalPassingFn(DTest):
             )
 
 
-class TestSeqToZigZagFn(DTest):
-    def test_fwd(self):
+class TestSeqAndZigZagFns(DTest):
+    seq_dim = 1
+    dtype = torch.bfloat16
+
+    def test_seq_to_zigzag_fwd(self):
         with torch.no_grad():
-            seq_dim = 1
-            dtype = torch.bfloat16
             # Send the mini shard idx tensors around
             t_send = torch.tensor(
                 [[2 * self.rank, 2 * self.rank + 1]],
                 device=self.device,
-                dtype=dtype,
+                dtype=self.dtype,
             )
             mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-            t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+            t_recv = seq_to_zigzag_comms(t_send, mesh, self.seq_dim)
             t_expected = torch.tensor(
                 [[self.rank, 2 * self.world_size - self.rank - 1]],
                 device=self.device,
-                dtype=dtype,
+                dtype=self.dtype,
             )
             torch.testing.assert_close(
                 t_recv,
                 t_expected,
             )
 
-    def test_bwd(self):
-        seq_dim = 1
-        dtype = torch.bfloat16
+    def test_seq_to_zigzag_bwd(self):
         t_send = torch.tensor(
             [[2 * self.rank, 2 * self.rank + 1]],
             device=self.device,
-            dtype=dtype,
+            dtype=self.dtype,
             requires_grad=True,
         )
 
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+        t_recv = seq_to_zigzag_comms(t_send, mesh, self.seq_dim)
         t_recv.pow(2).div(2).sum().backward()
 
         grad = t_send.grad
@@ -213,42 +211,36 @@ class TestSeqToZigZagFn(DTest):
             t_send,
         )
 
-
-class TestZigZagToSeqFn(DTest):
-    def test_fwd(self):
+    def test_zigzag_to_seq_fwd(self):
         with torch.no_grad():
-            seq_dim = 1
-            dtype = torch.bfloat16
             # Send the mini shard idx tensors around
             t_send = torch.tensor(
                 [[self.rank, 2 * self.world_size - self.rank - 1]],
                 device=self.device,
-                dtype=dtype,
+                dtype=self.dtype,
             )
             mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-            t_recv = zigzag_to_seq_comms(t_send, mesh, seq_dim)
+            t_recv = zigzag_to_seq_comms(t_send, mesh, self.seq_dim)
             t_expected = torch.tensor(
                 [[2 * self.rank, 2 * self.rank + 1]],
                 device=self.device,
-                dtype=dtype,
+                dtype=self.dtype,
             )
             torch.testing.assert_close(
                 t_recv,
                 t_expected,
             )
 
-    def test_bwd(self):
-        seq_dim = 1
-        dtype = torch.bfloat16
+    def test_zigzag_to_seq_bwd(self):
         t_send = torch.tensor(
             [[self.rank, 2 * self.world_size - self.rank - 1]],
             device=self.device,
-            dtype=dtype,
+            dtype=self.dtype,
             requires_grad=True,
         )
 
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
+        t_recv = seq_to_zigzag_comms(t_send, mesh, self.seq_dim)
         t_recv.pow(2).div(2).sum().backward()
 
         grad = t_send.grad
@@ -257,115 +249,43 @@ class TestZigZagToSeqFn(DTest):
             t_send,
         )
 
-
-class TestZigZagToSeqInverse(DTest):
-    """
-    zigzag_to_seq_comms and seq_to_zigzag_comms should be inverses of each other.
-    """
-
-    def test_seq_then_zig(self) -> None:
-        seq_dim = 1
-        dtype = torch.bfloat16
+    def test_seq_then_zigzag_identity_function(self) -> None:
+        """
+        zigzag_to_seq_comms and seq_to_zigzag_comms should be inverses of each other.
+        """
         # Send the mini shard idx tensors around
         t_send = torch.tensor(
             [[self.rank, 2 * self.world_size - self.rank - 1]],
             device=self.device,
-            dtype=dtype,
+            dtype=self.dtype,
         )
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         # Send and send again
-        t_recv = seq_to_zigzag_comms(t_send, mesh, seq_dim)
-        t_recv = zigzag_to_seq_comms(t_recv, mesh, seq_dim)
+        t_recv = seq_to_zigzag_comms(t_send, mesh, self.seq_dim)
+        t_recv = zigzag_to_seq_comms(t_recv, mesh, self.seq_dim)
         torch.testing.assert_close(
             t_recv,
             t_send,
         )
 
-    def test_zig_then_seq(self) -> None:
-        seq_dim = 1
-        dtype = torch.bfloat16
+    def test_zigzag_then_seq_identity_function(self) -> None:
+        """
+        zigzag_to_seq_comms and seq_to_zigzag_comms should be inverses of each other.
+        """
         # Send the mini shard idx tensors around
         t_send = torch.tensor(
             [[self.rank, 2 * self.world_size - self.rank - 1]],
             device=self.device,
-            dtype=dtype,
+            dtype=self.dtype,
         )
         mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         # Send and send again
-        t_recv = zigzag_to_seq_comms(t_send, mesh, seq_dim)
-        t_recv = seq_to_zigzag_comms(t_recv, mesh, seq_dim)
+        t_recv = zigzag_to_seq_comms(t_send, mesh, self.seq_dim)
+        t_recv = seq_to_zigzag_comms(t_recv, mesh, self.seq_dim)
         torch.testing.assert_close(
             t_recv,
             t_send,
         )
-
-
-class TestIdentityFwdAllGatherBwdFn(DTest):
-    def test_fwd(self):
-        with torch.no_grad():
-            dim = 16
-            torch.manual_seed(42)
-            weight = torch.randn(
-                dim,
-                device=self.device,
-                dtype=torch.bfloat16,
-            )
-            weight_copy = deepcopy(weight)
-
-            weight = nn.Parameter(weight)
-            mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-            weight_copy = nn.Parameter(weight_copy)
-
-            inputs = torch.randn(
-                self.world_size,
-                dim,
-                device=self.device,
-                dtype=torch.bfloat16,
-            )
-            inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
-
-            output = inputs * weight
-            output_shard = inputs_shard * _identity_fwd_all_reduce_bwd(
-                weight_copy, mesh
-            )
-
-            all_gathered_output_shards = torch.empty_like(inputs)
-            dist.all_gather_into_tensor(
-                all_gathered_output_shards, output_shard, group=mesh.get_group()
-            )
-            out = [torch.empty_like(output_shard) for _ in range(self.world_size)]
-            dist.all_gather(out, output_shard, group=mesh.get_group())
-
-            torch.testing.assert_close(all_gathered_output_shards, output)
-
-    def test_bwd(self):
-        dim = 16
-        torch.manual_seed(42)
-        weight = torch.randn(
-            dim,
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
-        weight_copy = deepcopy(weight)
-
-        weight = nn.Parameter(weight)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        weight_copy = nn.Parameter(weight_copy)
-
-        inputs = torch.randn(
-            self.world_size,
-            dim,
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
-        inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
-
-        (inputs * weight).sum().backward()
-        (
-            inputs_shard * _identity_fwd_all_reduce_bwd(weight_copy, mesh)
-        ).sum().backward()
-
-        torch.testing.assert_close(weight.grad, weight_copy.grad)
 
 
 class _DTestModelBase(DTest):
@@ -444,6 +364,7 @@ class _DTestModelBase(DTest):
         cp_mesh: dist.device_mesh.DeviceMesh,
         seed: int = 42,
         cp_mamba_impl: str = "allgather",
+        cp_mamba_recompute: bool = False,
     ) -> Mamba2:
         torch.manual_seed(seed)
         # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
@@ -454,6 +375,7 @@ class _DTestModelBase(DTest):
             d_state=self.d_state,
             chunk_size=self.chunk_size,
             cp_mamba_impl=cp_mamba_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
             **self.factory_kwargs,
         ).to(self.dtype)
 
@@ -502,6 +424,7 @@ class _DTestModelBase(DTest):
         cp_mesh: dist.device_mesh.DeviceMesh,
         cp_mamba_impl: str,
         cp_attn_impl: str,
+        cp_mamba_recompute: bool = False,
         seed: int = 42,
     ) -> MambaLMHeadModel:
         torch.manual_seed(seed)
@@ -512,6 +435,7 @@ class _DTestModelBase(DTest):
             cp_mesh=cp_mesh,
             cp_mamba_impl=cp_mamba_impl,
             cp_attn_impl=cp_attn_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
             device=self.device,
             dtype=self.dtype,
         ).to(self.dtype)
@@ -669,7 +593,7 @@ class TestConvCP(_DTestModelBase):
 
 
 class TestScanCP(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
     def test_fwd(self, cp_mamba_impl):
         with torch.no_grad():
             torch.manual_seed(42)
@@ -703,7 +627,7 @@ class TestScanCP(_DTestModelBase):
                 outputs_cp_all_gathered, outputs, atol=self.tol, rtol=self.tol
             )
 
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
     def test_bwd(self, cp_mamba_impl):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
@@ -738,13 +662,16 @@ class TestScanCP(_DTestModelBase):
 
 
 class TestMamba2CP(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl):
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
+    def test_fwd(self, cp_mamba_impl: str):
         with torch.no_grad():
             torch.manual_seed(42)
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             mamba2 = self.get_mamba2()
-            mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+            mamba2_cp = self.get_mamba2_cp(
+                cp_mesh=cp_mesh,
+                cp_mamba_impl=cp_mamba_impl,
+            )
 
             inputs = self.get_inputs()
             inputs_cp = self.get_cp_shard(inputs)
@@ -757,12 +684,17 @@ class TestMamba2CP(_DTestModelBase):
                 outputs_cp, outputs_shard, atol=self.tol, rtol=self.tol
             )
 
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_bwd(self, cp_mamba_impl):
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
+    def test_bwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+        mamba2_cp = self.get_mamba2_cp(
+            cp_mesh=cp_mesh,
+            cp_mamba_impl=cp_mamba_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
+        )
 
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
@@ -833,14 +765,17 @@ class TestMHACP(_DTestModelBase):
 
 
 class TestFSDP1MambaCP(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl):
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
+    def test_fwd(self, cp_mamba_impl: str):
         with torch.no_grad():
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
             model_cp = nn.Sequential(
                 *[
-                    self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+                    self.get_mamba2_cp(
+                        cp_mesh=cp_mesh,
+                        cp_mamba_impl=cp_mamba_impl,
+                    )
                     for _ in range(3)
                 ]
             )
@@ -864,13 +799,18 @@ class TestFSDP1MambaCP(_DTestModelBase):
                 outputs_cp_fsdp, outputs_shard, atol=self.tol, rtol=self.tol
             )
 
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_bwd(self, cp_mamba_impl):
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
+    def test_bwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+                self.get_mamba2_cp(
+                    cp_mesh=cp_mesh,
+                    cp_mamba_impl=cp_mamba_impl,
+                    cp_mamba_recompute=cp_mamba_recompute,
+                )
                 for _ in range(3)
             ]
         )
@@ -1011,8 +951,8 @@ class TestHSDP1MambaCP(_DTestModelBase):
     """
 
     @pytest.mark.world_size(4)
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl):
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
+    def test_fwd(self, cp_mamba_impl: str):
         with torch.no_grad():
             mesh = dist.device_mesh.init_device_mesh(
                 "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
@@ -1021,7 +961,10 @@ class TestHSDP1MambaCP(_DTestModelBase):
             model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
             model_cp = nn.Sequential(
                 *[
-                    self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+                    self.get_mamba2_cp(
+                        cp_mesh=cp_mesh,
+                        cp_mamba_impl=cp_mamba_impl,
+                    )
                     for _ in range(3)
                 ]
             )
@@ -1049,8 +992,9 @@ class TestHSDP1MambaCP(_DTestModelBase):
             )
 
     @pytest.mark.world_size(4)
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_bwd(self, cp_mamba_impl):
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
+    def test_bwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
         mesh = dist.device_mesh.init_device_mesh(
             "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
         )
@@ -1058,7 +1002,11 @@ class TestHSDP1MambaCP(_DTestModelBase):
         model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
         model_cp = nn.Sequential(
             *[
-                self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+                self.get_mamba2_cp(
+                    cp_mesh=cp_mesh,
+                    cp_mamba_impl=cp_mamba_impl,
+                    cp_mamba_recompute=cp_mamba_recompute,
+                )
                 for _ in range(3)
             ]
         )
@@ -1231,14 +1179,16 @@ class TestHSDP1MHACP(_DTestModelBase):
 
 
 class TestModelCPFSDP1(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
     def test_fwd(self, cp_mamba_impl, cp_attn_impl):
         with torch.no_grad():
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             model = self.get_model()
             model_cp_fsdp = self.get_model_cp(
-                cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+                cp_mesh,
+                cp_mamba_impl=cp_mamba_impl,
+                cp_attn_impl=cp_attn_impl,
             )
             model_cp_fsdp = FSDP(
                 model_cp_fsdp,
@@ -1262,20 +1212,18 @@ class TestModelCPFSDP1(_DTestModelBase):
                 atol=self.tol,
                 rtol=self.tol,
             )
-            greedy_preds_match = (
-                outputs_cp.max(dim=-1).indices == outputs_shard.max(dim=-1).indices
-            )
-            assert greedy_preds_match.all(), (
-                f"{greedy_preds_match.numel()=}, {(~greedy_preds_match).sum()=}"
-            )
 
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
-    def test_bwd(self, cp_mamba_impl, cp_attn_impl):
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    def test_bwd(self, cp_mamba_impl, cp_attn_impl, cp_mamba_recompute):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
         model_cp_fsdp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+            cp_mesh,
+            cp_mamba_impl=cp_mamba_impl,
+            cp_attn_impl=cp_attn_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
         )
         model_cp_fsdp = FSDP(
             model_cp_fsdp,
@@ -1322,14 +1270,16 @@ class TestModelCPFSDP1(_DTestModelBase):
 
 
 class TestModelCPFSDP2(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
-    def test_fwd(self, cp_mamba_impl, cp_attn_impl):
+    def test_fwd(self, cp_mamba_impl: str, cp_attn_impl: str):
         with torch.no_grad():
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             model = self.get_model()
             model_cp_fsdp = self.get_model_cp(
-                cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+                cp_mesh,
+                cp_mamba_impl=cp_mamba_impl,
+                cp_attn_impl=cp_attn_impl,
             )
 
             for module in model_cp_fsdp.modules():
@@ -1350,20 +1300,18 @@ class TestModelCPFSDP2(_DTestModelBase):
                 atol=self.tol,
                 rtol=self.tol,
             )
-            greedy_preds_match = (
-                outputs_cp.max(dim=-1).indices == outputs_shard.max(dim=-1).indices
-            )
-            assert greedy_preds_match.all(), (
-                f"{greedy_preds_match.numel()=}, {(~greedy_preds_match).sum()=}"
-            )
 
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", list(CP_MAMBA_IMPLS))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
-    def test_bwd(self, cp_mamba_impl, cp_attn_impl):
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    def test_bwd(self, cp_mamba_impl, cp_attn_impl, cp_mamba_recompute):
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         model = self.get_model()
         model_cp_fsdp = self.get_model_cp(
-            cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_attn_impl=cp_attn_impl
+            cp_mesh,
+            cp_mamba_impl=cp_mamba_impl,
+            cp_attn_impl=cp_attn_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
         )
 
         for module in model_cp_fsdp.modules():

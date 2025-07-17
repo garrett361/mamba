@@ -1,29 +1,24 @@
 from copy import deepcopy
 
+import pytest
 import torch
 from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba2_cp import conv, _Mamba2Ref
+from mamba_ssm.modules.mamba2_cp import _Mamba2Ref, conv
 from mamba_ssm.ops.triton.ssd_state_passing import (
-    _state_passing_fwd,
     _state_passing_bwd,
+    _state_passing_fwd,
 )
-
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
-
 
 # Breaking out various parts of the fwd for easier testing:
 
 
 class _TestBase:
     batch_size = 2
-    cp_dim = 4
+    cp_degree = 4
     chunk_size = 4
-    seq_len = 4 * cp_dim * chunk_size
+    seq_len = 4 * cp_degree * chunk_size
     n_chunks = seq_len // chunk_size
     d_model = 256
     d_state = 128
@@ -99,23 +94,27 @@ class _TestBase:
 
 
 class Test_Mamba2Ref(_TestBase):
-    def test_fwd(self) -> None:
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    def test_fwd(self, cp_mamba_recompute: bool) -> None:
         mamba2 = self.get_mamba2()
         mamba2_ref = self.get_mamba2_ref()
+        mamba2_ref.cp_mamba_recompute = cp_mamba_recompute
         inputs = self.get_inputs()
         outputs = mamba2(inputs)
         outputs_copy = mamba2_ref(inputs)
         torch.testing.assert_close(outputs, outputs_copy)
 
-    def test_bwd(self) -> None:
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    def test_bwd(self, cp_mamba_recompute: bool) -> None:
         mamba2 = self.get_mamba2()
-        mamba2_copy = self.get_mamba2_ref()
+        mamba2_ref = self.get_mamba2_ref()
+        mamba2_ref.cp_mamba_recompute = cp_mamba_recompute
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
         mamba2(inputs).sum().backward()
-        mamba2_copy(inputs_copy).sum().backward()
+        mamba2_ref(inputs_copy).sum().backward()
 
-        for p1, p2 in zip(mamba2.parameters(), mamba2_copy.parameters()):
+        for p1, p2 in zip(mamba2.parameters(), mamba2_ref.parameters()):
             if p1.grad is not None:
                 torch.testing.assert_close(p1.grad, p2.grad)
         torch.testing.assert_close(inputs.grad, inputs_copy.grad)
@@ -131,7 +130,7 @@ class TestLocalCP(_TestBase):
         xBC = self.get_xBC()
 
         # Shard and create the conv states
-        xBC_cp = rearrange(xBC, "b (c l) d -> b l d c ", c=self.cp_dim)
+        xBC_cp = rearrange(xBC, "b (c l) d -> b l d c ", c=self.cp_degree)
         xBC_cp_conv_states = xBC_cp[:, -(self.d_conv - 1) :]
         xBC_cp_conv_states = xBC_cp_conv_states.roll(1, dims=-1)
         # First conv state is trivial (could also make it None)
@@ -139,7 +138,7 @@ class TestLocalCP(_TestBase):
 
         outputs = conv(xBC, self.get_mamba2())
         outputs_cp_list: list[torch.Tensor] = []
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             cp_out = conv(
                 xBC_cp[..., rank_cp],
                 mamba2=self.get_mamba2(),
@@ -159,13 +158,13 @@ class TestLocalCP(_TestBase):
         mamba2_cp = deepcopy(mamba2)
 
         # Shard and create the conv states
-        xBC_cp = rearrange(xBC_clone, "b (r l) d -> b l d r ", r=self.cp_dim)
+        xBC_cp = rearrange(xBC_clone, "b (r l) d -> b l d r ", r=self.cp_degree)
         xBC_cp_conv_states = xBC_cp[:, -(self.d_conv - 1) :]
 
         outputs = conv(xBC, mamba2)
         outputs.sum().backward()
 
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             cp_out = conv(
                 xBC_cp[..., rank_cp],
                 mamba2=mamba2_cp,
@@ -196,9 +195,9 @@ class TestLocalCP(_TestBase):
         states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
 
         # Shard
-        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_degree)
         dA_chunk_cumsum_cp = rearrange(
-            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_degree
         )
 
         # Ground truth
@@ -208,7 +207,7 @@ class TestLocalCP(_TestBase):
         initial_states = None
         # Step through ranks serially, one passing their final states as the initial states of the
         # next rank.
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             out_cp, initial_states = _state_passing_fwd(
                 states_cp[..., rank_cp],
                 dA_chunk_cumsum_cp[..., rank_cp],
@@ -237,10 +236,10 @@ class TestLocalCP(_TestBase):
         dout = torch.randn_like(states)
 
         # Shard
-        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
-        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_degree)
+        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_degree)
         dA_chunk_cumsum_cp = rearrange(
-            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_degree
         )
 
         # Ground truth
@@ -259,7 +258,7 @@ class TestLocalCP(_TestBase):
         dfinal_states = None
         # Step through ranks serially in reversed order, one passing their dinitstates as the
         # dfinal_states of the preceding rank.
-        for rank_cp in reversed(range(self.cp_dim)):
+        for rank_cp in reversed(range(self.cp_degree)):
             dstates_cp, ddA_chunk_cumsum_cp, dfinal_states, _ = _state_passing_bwd(
                 states_cp[..., rank_cp],
                 dA_chunk_cumsum_cp[..., rank_cp],
@@ -299,9 +298,9 @@ class TestLocalCP(_TestBase):
         # dA_chunk_cumsum: (b, h, c)
 
         # Shard and create the conv states
-        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_degree)
         dA_chunk_cumsum_cp = rearrange(
-            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_degree
         )
 
         # Ground truth
@@ -309,7 +308,7 @@ class TestLocalCP(_TestBase):
 
         # Compute the states local to each rank (trivial initial_states)
         final_state_cp_list = []
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             _, final_state_cp = _state_passing_fwd(
                 states_cp[..., rank_cp],
                 dA_chunk_cumsum_cp[..., rank_cp],
@@ -331,7 +330,7 @@ class TestLocalCP(_TestBase):
 
         # Then recompute the out states with the now-known initial states.
         out_cp_list: list[torch.Tensor] = []
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             out_cp, _ = _state_passing_fwd(
                 states_cp[..., rank_cp],
                 dA_chunk_cumsum_cp[..., rank_cp],
@@ -360,10 +359,10 @@ class TestLocalCP(_TestBase):
         dout = torch.randn_like(states)
 
         # Shard
-        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_dim)
-        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_dim)
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_degree)
+        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_degree)
         dA_chunk_cumsum_cp = rearrange(
-            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_dim
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_degree
         )
 
         # Ground truth
@@ -379,7 +378,7 @@ class TestLocalCP(_TestBase):
 
         # Run the backwards with only local data (i.e. with the incorrect dfinal_states = None)
         dinitstates_cp_list = []
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             _, _, dinitstates_cp, *_ = _state_passing_bwd(
                 states_cp[..., rank_cp],
                 dA_chunk_cumsum_cp[..., rank_cp],
@@ -411,12 +410,176 @@ class TestLocalCP(_TestBase):
         # Then recompute derivatives with the now-known dfinal_states states.
         dstates_cp_list = []
         ddA_chunk_cumsum_cp_list = []
-        for rank_cp in range(self.cp_dim):
+        for rank_cp in range(self.cp_degree):
             dstates_cp, ddA_chunk_cumsum_cp, *_ = _state_passing_bwd(
                 states_cp[..., rank_cp],
                 dA_chunk_cumsum_cp[..., rank_cp],
                 dout_cp[..., rank_cp],
                 dfinal_states=dfinal_states_cp[..., rank_cp],
+                has_initial_states=True,
+                dstates_dtype=states.dtype,
+                states_dtype=states.dtype,
+            )
+            dstates_cp_list.append(dstates_cp)
+            ddA_chunk_cumsum_cp_list.append(ddA_chunk_cumsum_cp)
+
+        dstates_cp = torch.cat(dstates_cp_list, dim=1)
+        ddA_chunk_cumsum_cp = torch.cat(ddA_chunk_cumsum_cp_list, dim=2)
+        tol = 1e-3
+        torch.testing.assert_close(dstates, dstates_cp, atol=tol, rtol=tol)
+        torch.testing.assert_close(
+            ddA_chunk_cumsum, ddA_chunk_cumsum_cp, atol=tol, rtol=tol
+        )
+
+    def test_chunked_state_passing_optimized_serial_fwd(self) -> None:
+        """
+        Simulated CP with more parallelized state_passing step:
+        - Every rank completes its _state_passing_fwd with initial_sates = None to get its
+          final_state
+        - final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+        - The above data can be passed through _state_passing_fwd again to get the corrected
+          initial_states on each rank.
+        - Finally, every rank computes its _state_passing_fwd again, now with its proper
+          initial_states
+        NOTE: omits the d_state dim
+        """
+        torch.manual_seed(42)
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        # states: (b, c, h, p)
+        # dA_chunk_cumsum: (b, h, c)
+
+        # Shard and create the conv states
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_degree)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_degree
+        )
+
+        # Ground truth
+        out, _ = _state_passing_fwd(states, dA_chunk_cumsum)
+
+        # Compute the (incorrect) states local to each rank by using trivial initial_states
+        final_state_cp_list = []
+        for rank_cp in range(self.cp_degree):
+            _, final_state_cp = _state_passing_fwd(
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+            )
+            final_state_cp_list.append(final_state_cp)
+
+        # The start correcting theses states.
+
+        # Each rank needs to sum its dA factors up.
+        # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
+        dA_sums_cp = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2, keepdim=True)
+
+        initial_states_list = [None]
+        # Rank zero first send its final state to rank 1
+        send_state = final_state_cp_list[0]
+        for send_rank in range(self.cp_degree - 1):
+            recv_rank = send_rank + 1
+            recv_state = send_state
+            initial_states_list.append(recv_state)
+            # Here we correct the initial states on each rank via a very small computation:
+            send_state = (
+                recv_state * dA_sums_cp[..., recv_rank].exp()
+                + final_state_cp_list[recv_rank]
+            )
+
+        # Then recompute the out states with the now-known initial states.
+        out_cp_list: list[torch.Tensor] = []
+        for rank_cp in range(self.cp_degree):
+            out_cp, _ = _state_passing_fwd(
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+                initial_states_list[rank_cp],
+            )
+            out_cp_list.append(out_cp)
+        out_cp = torch.stack(out_cp_list, dim=-1)
+        out_cp = rearrange(out_cp, "b c h p r -> b (r c) h p")
+
+        tol = 1e-3
+        torch.testing.assert_close(out, out_cp, atol=tol, rtol=tol)
+
+    def test_chunked_state_passing_optimized_serial_bwd(self) -> None:
+        """
+        Simulated CP with more parallelized state_passing step:
+        - Every rank completes its _state_passing_bwd with dfinal_states = None to get its
+          dinitial_state
+        - dinitial_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+        - The above data can be passed through _state_passing_fwd again to get the corrected
+          dfinal_states on each rank.
+        - Finally, every rank computes its _state_passing_bwd again, now with its proper
+          dfinal_states
+        NOTE: omits the d_state dim
+        """
+        states, dA_chunk_cumsum = self.get_states_dA_chunk_cumum()
+        dout = torch.randn_like(states)
+
+        # Shard
+        states_cp = rearrange(states, "b (r c) h p -> b c h p r", r=self.cp_degree)
+        dout_cp = rearrange(dout, "b (r c) h p -> b c h p r", r=self.cp_degree)
+        dA_chunk_cumsum_cp = rearrange(
+            dA_chunk_cumsum, "b h (r c) -> b h c r ", r=self.cp_degree
+        )
+
+        # Ground truth
+        dstates, ddA_chunk_cumsum, *_ = _state_passing_bwd(
+            states,
+            dA_chunk_cumsum,
+            dout,
+            dfinal_states=None,
+            has_initial_states=True,
+            dstates_dtype=states.dtype,
+            states_dtype=states.dtype,
+        )
+
+        # Run the backwards with only local data (i.e. with the incorrect dfinal_states = None)
+        # Note:Set has_initial_states even for rank zero, so that dinitstates_cp is torch.zeros
+        # rather than None.
+        dinitstates_cp_list = []
+        for rank_cp in range(self.cp_degree):
+            _, _, dinitstates_cp, *_ = _state_passing_bwd(
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+                dout_cp[..., rank_cp],
+                dfinal_states=None,
+                has_initial_states=True,
+                dstates_dtype=states.dtype,
+                states_dtype=states.dtype,
+            )
+            dinitstates_cp_list.append(dinitstates_cp)
+
+        # Each rank needs to sum its dA factors up.
+        # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
+        dA_sums_cp = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2, keepdim=True)
+
+        # Then the ranks in reverse order do the following:
+        # 1) Recv the dinitstates from rank +1. These are the correct dfinal_states that rank should
+        #    have started with.
+        # 2) Rank uses dfinal_states and dA_sums_cp to compute the correct dinitstates on rank.
+        # 3) Rank passes dinitstates back to rank - 1 and the process continues.
+        # become the correct dfinal_states, which are then propagated backwards the dA_sums_cp
+        # factor and added to dinitstates to correct the result
+        for recv_rank in reversed(range(self.cp_degree - 1)):
+            send_rank = recv_rank + 1
+            # Recv dfinal_states
+            recv_dfinal_states = dinitstates_cp_list[send_rank]
+            # Correct the local dinitstates
+            dinitstates_cp_list[recv_rank] += (
+                dA_sums_cp[..., recv_rank].exp() * recv_dfinal_states
+            )
+
+        # Then recompute derivatives with the now-known dfinal_states states.
+        dstates_cp_list = []
+        ddA_chunk_cumsum_cp_list = []
+        for rank_cp in range(self.cp_degree):
+            dstates_cp, ddA_chunk_cumsum_cp, *_ = _state_passing_bwd(
+                states_cp[..., rank_cp],
+                dA_chunk_cumsum_cp[..., rank_cp],
+                dout_cp[..., rank_cp],
+                dfinal_states=dinitstates_cp_list[rank_cp + 1]
+                if rank_cp != self.cp_degree - 1
+                else None,
                 has_initial_states=True,
                 dstates_dtype=states.dtype,
                 states_dtype=states.dtype,
