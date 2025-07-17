@@ -2,7 +2,6 @@ from typing import Callable, Literal, Optional
 
 import torch
 import torch.distributed as dist
-import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from einops import rearrange
 from torch.profiler import record_function
@@ -11,13 +10,24 @@ from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_allgather_cp,
+    mamba_chunk_scan_combined_allgather_cp_recompute,
     mamba_chunk_scan_combined_non_cp,
+    mamba_chunk_scan_combined_non_cp_recompute,
+    mamba_chunk_scan_combined_serial_naive_cp,
+    mamba_chunk_scan_combined_serial_naive_cp_recompute,
     mamba_chunk_scan_combined_serial_cp,
+    mamba_chunk_scan_combined_serial_cp_recompute,
 )
 
 CP_MAMBA_IMPLS = {
-    "serial": mamba_chunk_scan_combined_serial_cp,
+    "serial_naive": mamba_chunk_scan_combined_serial_naive_cp,
     "allgather": mamba_chunk_scan_combined_allgather_cp,
+    "serial": mamba_chunk_scan_combined_serial_cp,
+}
+CP_MAMBA_RECOMPUTE_IMPLS = {
+    "serial_naive": mamba_chunk_scan_combined_serial_naive_cp_recompute,
+    "allgather": mamba_chunk_scan_combined_allgather_cp_recompute,
+    "serial": mamba_chunk_scan_combined_serial_cp_recompute,
 }
 
 
@@ -326,30 +336,6 @@ class ZigZagToSeqFn(torch.autograd.Function):
 zigzag_to_seq_comms = ZigZagToSeqFn.apply
 
 
-class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
-    """
-    Wrapper for all-gathering grads onto unsharded tensors which are used in rank-sharded
-    operations.
-    """
-
-    @staticmethod
-    def forward(
-        ctx, tensor: torch.Tensor, mesh: dist.device_mesh.DeviceMesh
-    ) -> torch.Tensor:
-        if mesh.ndim != 1:
-            raise ValueError("Only supports 1D DeviceMesh instances.")
-        ctx.mesh = mesh
-        return tensor
-
-    @staticmethod
-    def backward(ctx, dtensor: torch.Tensor) -> tuple[torch.Tensor, None]:
-        dtensor = funcol.all_reduce(dtensor, reduceOp="sum", group=ctx.mesh.get_group())
-        return dtensor, None
-
-
-_identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
-
-
 # Break down the Mamba2 forward into components
 
 
@@ -458,6 +444,7 @@ def scan(
 
 
 class _Mamba2Ref(Mamba2):
+    cp_mamba_recompute: bool = False
     """
     Class for testing correctness of the forward rewrite.
     """
@@ -473,7 +460,15 @@ class _Mamba2Ref(Mamba2):
 
         xBC = conv(xBC, self, seq_idx)
         y = scan(
-            mamba_chunk_scan_combined_non_cp, xBC, dt, z, self, seq_idx, cp_mesh=None
+            mamba_chunk_scan_combined_non_cp_recompute
+            if self.cp_mamba_recompute
+            else mamba_chunk_scan_combined_non_cp,
+            xBC,
+            dt,
+            z,
+            self,
+            seq_idx,
+            cp_mesh=None,
         )
 
         if self.rmsnorm:
@@ -504,12 +499,16 @@ class Mamba2CP(Mamba2):
         self,
         *args,
         cp_mesh: dist.device_mesh.DeviceMesh,
-        cp_mamba_impl: Literal["serial", "allgather"] = "allgather",
+        cp_mamba_impl: Literal["serial", "allgather", "serial_naive"] = "allgather",
+        cp_mamba_recompute: bool = False,
         **kwargs,
     ) -> None:
         self.cp_mesh = cp_mesh
         self.cp_mamba_impl = cp_mamba_impl
-        self.cp_impl_fn = CP_MAMBA_IMPLS[self.cp_mamba_impl]
+        if cp_mamba_recompute:
+            self.cp_impl_fn = CP_MAMBA_RECOMPUTE_IMPLS[self.cp_mamba_impl]
+        else:
+            self.cp_impl_fn = CP_MAMBA_IMPLS[self.cp_mamba_impl]
         super().__init__(*args, **kwargs)
 
     def forward(
