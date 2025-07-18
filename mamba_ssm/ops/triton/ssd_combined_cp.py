@@ -122,6 +122,8 @@ class _StatePassingImpl(ABC):
             ):
                 if cu_seqlens is not None or seq_idx is not None:
                     raise NotImplementedError
+                if return_varlen_states:
+                    raise NotImplementedError
                 ctx.dt_dtype = dt.dtype
                 if not return_varlen_states:
                     cu_seqlens = None
@@ -129,7 +131,7 @@ class _StatePassingImpl(ABC):
                     assert cu_seqlens is not None, (
                         "cu_seqlens must be provided if return_varlen_states is True"
                     )
-                out, out_x, _, _, _, final_states, *rest = (
+                out, out_x, _, _, _, final_states, *_ = (
                     _mamba_chunk_scan_combined_fwd_template(
                         cls,
                         x,
@@ -168,15 +170,7 @@ class _StatePassingImpl(ABC):
                 ctx.return_final_states = return_final_states
                 ctx.return_varlen_states = return_varlen_states
                 ctx.cp_mesh = cp_mesh
-                if not return_varlen_states:
-                    return out if not return_final_states else (out, final_states)
-                else:
-                    varlen_states = rest[0]
-                    return (
-                        (out, varlen_states)
-                        if not return_final_states
-                        else (out, final_states, varlen_states)
-                    )
+                return out if not return_final_states else (out, final_states)
 
             @staticmethod
             def backward(ctx, dout, *args):
@@ -370,7 +364,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         )
 
     with record_function("state_passing_impl_fwd"):
-        states, final_states, _ = state_passing_impl.fwd(
+        states, final_states, bwd_args = state_passing_impl.fwd(
             chunk_size=chunk_size,
             states=states,
             dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
@@ -387,7 +381,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         out, out_x = _chunk_scan_fwd(
             CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx
         )
-        return out, out_x, dt, dA_cumsum, states, final_states
+        return out, out_x, dt, dA_cumsum, states, final_states, CB, bwd_args
 
 
 def _mamba_chunk_scan_combined_bwd_template(
@@ -416,17 +410,13 @@ def _mamba_chunk_scan_combined_bwd_template(
     recompute_output=False,
     cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
-    with record_function("pre_state_passing_impl_fwd"):
+    with record_function("_mamba_chunk_scan_combined_fwd_in_bwd"):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
         assert dout.shape == (batch, seqlen, nheads, headdim)
         assert dt.shape == (batch, seqlen, nheads)
-        assert A.shape == (nheads,)
-        assert nheads % ngroups == 0
-        assert B.shape == (batch, seqlen, ngroups, dstate)
-        assert C.shape == B.shape
         assert out.shape == x.shape
         if initial_states is not None:
             assert initial_states.shape == (batch, nheads, headdim, dstate)
@@ -455,31 +445,27 @@ def _mamba_chunk_scan_combined_bwd_template(
         # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
         # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
         dt_in = dt.clone()
-        dA_cumsum, dt = _chunk_cumsum_fwd(
-            dt_in,
-            A,
-            chunk_size,
-            dt_bias=dt_bias,
-            dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
-        )
-        CB = _bmm_chunk_fwd(
-            C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32
-        )
-        states = _chunk_state_fwd(
-            B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True
+        out, out_x, dt, dA_cumsum, states, final_states, CB, bwd_args = (
+            _mamba_chunk_scan_combined_fwd_template(
+                state_passing_impl,
+                x=x,
+                dt=dt_in,
+                A=A,
+                B=B,
+                C=C,
+                chunk_size=chunk_size,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                cu_seqlens=None,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                cp_mesh=cp_mesh,
+            )
         )
 
-    with record_function("state_passing_impl_fwd"):
-        states, _, bwd_args = state_passing_impl.fwd(
-            chunk_size=chunk_size,
-            states=states,
-            dA_chunk_cumsum=dA_cumsum[:, :, :, -1],
-            initial_states=initial_states,
-            seq_idx=seq_idx,
-            out_dtype=None,
-            cp_mesh=cp_mesh,
-        )
 
     with record_function("pre_state_passing_impl_bwd"):
         if z is not None:
