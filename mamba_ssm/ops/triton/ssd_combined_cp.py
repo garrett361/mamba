@@ -37,7 +37,6 @@ from mamba_ssm.ops.triton.ssd_combined import (
     _chunk_state_fwd,
     _state_passing_bwd,
     _state_passing_fwd,
-    chunk_state_varlen,
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -121,6 +120,8 @@ class _StatePassingImpl(ABC):
                 return_varlen_states=False,
                 cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
             ):
+                if cu_seqlens is not None or seq_idx is not None:
+                    raise NotImplementedError
                 ctx.dt_dtype = dt.dtype
                 if not return_varlen_states:
                     cu_seqlens = None
@@ -323,6 +324,8 @@ def _mamba_chunk_scan_combined_fwd_template(
     dt_limit=(0.0, float("inf")),
     cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
 ):
+    if cu_seqlens is not None or seq_idx is not None:
+        raise NotImplementedError
     with record_function("pre_state_passing_impl_fwd"):
         batch, seqlen, nheads, headdim = x.shape
         _, _, ngroups, dstate = B.shape
@@ -384,21 +387,7 @@ def _mamba_chunk_scan_combined_fwd_template(
         out, out_x = _chunk_scan_fwd(
             CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx
         )
-        if cu_seqlens is None:
-            return out, out_x, dt, dA_cumsum, states, final_states
-        else:
-            assert batch == 1, (
-                "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
-            )
-            varlen_states = chunk_state_varlen(
-                B.squeeze(0),
-                x.squeeze(0),
-                dt.squeeze(0),
-                dA_cumsum.squeeze(0),
-                cu_seqlens,
-                states.squeeze(0),
-            )
-            return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+        return out, out_x, dt, dA_cumsum, states, final_states
 
 
 def _mamba_chunk_scan_combined_bwd_template(
