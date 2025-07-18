@@ -11,13 +11,20 @@ from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mha import MHA
 from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_allgather_cp,
+    mamba_chunk_scan_combined_allgather_cp_recompute,
     mamba_chunk_scan_combined_non_cp,
+    mamba_chunk_scan_combined_non_cp_recompute,
     mamba_chunk_scan_combined_serial_cp,
+    mamba_chunk_scan_combined_serial_cp_recompute,
 )
 
 CP_MAMBA_IMPLS = {
     "serial": mamba_chunk_scan_combined_serial_cp,
     "allgather": mamba_chunk_scan_combined_allgather_cp,
+}
+CP_MAMBA_RECOMPUTE_IMPLS = {
+    "serial": mamba_chunk_scan_combined_serial_cp_recompute,
+    "allgather": mamba_chunk_scan_combined_allgather_cp_recompute,
 }
 
 
@@ -458,6 +465,7 @@ def scan(
 
 
 class _Mamba2Ref(Mamba2):
+    cp_mamba_recompute: bool = False
     """
     Class for testing correctness of the forward rewrite.
     """
@@ -473,7 +481,15 @@ class _Mamba2Ref(Mamba2):
 
         xBC = conv(xBC, self, seq_idx)
         y = scan(
-            mamba_chunk_scan_combined_non_cp, xBC, dt, z, self, seq_idx, cp_mesh=None
+            mamba_chunk_scan_combined_non_cp_recompute
+            if self.cp_mamba_recompute
+            else mamba_chunk_scan_combined_non_cp,
+            xBC,
+            dt,
+            z,
+            self,
+            seq_idx,
+            cp_mesh=None,
         )
 
         if self.rmsnorm:
@@ -505,11 +521,15 @@ class Mamba2CP(Mamba2):
         *args,
         cp_mesh: dist.device_mesh.DeviceMesh,
         cp_mamba_impl: Literal["serial", "allgather"] = "allgather",
+        cp_mamba_recompute: bool = False,
         **kwargs,
     ) -> None:
         self.cp_mesh = cp_mesh
         self.cp_mamba_impl = cp_mamba_impl
-        self.cp_impl_fn = CP_MAMBA_IMPLS[self.cp_mamba_impl]
+        if cp_mamba_recompute:
+            self.cp_impl_fn = CP_MAMBA_RECOMPUTE_IMPLS[self.cp_mamba_impl]
+        else:
+            self.cp_impl_fn = CP_MAMBA_IMPLS[self.cp_mamba_impl]
         super().__init__(*args, **kwargs)
 
     def forward(

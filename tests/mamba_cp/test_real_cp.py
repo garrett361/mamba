@@ -444,6 +444,7 @@ class _DTestModelBase(DTest):
         cp_mesh: dist.device_mesh.DeviceMesh,
         seed: int = 42,
         cp_mamba_impl: str = "allgather",
+        cp_mamba_recompute: bool = False,
     ) -> Mamba2:
         torch.manual_seed(seed)
         # The D param doesn't respect the dtype constructor arg, so need an extra `to` call for
@@ -454,6 +455,7 @@ class _DTestModelBase(DTest):
             d_state=self.d_state,
             chunk_size=self.chunk_size,
             cp_mamba_impl=cp_mamba_impl,
+            cp_mamba_recompute=cp_mamba_recompute,
             **self.factory_kwargs,
         ).to(self.dtype)
 
@@ -738,13 +740,16 @@ class TestScanCP(_DTestModelBase):
 
 
 class TestMamba2CP(_DTestModelBase):
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl):
+    def test_fwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
         with torch.no_grad():
             torch.manual_seed(42)
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             mamba2 = self.get_mamba2()
-            mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+            mamba2_cp = self.get_mamba2_cp(
+                cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_mamba_recompute=cp_mamba_recompute
+            )
 
             inputs = self.get_inputs()
             inputs_cp = self.get_cp_shard(inputs)
@@ -757,12 +762,15 @@ class TestMamba2CP(_DTestModelBase):
                 outputs_cp, outputs_shard, atol=self.tol, rtol=self.tol
             )
 
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_bwd(self, cp_mamba_impl):
+    def test_bwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
         mamba2 = self.get_mamba2()
-        mamba2_cp = self.get_mamba2_cp(cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl)
+        mamba2_cp = self.get_mamba2_cp(
+            cp_mesh=cp_mesh, cp_mamba_impl=cp_mamba_impl, cp_mamba_recompute=cp_mamba_recompute
+        )
 
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)

@@ -1,20 +1,15 @@
 from copy import deepcopy
 
+import pytest
 import torch
 from einops import rearrange
 
 from mamba_ssm.modules.mamba2 import Mamba2
-from mamba_ssm.modules.mamba2_cp import conv, _Mamba2Ref
+from mamba_ssm.modules.mamba2_cp import _Mamba2Ref, conv
 from mamba_ssm.ops.triton.ssd_state_passing import (
-    _state_passing_fwd,
     _state_passing_bwd,
+    _state_passing_fwd,
 )
-
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
-
 
 # Breaking out various parts of the fwd for easier testing:
 
@@ -99,23 +94,27 @@ class _TestBase:
 
 
 class Test_Mamba2Ref(_TestBase):
-    def test_fwd(self) -> None:
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    def test_fwd(self, cp_mamba_recompute: bool) -> None:
         mamba2 = self.get_mamba2()
         mamba2_ref = self.get_mamba2_ref()
+        mamba2_ref.cp_mamba_recompute = cp_mamba_recompute
         inputs = self.get_inputs()
         outputs = mamba2(inputs)
         outputs_copy = mamba2_ref(inputs)
         torch.testing.assert_close(outputs, outputs_copy)
 
-    def test_bwd(self) -> None:
+    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
+    def test_bwd(self, cp_mamba_recompute: bool) -> None:
         mamba2 = self.get_mamba2()
-        mamba2_copy = self.get_mamba2_ref()
+        mamba2_ref = self.get_mamba2_ref()
+        mamba2_ref.cp_mamba_recompute = cp_mamba_recompute
         inputs = self.get_inputs(requires_grad=True)
         inputs_copy = deepcopy(inputs)
         mamba2(inputs).sum().backward()
-        mamba2_copy(inputs_copy).sum().backward()
+        mamba2_ref(inputs_copy).sum().backward()
 
-        for p1, p2 in zip(mamba2.parameters(), mamba2_copy.parameters()):
+        for p1, p2 in zip(mamba2.parameters(), mamba2_ref.parameters()):
             if p1.grad is not None:
                 torch.testing.assert_close(p1.grad, p2.grad)
         torch.testing.assert_close(inputs.grad, inputs_copy.grad)

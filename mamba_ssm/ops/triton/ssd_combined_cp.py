@@ -12,7 +12,7 @@ After defining the `_StatePassingImpl.{fwd,bwd}` methods of an implementation, t
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Type
+from typing import Optional, Type
 
 import torch
 import torch.distributed as dist
@@ -64,7 +64,7 @@ class _StatePassingImpl(ABC):
         seq_idx=None,
         out_dtype=None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Any]:
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[Optional[torch.Tensor]]]:
         """
         Returns a tuple of (out_states, final_states, bwd_args), where bwd_args is any tuple of
         tensors that _StatePassingImpl.bwd might require for its backwards pass.
@@ -767,7 +767,7 @@ class StatePassingNonCP(_StatePassingImpl):
             rearrange(t, "... (p n) -> ... p n", n=d_state)
             for t in [out_states, final_states]
         ]
-        return out_states, final_states, None
+        return out_states, final_states, (None,)
 
     @staticmethod
     def bwd(
