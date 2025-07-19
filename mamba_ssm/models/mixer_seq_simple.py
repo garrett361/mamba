@@ -68,6 +68,7 @@ def create_block(
                 raise NotImplementedError("Context parallel not implemented for Mamba1")
             ssm_cls_kwargs["cp_mesh"] = cp_mesh
             ssm_cls_kwargs["cp_mamba_impl"] = cp_mamba_impl
+            ssm_cls_kwargs["cp_mamba_recompute"] = cp_mamba_recompute
             ssm_cls = Mamba2CP
         else:
             ssm_cls = Mamba if ssm_layer == "Mamba1" else Mamba2
@@ -77,7 +78,6 @@ def create_block(
         if cp_mesh is not None:
             mha_cls_kwargs["cp_mesh"] = cp_mesh
             mha_cls_kwargs["cp_attn_impl"] = cp_attn_impl
-            mha_cls_kwargs["cp_mamba_recompute"] = cp_mamba_recompute
             mha_cls = MHACP
         else:
             mha_cls = MHA
