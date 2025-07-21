@@ -1147,7 +1147,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         # Compute dinitial_states with the locally available information. I.e. use trivial
         # dfinal_states on all but, maybe, the last rank. These can be used to compute the
         # corrected dfinal_states each rank should have started with.
-        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, _ = (
+        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, states = (
             StatePassingNonCP.bwd(
                 chunk_size=chunk_size,
                 states=states,
