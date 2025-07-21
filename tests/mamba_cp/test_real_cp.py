@@ -22,7 +22,6 @@ from mamba_ssm.modules.mamba2_cp import (
     CP_MAMBA_IMPLS,
     MHACP,
     Mamba2CP,
-    _identity_fwd_all_reduce_bwd,
     causal_passing_comms,
     conv,
     conv_cp,
@@ -298,74 +297,6 @@ class TestZigZagToSeqInverse(DTest):
             t_recv,
             t_send,
         )
-
-
-class TestIdentityFwdAllGatherBwdFn(DTest):
-    def test_fwd(self):
-        with torch.no_grad():
-            dim = 16
-            torch.manual_seed(42)
-            weight = torch.randn(
-                dim,
-                device=self.device,
-                dtype=torch.bfloat16,
-            )
-            weight_copy = deepcopy(weight)
-
-            weight = nn.Parameter(weight)
-            mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-            weight_copy = nn.Parameter(weight_copy)
-
-            inputs = torch.randn(
-                self.world_size,
-                dim,
-                device=self.device,
-                dtype=torch.bfloat16,
-            )
-            inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
-
-            output = inputs * weight
-            output_shard = inputs_shard * _identity_fwd_all_reduce_bwd(
-                weight_copy, mesh
-            )
-
-            all_gathered_output_shards = torch.empty_like(inputs)
-            dist.all_gather_into_tensor(
-                all_gathered_output_shards, output_shard, group=mesh.get_group()
-            )
-            out = [torch.empty_like(output_shard) for _ in range(self.world_size)]
-            dist.all_gather(out, output_shard, group=mesh.get_group())
-
-            torch.testing.assert_close(all_gathered_output_shards, output)
-
-    def test_bwd(self):
-        dim = 16
-        torch.manual_seed(42)
-        weight = torch.randn(
-            dim,
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
-        weight_copy = deepcopy(weight)
-
-        weight = nn.Parameter(weight)
-        mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
-        weight_copy = nn.Parameter(weight_copy)
-
-        inputs = torch.randn(
-            self.world_size,
-            dim,
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
-        inputs_shard = inputs.tensor_split(self.world_size, 0)[self.rank]
-
-        (inputs * weight).sum().backward()
-        (
-            inputs_shard * _identity_fwd_all_reduce_bwd(weight_copy, mesh)
-        ).sum().backward()
-
-        torch.testing.assert_close(weight.grad, weight_copy.grad)
 
 
 class _DTestModelBase(DTest):

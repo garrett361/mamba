@@ -2,7 +2,6 @@ from typing import Callable, Literal, Optional
 
 import torch
 import torch.distributed as dist
-import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from einops import rearrange
 from torch.profiler import record_function
@@ -331,30 +330,6 @@ class ZigZagToSeqFn(torch.autograd.Function):
 
 
 zigzag_to_seq_comms = ZigZagToSeqFn.apply
-
-
-class IdentityFwdAllReduceBwdFn(torch.autograd.Function):
-    """
-    Wrapper for all-gathering grads onto unsharded tensors which are used in rank-sharded
-    operations.
-    """
-
-    @staticmethod
-    def forward(
-        ctx, tensor: torch.Tensor, mesh: dist.device_mesh.DeviceMesh
-    ) -> torch.Tensor:
-        if mesh.ndim != 1:
-            raise ValueError("Only supports 1D DeviceMesh instances.")
-        ctx.mesh = mesh
-        return tensor
-
-    @staticmethod
-    def backward(ctx, dtensor: torch.Tensor) -> tuple[torch.Tensor, None]:
-        dtensor = funcol.all_reduce(dtensor, reduceOp="sum", group=ctx.mesh.get_group())
-        return dtensor, None
-
-
-_identity_fwd_all_reduce_bwd = IdentityFwdAllReduceBwdFn.apply
 
 
 # Break down the Mamba2 forward into components
