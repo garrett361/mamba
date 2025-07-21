@@ -92,7 +92,7 @@ class _StatePassingImpl(ABC):
         ] = None,  # Optional[(batch, nheads, headdim, d_state)]
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[tuple[Optional[torch.Tensor]]] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
     ) -> tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
     ]:
@@ -781,9 +781,7 @@ class StatePassingNonCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[
-            tuple[Optional[torch.Tensor]]
-        ] = None,  # Intentionally unused
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),  # Intentionally unused
     ):
         d_state = states.shape[-1]
         dstates_out, ddA_chunk_cumsum, dinitial_states, states = _state_passing_bwd(
@@ -909,7 +907,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[tuple[Optional[torch.Tensor]]] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
     ):
         """
         Starting from the final rank to compute in _state_passing_serial_cp_fwd, compute
@@ -1011,7 +1009,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
         """
-        1. Every rank completes its _state_passing_fwd with initial_sates = None.
+        1. Every rank completes its _state_passing_fwd with initial_states = None.
         2. final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
         3. The above data can be passed through _state_passing_fwd again to get the corrected
            initial_states that each rank should have started with.
@@ -1120,7 +1118,7 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         dfinal_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
-        bwd_args: Optional[tuple[Optional[torch.Tensor]]] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
     ):
         """
         1. Every rank completes its _state_passing_bwd with dfinal_states = None (except maybe on
@@ -1239,4 +1237,221 @@ mamba_chunk_scan_combined_allgather_cp = (
 )
 mamba_chunk_scan_combined_allgather_cp_recompute = (
     StatePassingAllGatherCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
+)
+
+
+class StatePassingSerialOptimizedCP(_StatePassingImpl):
+    @staticmethod
+    def fwd(
+        chunk_size,
+        states,
+        dA_chunk_cumsum,
+        initial_states=None,
+        seq_idx=None,
+        out_dtype=None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
+    ):
+        """
+        1. Every rank completes its _state_passing_fwd with initial_states = None.
+        2. Ranks sequentially recv the final state from the preceding rank, use this to correct
+           their initial_states/final_states
+        3. The above data can be passed through _state_passing_fwd again to get the corrected
+           initial_states that each rank should have started with.
+        4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
+        """
+        assert cp_mesh is not None
+        local_rank = cp_mesh.get_local_rank()
+        group = cp_mesh.get_group()
+        is_lead_rank = local_rank == 0
+        if not is_lead_rank and initial_states is not None:
+            raise ValueError(
+                "initial_states can only be non-trival on the lead CP rank."
+            )
+
+        # Compute the partial states with the locally available information. I.e. use trivial
+        # initial_states on all but, maybe, the lead rank.
+        states_partial, final_states_partial, _ = StatePassingNonCP.fwd(
+            chunk_size=chunk_size,
+            states=states,
+            dA_chunk_cumsum=dA_chunk_cumsum,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            out_dtype=out_dtype,
+        )
+
+        initial_states_corrected = initial_states
+        mesh_size = cp_mesh.size()
+        for send_rank, recv_rank in zip(range(mesh_size - 1), range(1, mesh_size)):
+            if local_rank == send_rank:
+                if initial_states_corrected is None:
+                    assert cp_mesh.get_local_rank() == 0
+                    final_states = final_states_partial
+                else:
+                    final_states = (
+                        final_states_partial
+                        + initial_states_corrected
+                        * dA_chunk_cumsum.sum(dim=2, keepdim=True).exp()[..., None]
+                    )
+                send(
+                    final_states.contiguous(),
+                    dst=dist.get_global_rank(group, recv_rank),
+                    group=group,
+                )
+            elif local_rank == recv_rank:
+                initial_states_corrected = torch.empty_like(states[:, 0])
+                recv(
+                    initial_states_corrected,
+                    src=dist.get_global_rank(group, send_rank),
+                    group=group,
+                )
+
+        if is_lead_rank:
+            final_states = final_states_partial
+            out_states = states_partial
+        else:
+            # And repeat the forward with the now-corrected initial_states
+            out_states, final_states, _ = StatePassingNonCP.fwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_chunk_cumsum=dA_chunk_cumsum,
+                initial_states=initial_states_corrected,
+                seq_idx=seq_idx,
+                out_dtype=out_dtype,
+            )
+
+        bwd_args = (initial_states_corrected,)
+
+        return out_states, final_states, bwd_args
+
+    @staticmethod
+    def bwd(
+        chunk_size: int,
+        states: torch.Tensor,
+        dA_chunk_cumsum: torch.Tensor,
+        dstates: torch.Tensor,
+        dstates_dtype: torch.dtype,
+        states_dtype: torch.dtype,
+        initial_states: Optional[torch.Tensor] = None,
+        dfinal_states: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,
+        bwd_args: tuple[Optional[torch.Tensor]] = (None,),
+    ):
+        """
+        1. Every rank completes its _state_passing_bwd with dfinal_states = None (except maybe on
+            the final cp rank) and with the corrected initial_states from the forward.
+        2. Allgather dfinal_states and use these to compute what the proper dfinal_states should
+        have been on each rank
+        3. Every rank recomputes its _state_passing_bwd with the proper {dfinal,initial}_states
+        values.
+        """
+        assert cp_mesh is not None
+        local_rank = cp_mesh.get_local_rank()
+        is_lead_rank = local_rank == 0
+        if not is_lead_rank and initial_states is not None:
+            raise ValueError(
+                "initial_states can only be non-trival on the lead CP rank."
+            )
+        is_last_rank = local_rank == cp_mesh.size() - 1
+        if not is_last_rank and dfinal_states is not None:
+            raise ValueError(
+                "dfinal_states can only be non-trival on the last CP rank."
+            )
+
+        assert bwd_args is not None
+        initial_states_corrected, dA_chunk_sum_allgather = bwd_args
+
+        # Compute dinitial_states with the locally available information. I.e. use trivial
+        # dfinal_states on all but, maybe, the last rank. These can be used to compute the
+        # corrected dfinal_states each rank should have started with.
+        dstates_partial, ddA_chunk_cumsum_partial, dinitial_states_partial, _ = (
+            StatePassingNonCP.bwd(
+                chunk_size=chunk_size,
+                states=states,
+                dA_chunk_cumsum=dA_chunk_cumsum,
+                dstates=dstates,
+                # HACK: initial_states=True ensures dinitial_states_partial is never None, maybe
+                # just zeros
+                initial_states=True,
+                dfinal_states=dfinal_states,
+                seq_idx=seq_idx,
+                dstates_dtype=dstates_dtype,
+                states_dtype=states_dtype,
+                cp_mesh=cp_mesh,
+            )
+        )
+
+        dinitial_states_partial_allgather = torch.empty(
+            cp_mesh.size(),
+            *dinitial_states_partial.shape,
+            device=dinitial_states_partial.device,
+            dtype=dinitial_states_partial.dtype,
+        )
+        dist.all_gather_into_tensor(
+            dinitial_states_partial_allgather,
+            dinitial_states_partial.contiguous(),
+            group=cp_mesh.get_group(),
+            async_op=False,
+        )
+        dinitial_states_partial_allgather = rearrange(
+            dinitial_states_partial_allgather, "r b ... -> b r ... "
+        )
+
+        # TODO: @goon - write a more focused kernel for this step.
+        if is_last_rank:
+            dinitial_states = None
+            dstates_out = dstates_partial
+            ddA_chunk_cumsum = ddA_chunk_cumsum_partial
+        else:
+            # Build the dfinal_states that each rank should have started with.
+            dstates_slice = dinitial_states_partial_allgather[
+                :, cp_mesh.get_local_rank() + 1 :
+            ]
+            dA_chunk_cumsum_slice = dA_chunk_sum_allgather[
+                ..., cp_mesh.get_local_rank() + 1 :
+            ]
+            _, _, dfinal_states_corrected, _ = StatePassingNonCP.bwd(
+                chunk_size=chunk_size,
+                # `states` is not used, but can't be None and it needs to pass shape checks
+                states=dstates_slice,
+                dA_chunk_cumsum=dA_chunk_cumsum_slice,
+                dstates=dstates_slice,
+                # HACK: initial_states=True ensures dfinal_states_corrected is never None, maybe
+                # just zeros
+                initial_states=True,
+                dfinal_states=dfinal_states,
+                seq_idx=seq_idx,
+                dstates_dtype=dstates_dtype,
+                states_dtype=states_dtype,
+                cp_mesh=cp_mesh,
+            )
+
+            # And repeat the backward with the now-corrected dfinal_states
+            dstates_out, ddA_chunk_cumsum, dinitial_states, states = (
+                StatePassingNonCP.bwd(
+                    chunk_size=chunk_size,
+                    states=states,
+                    dA_chunk_cumsum=dA_chunk_cumsum,
+                    dstates=dstates,
+                    initial_states=initial_states_corrected,
+                    dfinal_states=dfinal_states_corrected,
+                    seq_idx=seq_idx,
+                    dstates_dtype=dstates_dtype,
+                    states_dtype=states_dtype,
+                    cp_mesh=cp_mesh,
+                )
+            )
+
+            # Only the first rank potentially had non-trivial initial_states as proper inputs, so
+            # all other ranks get dinitial_states = None.
+            if not is_lead_rank:
+                dinitial_states = None
+        return dstates_out, ddA_chunk_cumsum, dinitial_states, states
+
+
+mamba_chunk_scan_combined_serial_optimized_cp = (
+    StatePassingSerialOptimizedCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=False)
+)
+mamba_chunk_scan_combined_serial_optimized_cp_recompute = (
+    StatePassingSerialOptimizedCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
 )
