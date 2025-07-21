@@ -927,7 +927,7 @@ class StatePassingSerialCP(_StatePassingImpl):
             raise ValueError(
                 "dfinal_states can only be non-trival on the last CP rank."
             )
-        recv_init_states = bwd_args
+        recv_init_states = bwd_args[0]
         recv_dfinal_states = None
         for send_rank, recv_rank in zip(
             range(mesh_size - 1, 0, -1), range(mesh_size - 2, -1, -1)
