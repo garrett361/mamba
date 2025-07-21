@@ -470,7 +470,7 @@ class TestLocalCP(_TestBase):
 
         # Each rank needs to sum its dA factors up.
         # Important! Do the sum in float32, otherwise the tests won't pass due to numerics
-        dA_sums_cp = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2)
+        dA_sums_cp = dA_chunk_cumsum_cp.to(torch.float32).sum(dim=2, keepdim=True)
 
         initial_states_list = [None]
         # Rank zero first send its final state to rank 1
@@ -481,7 +481,7 @@ class TestLocalCP(_TestBase):
             initial_states_list.append(recv_state)
             # Here we correct the initial states on each rank via a very small computation:
             send_state = (
-                recv_state * dA_sums_cp[..., recv_rank].exp()[..., None]
+                recv_state * dA_sums_cp[..., recv_rank].exp()
                 + final_state_cp_list[recv_rank]
             )
 
