@@ -13,21 +13,21 @@ from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_allgather_cp_recompute,
     mamba_chunk_scan_combined_non_cp,
     mamba_chunk_scan_combined_non_cp_recompute,
+    mamba_chunk_scan_combined_serial_naive_cp,
+    mamba_chunk_scan_combined_serial_naive_cp_recompute,
     mamba_chunk_scan_combined_serial_cp,
     mamba_chunk_scan_combined_serial_cp_recompute,
-    mamba_chunk_scan_combined_serial_optimized_cp,
-    mamba_chunk_scan_combined_serial_optimized_cp_recompute,
 )
 
 CP_MAMBA_IMPLS = {
-    "serial": mamba_chunk_scan_combined_serial_cp,
+    "serial_naive": mamba_chunk_scan_combined_serial_naive_cp,
     "allgather": mamba_chunk_scan_combined_allgather_cp,
-    "serial_optimized": mamba_chunk_scan_combined_serial_optimized_cp,
+    "serial": mamba_chunk_scan_combined_serial_cp,
 }
 CP_MAMBA_RECOMPUTE_IMPLS = {
-    "serial": mamba_chunk_scan_combined_serial_cp_recompute,
+    "serial_naive": mamba_chunk_scan_combined_serial_naive_cp_recompute,
     "allgather": mamba_chunk_scan_combined_allgather_cp_recompute,
-    "serial_optimized": mamba_chunk_scan_combined_serial_optimized_cp_recompute,
+    "serial": mamba_chunk_scan_combined_serial_cp_recompute,
 }
 
 
@@ -499,7 +499,7 @@ class Mamba2CP(Mamba2):
         self,
         *args,
         cp_mesh: dist.device_mesh.DeviceMesh,
-        cp_mamba_impl: Literal["serial", "allgather"] = "allgather",
+        cp_mamba_impl: Literal["serial", "allgather", "serial_naive"] = "allgather",
         cp_mamba_recompute: bool = False,
         **kwargs,
     ) -> None:

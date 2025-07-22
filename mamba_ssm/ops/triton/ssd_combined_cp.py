@@ -739,10 +739,14 @@ def _mamba_chunk_scan_combined_bwd_no_recompute_template(
         return return_vals if not recompute_output else (*return_vals, outz)
 
 
-##### Non-CP impls. For testing and components of other impls.  #####
+##### Non-CP impls. #####
 
 
 class StatePassingNonCP(_StatePassingImpl):
+    """
+    A wrapper around of _state_passing_{fwd,bwd} for testing and reusing in CP implementations.
+    """
+
     @staticmethod
     def fwd(
         chunk_size,
@@ -820,7 +824,7 @@ mamba_chunk_scan_combined_non_cp_recompute = (
 
 # Async send/recv wrappers.
 # NOTE: @goon - For some reason, plain dist.isend(...).wait() calls are erroring out for me. Don't
-# think is should be necessary to use the `batch_isend_irecv` wrapper.
+# think it should be necessary to use the `batch_isend_irecv` wrapper.
 def send(tensor, dst=None, group=None) -> None:
     for op in dist.batch_isend_irecv([dist.P2POp(dist.isend, tensor, dst, group)]):
         op.wait()
@@ -831,9 +835,14 @@ def recv(tensor, src=None, group=None) -> None:
         op.wait()
 
 
-class StatePassingSerialCP(_StatePassingImpl):
+class StatePassingSerialNaiveCP(_StatePassingImpl):
     """
-    TODO: @goon - seq_idx probably not being treated correctly
+    Context Parallelism implemented as in https://arxiv.org/abs/2405.21060: ranks complete their
+    _state_passing_fwd passes in order, each waiting to receive the final_states from the previous
+    rank, which are used as the initial_states of the subsequent rank, and similar for the backwards
+    pass.
+
+    TODO: @goon - seq_idx handling
     """
 
     @staticmethod
@@ -849,6 +858,8 @@ class StatePassingSerialCP(_StatePassingImpl):
         """
         Serially compute the final state on each rank and pass as initial_states to the next.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         group = cp_mesh.get_group()
@@ -914,6 +925,8 @@ class StatePassingSerialCP(_StatePassingImpl):
         Starting from the final rank to compute in _state_passing_serial_cp_fwd, compute
         dinitial_states and pass these back as the dfinal_states of the preceding rank.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         mesh_size = cp_mesh.size()
@@ -984,17 +997,27 @@ class StatePassingSerialCP(_StatePassingImpl):
         return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
-mamba_chunk_scan_combined_serial_cp = StatePassingSerialCP.get_chunk_scan_autograd_fn(
-    recompute_fwd_in_bwd=False
+mamba_chunk_scan_combined_serial_naive_cp = (
+    StatePassingSerialNaiveCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=False)
 )
-mamba_chunk_scan_combined_serial_cp_recompute = (
-    StatePassingSerialCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
+mamba_chunk_scan_combined_serial_naive_cp_recompute = (
+    StatePassingSerialNaiveCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
 )
 
 
 class StatePassingAllGatherCP(_StatePassingImpl):
     """
-    TODO: @goon - seq_idx probably not being treated correctly
+    Alternative CP implemementation:
+    1. Every rank completes its _state_passing_fwd with initial_states = None.
+    2. final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
+    3. The above data can be passed through _state_passing_fwd again to get the corrected
+       initial_states that each rank should have started with.
+    4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
+
+    Uses additional compute to swap P2P comms for collectives and reduces typical blocking wait
+    times.
+
+    TODO: @goon - seq_idx handling
     """
 
     @staticmethod
@@ -1007,13 +1030,8 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         out_dtype=None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
-        """
-        1. Every rank completes its _state_passing_fwd with initial_states = None.
-        2. final_state and dA_cumsum.sum(dim=-1) all-gathered across ranks
-        3. The above data can be passed through _state_passing_fwd again to get the corrected
-           initial_states that each rank should have started with.
-        4. Every rank computes its _state_passing_fwd again, now with its proper initial_states
-        """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         is_lead_rank = local_rank == 0
@@ -1127,6 +1145,8 @@ class StatePassingAllGatherCP(_StatePassingImpl):
         3. Every rank recomputes its _state_passing_bwd with the proper {dfinal,initial}_states
         values.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         is_lead_rank = local_rank == 0
@@ -1239,7 +1259,19 @@ mamba_chunk_scan_combined_allgather_cp_recompute = (
 )
 
 
-class StatePassingSerialOptimizedCP(_StatePassingImpl):
+class StatePassingSerialCP(_StatePassingImpl):
+    """
+    Alternative CP implemementation:
+    1. Every rank completes its _state_passing_fwd with initial_states = None.
+    2. Ranks sequentially recv the final state from the preceding rank, use this to correct
+       their initial_states/final_states
+    3. Every rank computes its _state_passing_fwd again, now with its proper initial_states
+
+    Reduces the amount of waiting time relative to StatePassingSerialNaiveCP in exchange for
+    additional non-blocking compute.
+
+    TODO: @goon - seq_idx handling
+    """
     @staticmethod
     def fwd(
         chunk_size,
@@ -1251,11 +1283,9 @@ class StatePassingSerialOptimizedCP(_StatePassingImpl):
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
         """
-        1. Every rank completes its _state_passing_fwd with initial_states = None.
-        2. Ranks sequentially recv the final state from the preceding rank, use this to correct
-           their initial_states/final_states
-        3. Every rank computes its _state_passing_fwd again, now with its proper initial_states
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         group = cp_mesh.get_group()
@@ -1342,6 +1372,8 @@ class StatePassingSerialOptimizedCP(_StatePassingImpl):
         3. Every rank recomputes its _state_passing_bwd with the proper {dfinal,initial}_states
            values.
         """
+        if seq_idx is not None:
+            raise NotImplementedError
         assert cp_mesh is not None
         local_rank = cp_mesh.get_local_rank()
         mesh_size = cp_mesh.size()
@@ -1435,9 +1467,9 @@ class StatePassingSerialOptimizedCP(_StatePassingImpl):
         return dstates_out, ddA_chunk_cumsum, dinitial_states, states
 
 
-mamba_chunk_scan_combined_serial_optimized_cp = (
-    StatePassingSerialOptimizedCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=False)
+mamba_chunk_scan_combined_serial_cp = StatePassingSerialCP.get_chunk_scan_autograd_fn(
+    recompute_fwd_in_bwd=False
 )
-mamba_chunk_scan_combined_serial_optimized_cp_recompute = (
-    StatePassingSerialOptimizedCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
+mamba_chunk_scan_combined_serial_cp_recompute = (
+    StatePassingSerialCP.get_chunk_scan_autograd_fn(recompute_fwd_in_bwd=True)
 )
