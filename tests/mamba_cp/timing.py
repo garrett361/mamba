@@ -128,11 +128,11 @@ bamba_9dot8b_defaults = {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cp", type=bool, default=False)
+    parser.add_argument("--cp", action="store_true")
     parser.add_argument("--cp_mamba_impl", type=str, default="allgather")
     parser.add_argument("--cp_attn_impl", type=str, default="zigzag")
-    parser.add_argument("--mamba_only", type=bool, default=False)
-    parser.add_argument("--no_ac", type=bool, default=False)
+    parser.add_argument("--mamba_only", action="store_true")
+    parser.add_argument("--no_ac", action="store_true")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--seq_len", type=int, default=4096)
