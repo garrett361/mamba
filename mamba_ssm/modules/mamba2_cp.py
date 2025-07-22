@@ -15,15 +15,19 @@ from mamba_ssm.ops.triton.ssd_combined_cp import (
     mamba_chunk_scan_combined_non_cp_recompute,
     mamba_chunk_scan_combined_serial_cp,
     mamba_chunk_scan_combined_serial_cp_recompute,
+    mamba_chunk_scan_combined_serial_optimized_cp,
+    mamba_chunk_scan_combined_serial_optimized_cp_recompute,
 )
 
 CP_MAMBA_IMPLS = {
     "serial": mamba_chunk_scan_combined_serial_cp,
     "allgather": mamba_chunk_scan_combined_allgather_cp,
+    "serial_optimized": mamba_chunk_scan_combined_serial_optimized_cp,
 }
 CP_MAMBA_RECOMPUTE_IMPLS = {
     "serial": mamba_chunk_scan_combined_serial_cp_recompute,
     "allgather": mamba_chunk_scan_combined_allgather_cp_recompute,
+    "serial_optimized": mamba_chunk_scan_combined_serial_optimized_cp_recompute,
 }
 
 

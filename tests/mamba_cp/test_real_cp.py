@@ -662,9 +662,10 @@ class TestScanCP(_DTestModelBase):
 
 
 class TestMamba2CP(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
+    @pytest.mark.parametrize(
+        "cp_mamba_impl", ("serial", "allgather", "serial_optimized")
+    )
+    def test_fwd(self, cp_mamba_impl: str):
         with torch.no_grad():
             torch.manual_seed(42)
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
@@ -672,7 +673,6 @@ class TestMamba2CP(_DTestModelBase):
             mamba2_cp = self.get_mamba2_cp(
                 cp_mesh=cp_mesh,
                 cp_mamba_impl=cp_mamba_impl,
-                cp_mamba_recompute=cp_mamba_recompute,
             )
 
             inputs = self.get_inputs()
@@ -687,7 +687,7 @@ class TestMamba2CP(_DTestModelBase):
             )
 
     @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
-    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
+    @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather", "serial_optimized"))
     def test_bwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
         torch.manual_seed(42)
         cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
@@ -767,9 +767,8 @@ class TestMHACP(_DTestModelBase):
 
 
 class TestFSDP1MambaCP(_DTestModelBase):
-    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
+    def test_fwd(self, cp_mamba_impl: str):
         with torch.no_grad():
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             model = nn.Sequential(*[self.get_mamba2() for _ in range(3)])
@@ -778,7 +777,6 @@ class TestFSDP1MambaCP(_DTestModelBase):
                     self.get_mamba2_cp(
                         cp_mesh=cp_mesh,
                         cp_mamba_impl=cp_mamba_impl,
-                        cp_mamba_recompute=cp_mamba_recompute,
                     )
                     for _ in range(3)
                 ]
@@ -955,9 +953,8 @@ class TestHSDP1MambaCP(_DTestModelBase):
     """
 
     @pytest.mark.world_size(4)
-    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
-    def test_fwd(self, cp_mamba_impl: str, cp_mamba_recompute: bool):
+    def test_fwd(self, cp_mamba_impl: str):
         with torch.no_grad():
             mesh = dist.device_mesh.init_device_mesh(
                 "cuda", (2, 2), mesh_dim_names=("inter_node", "intra_node")
@@ -969,7 +966,6 @@ class TestHSDP1MambaCP(_DTestModelBase):
                     self.get_mamba2_cp(
                         cp_mesh=cp_mesh,
                         cp_mamba_impl=cp_mamba_impl,
-                        cp_mamba_recompute=cp_mamba_recompute,
                     )
                     for _ in range(3)
                 ]
@@ -1187,8 +1183,7 @@ class TestHSDP1MHACP(_DTestModelBase):
 class TestModelCPFSDP1(_DTestModelBase):
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
-    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
-    def test_fwd(self, cp_mamba_impl, cp_attn_impl, cp_mamba_recompute):
+    def test_fwd(self, cp_mamba_impl, cp_attn_impl):
         with torch.no_grad():
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             model = self.get_model()
@@ -1196,7 +1191,6 @@ class TestModelCPFSDP1(_DTestModelBase):
                 cp_mesh,
                 cp_mamba_impl=cp_mamba_impl,
                 cp_attn_impl=cp_attn_impl,
-                cp_mamba_recompute=cp_mamba_recompute,
             )
             model_cp_fsdp = FSDP(
                 model_cp_fsdp,
@@ -1286,8 +1280,7 @@ class TestModelCPFSDP1(_DTestModelBase):
 class TestModelCPFSDP2(_DTestModelBase):
     @pytest.mark.parametrize("cp_mamba_impl", ("serial", "allgather"))
     @pytest.mark.parametrize("cp_attn_impl", ("ring", "zigzag"))
-    @pytest.mark.parametrize("cp_mamba_recompute", (True, False))
-    def test_fwd(self, cp_mamba_impl, cp_attn_impl, cp_mamba_recompute):
+    def test_fwd(self, cp_mamba_impl: str, cp_attn_impl:str):
         with torch.no_grad():
             cp_mesh = dist.device_mesh.init_device_mesh("cuda", (self.world_size,))
             model = self.get_model()
@@ -1295,7 +1288,6 @@ class TestModelCPFSDP2(_DTestModelBase):
                 cp_mesh,
                 cp_mamba_impl=cp_mamba_impl,
                 cp_attn_impl=cp_attn_impl,
-                cp_mamba_recompute=cp_mamba_recompute,
             )
 
             for module in model_cp_fsdp.modules():
