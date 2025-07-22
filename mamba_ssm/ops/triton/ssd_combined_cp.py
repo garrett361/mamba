@@ -1259,6 +1259,18 @@ mamba_chunk_scan_combined_allgather_cp_recompute = (
 )
 
 
+@torch.compile
+def _get_corrected_state(
+    partial_state: torch.Tensor,
+    state_correction: torch.Tensor,
+    dA_chunk_cumsum: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        partial_state
+        + state_correction * dA_chunk_cumsum.sum(dim=2, keepdim=True).exp()[..., None]
+    )
+
+
 class StatePassingSerialCP(_StatePassingImpl):
     """
     Alternative CP implemementation:
@@ -1272,6 +1284,7 @@ class StatePassingSerialCP(_StatePassingImpl):
 
     TODO: @goon - seq_idx handling
     """
+
     @staticmethod
     def fwd(
         chunk_size,
@@ -1282,8 +1295,7 @@ class StatePassingSerialCP(_StatePassingImpl):
         out_dtype=None,
         cp_mesh: Optional[dist.device_mesh.DeviceMesh] = None,  # Unused
     ):
-        """
-        """
+        """ """
         if seq_idx is not None:
             raise NotImplementedError
         assert cp_mesh is not None
@@ -1314,13 +1326,11 @@ class StatePassingSerialCP(_StatePassingImpl):
                     assert is_lead_rank
                     final_states = final_states_partial
                 else:
-                    final_states = (
-                        final_states_partial
-                        + initial_states_corrected
-                        * dA_chunk_cumsum.sum(dim=2, keepdim=True).exp()[..., None]
+                    final_states = _get_corrected_state(
+                        final_states_partial, initial_states_corrected, dA_chunk_cumsum
                     )
                 send(
-                    final_states.contiguous(),
+                    final_states.to(dtype=states.dtype).contiguous(),
                     dst=dist.get_global_rank(group, recv_rank),
                     group=group,
                 )
@@ -1419,10 +1429,8 @@ class StatePassingSerialCP(_StatePassingImpl):
                     assert is_last_rank
                     dinitial_states = dinitial_states_partial
                 else:
-                    dinitial_states = (
-                        dinitial_states_partial
-                        + recv_dfinal_states
-                        * dA_chunk_cumsum.sum(dim=2, keepdim=True).exp()[..., None]
+                    dinitial_states = _get_corrected_state(
+                        dinitial_states_partial, recv_dfinal_states, dA_chunk_cumsum
                     )
                 # Careful: P2P will hang if the dtypes don't match!
                 send(
