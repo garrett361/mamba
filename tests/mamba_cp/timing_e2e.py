@@ -128,7 +128,7 @@ bamba_9dot8b_defaults = {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cp", action="store_true")
+    parser.add_argument("--no_cp", action="store_true")
     parser.add_argument("--cp_degree", type=int, default=torch.cuda.device_count())
     parser.add_argument("--cp_mamba_impl", type=str, default="allgather")
     parser.add_argument("--cp_attn_impl", type=str, default="zigzag")
@@ -175,10 +175,10 @@ if __name__ == "__main__":
 
     model = MambaLMHeadModel(
         config=config,
-        cp_mesh=cp_mesh if args.cp else None,
-        cp_mamba_impl=args.cp_mamba_impl if args.cp else None,
-        cp_mamba_recompute=args.cp_mamba_recompute if args.cp else None,
-        cp_attn_impl=args.cp_attn_impl if args.cp else None,
+        cp_mesh=cp_mesh if not args.no_cp else None,
+        cp_mamba_impl=args.cp_mamba_impl if not args.no_cp else None,
+        cp_mamba_recompute=args.cp_mamba_recompute if not args.no_cp else None,
+        cp_attn_impl=args.cp_attn_impl if not args.no_cp else None,
     )
 
     model = FSDP(
