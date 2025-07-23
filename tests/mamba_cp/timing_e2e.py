@@ -129,13 +129,15 @@ bamba_9dot8b_defaults = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cp", action="store_true")
+    parser.add_argument("--cp_degree", type=int, default=torch.cuda.device_count())
     parser.add_argument("--cp_mamba_impl", type=str, default="allgather")
     parser.add_argument("--cp_attn_impl", type=str, default="zigzag")
+    parser.add_argument("--cp_mamba_recompute", action="store_true")
     parser.add_argument("--mamba_only", action="store_true")
     parser.add_argument("--no_ac", action="store_true")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument("--seq_len", type=int, default=4096)
+    parser.add_argument("--seq_len", type=int, default=16384)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_layer", type=int, default=bamba_9dot8b_defaults["n_layer"])
     args = parser.parse_args()
@@ -161,12 +163,21 @@ if __name__ == "__main__":
     dist.init_process_group(
         backend="nccl", timeout=datetime.timedelta(seconds=60), device_id=device
     )
-    mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
+    fsdp_mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
+    cp_mesh = dist.device_mesh.init_device_mesh(
+        "cuda",
+        (world_size // args.cp_degree, args.cp_degree),
+        mesh_dim_names=("outer", "inner"),
+    )["inner"]
+    if not rank:
+        print(f"{fsdp_mesh=}")
+        print(f"{cp_mesh=}")
 
     model = MambaLMHeadModel(
         config=config,
-        cp_mesh=mesh if args.cp else None,
+        cp_mesh=cp_mesh if args.cp else None,
         cp_mamba_impl=args.cp_mamba_impl if args.cp else None,
+        cp_mamba_recompute=args.cp_mamba_recompute if args.cp else None,
         cp_attn_impl=args.cp_attn_impl if args.cp else None,
     )
 
@@ -184,7 +195,7 @@ if __name__ == "__main__":
     )
     if not args.no_ac:
         apply_fsdp_checkpointing(model)
-    optim = torch.optim.AdamW(model.parameters(), lr=1e-7, foreach=False)
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-5, foreach=False)
 
     inputs = torch.randint(
         config.vocab_size,
@@ -192,7 +203,7 @@ if __name__ == "__main__":
         device=device,
     )
 
-    def train_one_step():
+    def train_one_step(inputs):
         outputs = model(inputs)
         loss = F.cross_entropy(
             outputs.logits.view(-1, outputs.logits.shape[-1]), inputs.view(-1)
@@ -200,19 +211,26 @@ if __name__ == "__main__":
         loss.backward()
         optim.step()
         optim.zero_grad()
+        return loss.detach()
 
     for _ in range(args.warmups):
-        train_one_step()
+        train_one_step(inputs)
+
 
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(args.iters):
-        train_one_step()
+    losses = [train_one_step(inputs) for _ in range(args.iters)]
     dist.barrier()
     stop.record()
     torch.cuda.synchronize()
     secs = start.elapsed_time(stop) / 1e3
+    if not rank:
+        for step, loss in enumerate(losses):
+            print(f"{step=}: {loss=}")
+        dist.barrier()
+    else:
+        dist.barrier()
 
     total_toks = args.batch_size * args.seq_len * world_size * args.iters
     toks_per_sec = total_toks / secs
