@@ -135,14 +135,14 @@ class Gate(nn.Module):
             self.tok_counter(indices, self.n_routed_experts),
         )
 
-    def __repr__(self) -> str:
+    def extra_repr(self) -> str:
         return (
-            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f"in_features={self.in_features},"
             f" n_routed_experts={self.n_routed_experts},"
             f" n_activated_experts={self.n_activated_experts},"
             f" n_expert_groups={self.n_expert_groups},"
             f" n_limited_groups={self.n_limited_groups},"
-            f" score_func={self.score_func})"
+            f" score_func={self.score_func}"
         )
 
     def reset_parameters(self) -> None:
@@ -452,13 +452,13 @@ class RoutedExpertsWeights(nn.Module):
         # Default nn.Linear init.
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def __repr__(self) -> str:
+    def extra_repr(self) -> str:
         return (
-            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f"in_features={self.in_features},"
             f" n_routed_experts={self.n_routed_experts},"
             f" out_features={self.out_features},"
             f" in_features={self.in_features},"
-            f" ep_mesh={self.ep_mesh})"
+            f" ep_mesh={self.ep_mesh}"
         )
 
 
@@ -692,12 +692,12 @@ class _RoutedExperts(nn.Module, ABC):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def __repr__(self) -> str:
+    def extra_repr(self) -> str:
         return (
-            f"{self.__class__.__name__}(in_features={self.in_features},"
+            f"in_features={self.in_features},"
             f" d_intermediate={self.d_intermediate},"
             f" n_routed_experts={self.n_routed_experts},"
-            f" n_local_experts={self.n_local_experts})"
+            f" n_local_experts={self.n_local_experts}"
         )
 
 
