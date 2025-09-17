@@ -1,9 +1,12 @@
 from dataclasses import dataclass, field
 
+"""
+NOTE: @goon - moe_cfg matches up to the MoE kwargs 
+"""
+
 
 @dataclass
 class MambaConfig:
-
     d_model: int = 2560
     d_intermediate: int = 0
     n_layer: int = 64
@@ -11,8 +14,11 @@ class MambaConfig:
     ssm_cfg: dict = field(default_factory=dict)
     attn_layer_idx: list = field(default_factory=list)
     attn_cfg: dict = field(default_factory=dict)
+    moe_layer_idx: list = field(default_factory=list)
+    moe_cfg: dict = field(default_factory=dict)
     rms_norm: bool = True
     residual_in_fp32: bool = True
     fused_add_norm: bool = True
     pad_vocab_size_multiple: int = 8
     tie_embeddings: bool = True
+    return_logits: bool = False
