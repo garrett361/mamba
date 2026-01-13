@@ -63,7 +63,7 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
     X += row * stride_x_row + group * N
     Y += row * stride_y_row + group * N
