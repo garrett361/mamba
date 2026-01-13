@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.modules.mamba2_cp import Mamba2CP
 
 if __name__ == "__main__":
@@ -43,18 +44,18 @@ if __name__ == "__main__":
         )
         mesh = dist.device_mesh.init_device_mesh("cuda", (world_size,))
 
+        mamba_cls = Mamba2CP if world_size > 1 else Mamba2
+        mamba_kwargs = dict(
+            d_model=args.d_model,
+            device=device,
+            dtype=dtype,
+        )
+        if world_size > 1:
+            mamba_kwargs["cp_mesh"] = mesh
+            mamba_kwargs["cp_mamba_impl"] = args.cp_mamba_impl
+            mamba_kwargs["cp_mamba_recompute"] = args.cp_mamba_recompute
         mamba_stack = nn.Sequential(
-            *[
-                Mamba2CP(
-                    d_model=args.d_model,
-                    cp_mesh=mesh,
-                    cp_mamba_impl=args.cp_mamba_impl,
-                    cp_mamba_recompute=args.cp_mamba_recompute,
-                    device=device,
-                    dtype=dtype,
-                )
-                for _ in range(args.n_layers)
-            ]
+            *[mamba_cls(**mamba_kwargs) for _ in range(args.n_layers)]
         )
 
         inputs = torch.randn(
