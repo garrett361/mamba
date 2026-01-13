@@ -17,7 +17,7 @@ if __name__ == "__main__":
     parser.add_argument("--cp_mamba_recompute", action="store_true")
     parser.add_argument("--d_model", type=int, default=4096)  # bamba 9.8b default
     parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--n_layers", type=int, default=1)
+    parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--project", type=str, default=None)
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--seq_len_per_gpu", type=int, default=65536)
