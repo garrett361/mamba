@@ -26,6 +26,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_bwd", action="store_true")
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--no_barrier_after_iter", action="store_true", default=False)
+    parser.add_argument("--no_csv", action="store_true", default=False)
     args = parser.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -114,57 +115,58 @@ if __name__ == "__main__":
             )
 
             # Write results to CSV
-            csv_filename = "mamba_cp_layer_timing.csv"
-            file_exists = os.path.isfile(csv_filename)
+            if not args.no_csv:
+                csv_filename = "mamba_cp_layer_timing.csv"
+                file_exists = os.path.isfile(csv_filename)
 
-            with open(csv_filename, "a", newline="") as csvfile:
-                fieldnames = [
-                    "batch_size",
-                    "cp_mamba_impl",
-                    "cp_mamba_recompute",
-                    "d_model",
-                    "iters",
-                    "n_layers",
-                    "seq_len_per_gpu",
-                    "world_size",
-                    "seq_len",
-                    "no_bwd",
-                    "warmups",
-                    "no_barrier_after_iter",
-                    "total_toks",
-                    "secs",
-                    "toks_per_sec",
-                    "toks_per_sec_per_gpu",
-                    "reserved_mem_gib",
-                    "allocated_mem_gib",
-                ]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                with open(csv_filename, "a", newline="") as csvfile:
+                    fieldnames = [
+                        "batch_size",
+                        "cp_mamba_impl",
+                        "cp_mamba_recompute",
+                        "d_model",
+                        "iters",
+                        "n_layers",
+                        "seq_len_per_gpu",
+                        "world_size",
+                        "seq_len",
+                        "no_bwd",
+                        "warmups",
+                        "no_barrier_after_iter",
+                        "total_toks",
+                        "secs",
+                        "toks_per_sec",
+                        "toks_per_sec_per_gpu",
+                        "reserved_mem_gib",
+                        "allocated_mem_gib",
+                    ]
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
-                if not file_exists:
-                    writer.writeheader()
+                    if not file_exists:
+                        writer.writeheader()
 
-                writer.writerow(
-                    {
-                        "batch_size": args.batch_size,
-                        "cp_mamba_impl": args.cp_mamba_impl,
-                        "cp_mamba_recompute": args.cp_mamba_recompute,
-                        "d_model": args.d_model,
-                        "iters": args.iters,
-                        "n_layers": args.n_layers,
-                        "seq_len_per_gpu": args.seq_len_per_gpu,
-                        "world_size": world_size,
-                        "seq_len": args.seq_len_per_gpu * world_size,
-                        "no_bwd": args.no_bwd,
-                        "warmups": args.warmups,
-                        "no_barrier_after_iter": args.no_barrier_after_iter,
-                        "total_toks": total_toks,
-                        "secs": secs,
-                        "toks_per_sec": toks_per_sec,
-                        "toks_per_sec_per_gpu": toks_per_sec_per_gpu,
-                        "reserved_mem_gib": reserved_mem,
-                        "allocated_mem_gib": allocated_mem,
-                    }
-                )
+                    writer.writerow(
+                        {
+                            "batch_size": args.batch_size,
+                            "cp_mamba_impl": args.cp_mamba_impl,
+                            "cp_mamba_recompute": args.cp_mamba_recompute,
+                            "d_model": args.d_model,
+                            "iters": args.iters,
+                            "n_layers": args.n_layers,
+                            "seq_len_per_gpu": args.seq_len_per_gpu,
+                            "world_size": world_size,
+                            "seq_len": args.seq_len_per_gpu * world_size,
+                            "no_bwd": args.no_bwd,
+                            "warmups": args.warmups,
+                            "no_barrier_after_iter": args.no_barrier_after_iter,
+                            "total_toks": total_toks,
+                            "secs": secs,
+                            "toks_per_sec": toks_per_sec,
+                            "toks_per_sec_per_gpu": toks_per_sec_per_gpu,
+                            "reserved_mem_gib": reserved_mem,
+                            "allocated_mem_gib": allocated_mem,
+                        }
+                    )
 
             print(f"Total tokens: {total_toks}")
             print(f"Total Secs: {secs}")
