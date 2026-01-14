@@ -95,6 +95,9 @@ if __name__ == "__main__":
                 # e2e code
                 if not args.no_barrier_after_iter:
                     dist.barrier()
+        if args.no_barrier_after_iter:
+            # Barrier after all iters finish, if not already using barriers
+            dist.barrier()
         stop.record()
         torch.cuda.synchronize()
 
